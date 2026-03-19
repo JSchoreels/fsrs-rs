@@ -70,6 +70,23 @@ impl std::fmt::Debug for PostSchedulingFn {
     }
 }
 
+/// Function type for dynamic review-time cost estimation.
+#[derive(Clone)]
+#[allow(clippy::type_complexity)]
+pub struct ReviewCostFn(pub Arc<dyn Fn(f32, f32, usize) -> f32 + Sync + Send>);
+
+impl PartialEq for ReviewCostFn {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for ReviewCostFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Wrap(<function>)")
+    }
+}
+
 /// Function type for review priority calculation that takes a card reference
 /// and returns a priority value (lower value means higher priority)
 #[derive(Clone)]
@@ -133,6 +150,7 @@ pub struct SimulatorConfig {
     pub suspend_after_lapses: Option<u32>,
     pub post_scheduling_fn: Option<PostSchedulingFn>,
     pub review_priority_fn: Option<ReviewPriorityFn>,
+    pub review_cost_fn: Option<ReviewCostFn>,
     pub learning_step_transitions: [[f32; 4]; 3],
     pub relearning_step_transitions: [[f32; 4]; 3],
     pub state_rating_costs: [[f32; 4]; 3],
@@ -155,6 +173,7 @@ impl Default for SimulatorConfig {
             suspend_after_lapses: None,
             post_scheduling_fn: None,
             review_priority_fn: None,
+            review_cost_fn: None,
             learning_step_transitions: [
                 [0.3686, 0.0628, 0.5108, 0.0577],
                 [0.0442, 0.4553, 0.4457, 0.0549],
@@ -836,6 +855,11 @@ pub fn simulate(
             };
 
             //dbg!(&card, &rating);
+            let review_cost = if let Some(ReviewCostFn(cb)) = &config.review_cost_fn {
+                cb(retrievability, last_stability, rating)
+            } else {
+                config.state_rating_costs[REVIEW][rating - 1]
+            };
 
             let (new_s, new_d, cost) = if forget {
                 let post_lapse_stability =
@@ -851,11 +875,7 @@ pub fn simulate(
                     config.relearning_step_count,
                     &mut rng,
                 );
-                (
-                    new_s,
-                    new_d,
-                    config.state_rating_costs[REVIEW][rating - 1] + cost,
-                )
+                (new_s, new_d, review_cost + cost)
             } else {
                 (
                     stability_after_success(
@@ -866,7 +886,7 @@ pub fn simulate(
                         rating,
                     ),
                     next_d(w, card.difficulty, rating),
-                    config.state_rating_costs[REVIEW][rating - 1],
+                    review_cost,
                 )
             };
 
@@ -1453,6 +1473,7 @@ pub fn extract_simulator_config(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Instant;
 
     use super::*;
@@ -1561,6 +1582,32 @@ mod tests {
             ..
         } = simulate(&config, &DEFAULT_PARAMETERS, 0.9, None, Some(cards))?;
         assert_eq!(cost_per_day_review[0], REVIEW_COST);
+        Ok(())
+    }
+
+    #[test]
+    fn simulator_review_cost_fn_overrides_review_cost() -> Result<()> {
+        let config = SimulatorConfig {
+            deck_size: 1,
+            learn_span: 1,
+            review_cost_fn: Some(ReviewCostFn(Arc::new(|_, _, _| 99.0))),
+            state_rating_costs: [[LEARN_COST; 4], [REVIEW_COST; 4], [0.; 4]],
+            review_rating_prob: [0.0, 1.0, 0.0],
+            ..Default::default()
+        };
+        let cards = vec![Card {
+            id: 0,
+            difficulty: 5.0,
+            stability: 5.0,
+            last_date: -5.0,
+            due: 0.0,
+            interval: 5.0,
+            lapses: 0,
+        }];
+
+        let SimulationResult { cost_per_day, .. } =
+            simulate(&config, &DEFAULT_PARAMETERS, 0.9, None, Some(cards))?;
+        assert_eq!(cost_per_day[0], 99.0);
         Ok(())
     }
 
