@@ -20,13 +20,13 @@ use burn::tensor::ElementConversion;
 use burn::tensor::cast::ToElement;
 use burn::tensor::{Shape, Tensor, TensorData};
 use burn::{data::dataloader::batcher::Batcher, tensor::backend::Backend};
-/// This is a slice for efficiency, but should always be 21 in length.
+/// This is a slice for efficiency, and may be 17/19/21/35 in length.
 pub type Parameters = [f32];
 
 pub const FSRS5_DEFAULT_DECAY: f32 = 0.5;
 pub const FSRS6_DEFAULT_DECAY: f32 = 0.1542;
 
-pub static DEFAULT_PARAMETERS: [f32; 21] = [
+pub static FSRS6_DEFAULT_PARAMETERS: [f32; 21] = [
     0.212,
     1.2931,
     2.3065,
@@ -48,6 +48,12 @@ pub static DEFAULT_PARAMETERS: [f32; 21] = [
     0.0912,
     0.0658,
     FSRS6_DEFAULT_DECAY,
+];
+
+pub static DEFAULT_PARAMETERS: [f32; 35] = [
+    0.041, 2.4175, 4.1283, 11.9709, 5.6385, 0.4468, 3.262, 2.3054, 0.1688, 1.3325, 0.3524, 0.0049,
+    0.7503, 0.0896, 0.6625, 1.3, 0.882, 0.3072, 3.5875, 0.303, 0.0107, 0.2279, 2.6413, 0.5594, 1.3,
+    2.5, 1.0, 0.0723, 0.1634, 0.5, 0.9555, 0.2245, 0.6232, 0.1362, 0.3862,
 ];
 
 fn infer<B: Backend>(
@@ -375,6 +381,19 @@ impl<B: Backend> FSRS<B> {
                 difficulty: difficulty.clamp(D_MIN, D_MAX),
             })
         }
+    }
+
+    /// Calculate current retrievability using the model's active forgetting
+    /// curve (FSRS-6 or FSRS-7).
+    pub fn current_retrievability(&self, state: MemoryState, days_elapsed: f32) -> f32 {
+        let device = self.device();
+        self.model()
+            .power_forgetting_curve(
+                Tensor::from_floats([days_elapsed.max(0.0)], &device),
+                Tensor::from_floats([state.stability], &device),
+            )
+            .into_scalar()
+            .elem()
     }
 
     /// Calculate the next interval for the current memory state, for rescheduling. Stability
@@ -1477,6 +1496,35 @@ mod tests {
         assert_eq!(current_retrievability(state, 1.0, 0.2), 0.9);
         assert_eq!(current_retrievability(state, 2.0, 0.2), 0.84028935);
         assert_eq!(current_retrievability(state, 3.0, 0.2), 0.7985001);
+    }
+
+    #[test]
+    fn test_model_current_retrievability_matches_fsrs6_scalar() {
+        let fsrs = FSRS::new(&FSRS6_DEFAULT_PARAMETERS).unwrap();
+        let state = MemoryState {
+            stability: 10.0,
+            difficulty: 5.0,
+        };
+        let expected = current_retrievability(state, 3.0, FSRS6_DEFAULT_DECAY);
+        let actual = fsrs.current_retrievability(state, 3.0);
+        assert!((actual - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_fsrs7_retrievability_does_not_depend_on_w20() {
+        let state = MemoryState {
+            stability: 12.0,
+            difficulty: 5.0,
+        };
+        let mut params_a = DEFAULT_PARAMETERS.to_vec();
+        let mut params_b = DEFAULT_PARAMETERS.to_vec();
+        params_a[20] = 0.001;
+        params_b[20] = 5.0;
+        let fsrs_a = FSRS::new(&params_a).unwrap();
+        let fsrs_b = FSRS::new(&params_b).unwrap();
+        let r_a = fsrs_a.current_retrievability(state, 10.0);
+        let r_b = fsrs_b.current_retrievability(state, 10.0);
+        assert!((r_a - r_b).abs() < 1e-7);
     }
 
     #[test]

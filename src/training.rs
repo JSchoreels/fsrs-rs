@@ -6,7 +6,7 @@ use crate::dataset::{
 use crate::error::Result;
 use crate::model::{Model, ModelConfig};
 use crate::parameter_clipper::parameter_clipper;
-use crate::parameter_initialization::{initialize_stability_parameters, smooth_and_fill};
+use crate::parameter_initialization::{initialize_parameters, smooth_and_fill};
 use crate::{DEFAULT_PARAMETERS, FSRSError};
 use burn::backend::Autodiff;
 use burn::backend::ndarray::NdArray;
@@ -28,9 +28,10 @@ use std::sync::{Arc, Mutex};
 
 type B = NdArray<f32>;
 
-static PARAMS_STDDEV: [f32; 21] = [
-    6.43, 9.66, 17.58, 27.85, 0.57, 0.28, 0.6, 0.12, 0.39, 0.18, 0.33, 0.3, 0.09, 0.16, 0.57, 0.25,
-    1.03, 0.31, 0.32, 0.14, 0.27,
+static PARAMS_STDDEV: [f32; 35] = [
+    9999.0, 9999.0, 9999.0, 9999.0, 0.523, 0.2528, 0.4329, 0.2966, 0.2139, 0.2889, 0.1862, 0.0829,
+    0.175, 0.3812, 0.3013, 0.9104, 0.3234, 0.2448, 0.3273, 0.1842, 0.1542, 0.1735, 0.4608, 0.311,
+    0.864, 0.4053, 0.162, 0.0418, 0.2596, 0.0798, 0.0682, 0.1282, 0.1397, 0.1407, 0.1489,
 ];
 
 pub struct BCELoss<B: Backend> {
@@ -109,7 +110,11 @@ impl<B: AutodiffBackend> Model<B> {
     fn freeze_short_term_stability(&self, mut grad: B::Gradients) -> B::Gradients {
         let grad_tensor = self.w.grad(&grad).unwrap();
         let device = grad_tensor.device();
-        let updated_grad_tensor = grad_tensor.slice_assign([17..20], Tensor::zeros([3], &device));
+        let updated_grad_tensor = if grad_tensor.dims()[0] >= 35 {
+            grad_tensor.slice_assign([16..25], Tensor::zeros([9], &device))
+        } else {
+            grad_tensor.slice_assign([17..20], Tensor::zeros([3], &device))
+        };
 
         self.w.grad_remove(&mut grad);
         self.w.grad_replace(&mut grad, updated_grad_tensor);
@@ -288,15 +293,15 @@ pub fn compute_parameters(
         return Ok(DEFAULT_PARAMETERS.to_vec());
     }
 
-    let (initial_stability, initial_rating_count) =
-        initialize_stability_parameters(dataset_for_initialization.clone(), average_recall)
-            .inspect_err(|_e| {
+    let (initial_stability, initial_forgetting_curve, initial_rating_count) =
+        initialize_parameters(dataset_for_initialization.clone(), average_recall).inspect_err(
+            |_e| {
                 finish_progress();
-            })?;
-    let initialized_parameters: Vec<f32> = initial_stability
-        .into_iter()
-        .chain(DEFAULT_PARAMETERS[4..].iter().copied())
-        .collect();
+            },
+        )?;
+    let mut initialized_parameters = DEFAULT_PARAMETERS.to_vec();
+    initialized_parameters[0..4].copy_from_slice(&initial_stability);
+    initialized_parameters[27..35].copy_from_slice(&initial_forgetting_curve);
     if train_set.len() == dataset_for_initialization.len() || train_set.len() < 64 {
         finish_progress();
         return Ok(initialized_parameters);
@@ -305,6 +310,7 @@ pub fn compute_parameters(
         ModelConfig {
             freeze_initial_stability: !enable_short_term,
             initial_stability: Some(initial_stability),
+            initial_forgetting_curve: Some(initial_forgetting_curve),
             freeze_short_term_stability: !enable_short_term,
             num_relearning_steps: num_relearning_steps.unwrap_or(1),
         },
@@ -376,14 +382,13 @@ pub fn benchmark(
         .clone()
         .into_iter()
         .partition(|item| item.long_term_review_cnt() == 1);
-    let initial_stability =
-        initialize_stability_parameters(dataset_for_initialization, average_recall)
-            .unwrap()
-            .0;
+    let (initial_stability, initial_forgetting_curve, _rating_count) =
+        initialize_parameters(dataset_for_initialization, average_recall).unwrap();
     let mut config = TrainingConfig::new(
         ModelConfig {
             freeze_initial_stability: !enable_short_term,
             initial_stability: Some(initial_stability),
+            initial_forgetting_curve: Some(initial_forgetting_curve),
             freeze_short_term_stability: !enable_short_term,
             num_relearning_steps: num_relearning_steps.unwrap_or(1),
         },

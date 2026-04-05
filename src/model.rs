@@ -11,6 +11,9 @@ use burn::{
     tensor::{Shape, Tensor, TensorData, backend::Backend},
 };
 
+const FSRS6_PARAM_LEN: usize = 21;
+const FSRS7_PARAM_LEN: usize = 35;
+
 #[derive(Module, Debug)]
 pub struct Model<B: Backend> {
     pub w: Param<Tensor<B, 1>>,
@@ -26,19 +29,80 @@ impl<B: Backend, const N: usize> Get<B, N> for Tensor<B, N> {
     }
 }
 
+fn tensor_min<B: Backend>(a: Tensor<B, 1>, b: Tensor<B, 1>) -> Tensor<B, 1> {
+    a.clone().mask_where(a.clone().greater(b.clone()), b)
+}
+
+fn tensor_max<B: Backend>(a: Tensor<B, 1>, b: Tensor<B, 1>) -> Tensor<B, 1> {
+    a.clone().mask_where(a.clone().lower(b.clone()), b)
+}
+
+fn fsrs7_forgetting_curve_scalar(w: &[f32], t: f32, s: f32) -> f32 {
+    let s = s.max(S_MIN);
+    let t_over_s = t.max(0.0) / s;
+
+    let decay1 = -w[27];
+    let decay2 = -w[28];
+    let base1 = w[29];
+    let base2 = w[30];
+
+    let factor1 = base1.powf(1.0 / decay1) - 1.0;
+    let factor2 = base2.powf(1.0 / decay2) - 1.0;
+    let r1 = (1.0 + factor1 * t_over_s).powf(decay1);
+    let r2 = (1.0 + factor2 * t_over_s).powf(decay2);
+
+    let weight1 = w[31] * s.powf(-w[33]);
+    let weight2 = w[32] * s.powf(w[34]);
+
+    (weight1 * r1 + weight2 * r2) / (weight1 + weight2)
+}
+
+fn fsrs7_next_interval_scalar(w: &[f32], stability: f32, desired_retention: f32) -> f32 {
+    let desired_retention = desired_retention.clamp(0.0001, 0.9999);
+    let stability = stability.max(S_MIN);
+
+    if desired_retention >= 0.9999 {
+        return 0.0;
+    }
+
+    let mut low = 0.0;
+    let mut high = stability.max(1.0);
+
+    while fsrs7_forgetting_curve_scalar(w, high, stability) > desired_retention && high < S_MAX {
+        high = (high * 2.0).min(S_MAX);
+        if (high - S_MAX).abs() < f32::EPSILON {
+            break;
+        }
+    }
+
+    for _ in 0..50 {
+        let mid = (low + high) / 2.0;
+        let r = fsrs7_forgetting_curve_scalar(w, mid, stability);
+        if r > desired_retention {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+
+    ((low + high) / 2.0).clamp(0.0, S_MAX)
+}
+
 impl<B: Backend> Model<B> {
     pub fn new(config: ModelConfig) -> Self {
         Self::new_with_device(config, &B::Device::default())
     }
 
     pub fn new_with_device(config: ModelConfig, device: &B::Device) -> Self {
-        let mut initial_params: Vec<f32> = config
-            .initial_stability
-            .unwrap_or_else(|| DEFAULT_PARAMETERS[0..4].try_into().unwrap())
-            .into_iter()
-            .chain(DEFAULT_PARAMETERS[4..].iter().copied())
-            .collect();
+        let mut initial_params = DEFAULT_PARAMETERS.to_vec();
+        if let Some(initial_stability) = config.initial_stability {
+            initial_params[0..4].copy_from_slice(&initial_stability);
+        }
+        if let Some(initial_forgetting_curve) = config.initial_forgetting_curve {
+            initial_params[27..35].copy_from_slice(&initial_forgetting_curve);
+        }
         if config.freeze_short_term_stability {
+            // Legacy (FSRS-6) short-term terms only.
             initial_params[17] = 0.0;
             initial_params[18] = 0.0;
             initial_params[19] = 0.0;
@@ -46,19 +110,56 @@ impl<B: Backend> Model<B> {
 
         Self {
             w: Param::from_tensor(Tensor::from_floats(
-                TensorData::new(initial_params, Shape { dims: vec![21] }),
+                TensorData::new(
+                    initial_params.clone(),
+                    Shape {
+                        dims: vec![initial_params.len()],
+                    },
+                ),
                 device,
             )),
         }
     }
 
-    pub fn power_forgetting_curve(&self, t: Tensor<B, 1>, s: Tensor<B, 1>) -> Tensor<B, 1> {
+    fn is_fsrs7(&self) -> bool {
+        self.w.val().dims()[0] >= FSRS7_PARAM_LEN
+    }
+
+    fn power_forgetting_curve_fsrs6(&self, t: Tensor<B, 1>, s: Tensor<B, 1>) -> Tensor<B, 1> {
         let decay = -self.w.get(20);
         let factor = decay.clone().powi_scalar(-1).mul_scalar(0.9f32.ln()).exp() - 1.0;
         (t / s * factor + 1.0).powf(decay)
     }
 
-    pub fn next_interval(
+    fn power_forgetting_curve_fsrs7(&self, t: Tensor<B, 1>, s: Tensor<B, 1>) -> Tensor<B, 1> {
+        let t_over_s = t / s.clone();
+
+        let decay1 = -self.w.get(27);
+        let decay2 = -self.w.get(28);
+        let base1 = self.w.get(29);
+        let base2 = self.w.get(30);
+
+        let factor1 = base1.clone().powf(decay1.clone().powi_scalar(-1)) - 1.0;
+        let factor2 = base2.clone().powf(decay2.clone().powi_scalar(-1)) - 1.0;
+
+        let r1 = (t_over_s.clone() * factor1 + 1.0).powf(decay1);
+        let r2 = (t_over_s * factor2 + 1.0).powf(decay2);
+
+        let weight1 = self.w.get(31) * s.clone().powf(-self.w.get(33));
+        let weight2 = self.w.get(32) * s.powf(self.w.get(34));
+
+        (weight1.clone() * r1 + weight2.clone() * r2) / (weight1 + weight2)
+    }
+
+    pub fn power_forgetting_curve(&self, t: Tensor<B, 1>, s: Tensor<B, 1>) -> Tensor<B, 1> {
+        if self.is_fsrs7() {
+            self.power_forgetting_curve_fsrs7(t, s)
+        } else {
+            self.power_forgetting_curve_fsrs6(t, s)
+        }
+    }
+
+    fn next_interval_fsrs6(
         &self,
         stability: Tensor<B, 1>,
         desired_retention: Tensor<B, 1>,
@@ -66,6 +167,39 @@ impl<B: Backend> Model<B> {
         let decay = -self.w.get(20);
         let factor = decay.clone().powi_scalar(-1).mul_scalar(0.9f32.ln()).exp() - 1.0;
         stability / factor * (desired_retention.powf(decay.powi_scalar(-1)) - 1.0)
+    }
+
+    fn next_interval_fsrs7(
+        &self,
+        stability: Tensor<B, 1>,
+        desired_retention: Tensor<B, 1>,
+    ) -> Tensor<B, 1> {
+        let device = stability.device();
+        let w = self.w.val().to_data().to_vec::<f32>().unwrap();
+        let stabilities = stability.to_data().to_vec::<f32>().unwrap();
+        let desired = desired_retention.to_data().to_vec::<f32>().unwrap();
+
+        let intervals: Vec<f32> = stabilities
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                let dr = desired.get(i).copied().unwrap_or_else(|| desired[0]);
+                fsrs7_next_interval_scalar(&w, s, dr)
+            })
+            .collect();
+        Tensor::from_floats(intervals.as_slice(), &device)
+    }
+
+    pub fn next_interval(
+        &self,
+        stability: Tensor<B, 1>,
+        desired_retention: Tensor<B, 1>,
+    ) -> Tensor<B, 1> {
+        if self.is_fsrs7() {
+            self.next_interval_fsrs7(stability, desired_retention)
+        } else {
+            self.next_interval_fsrs6(stability, desired_retention)
+        }
     }
 
     fn stability_after_success(
@@ -124,6 +258,61 @@ impl<B: Backend> Model<B> {
         self.w.get(7) * (self.init_difficulty(rating) - new_d.clone()) + new_d
     }
 
+    fn fsrs7_stability_for_set(
+        &self,
+        last_s: Tensor<B, 1>,
+        last_d: Tensor<B, 1>,
+        r: Tensor<B, 1>,
+        rating: Tensor<B, 1>,
+        start: usize,
+    ) -> Tensor<B, 1> {
+        let batch_size = rating.dims()[0];
+        let device = rating.device();
+        let hard_penalty = Tensor::ones([batch_size], &device)
+            .mask_where(rating.clone().equal_elem(2), self.w.get(start + 7));
+        let easy_bonus = Tensor::ones([batch_size], &device)
+            .mask_where(rating.clone().equal_elem(4), self.w.get(start + 8));
+
+        let new_s_fail = self.w.get(start + 3)
+            * last_d.clone().powf(-self.w.get(start + 4))
+            * ((last_s.clone() + 1).powf(self.w.get(start + 5)) - 1)
+            * ((-r.clone() + 1) * self.w.get(start + 6)).exp();
+        let pls = tensor_min(last_s.clone(), new_s_fail);
+
+        let sinc = self.w.get(start).add_scalar(-1.5).exp()
+            * last_d.neg().add_scalar(11.0)
+            * last_s.clone().powf(-self.w.get(start + 1))
+            * (((-r + 1) * self.w.get(start + 2)).exp() - 1)
+            * hard_penalty
+            * easy_bonus
+            + 1;
+        let new_s_success = tensor_max(pls.clone(), last_s * sinc);
+        let success = rating.greater_elem(1);
+        pls.mask_where(success, new_s_success)
+    }
+
+    fn fsrs7_transition_function(&self, delta_t: Tensor<B, 1>) -> Tensor<B, 1> {
+        (self.w.get(26) * (-self.w.get(25) * delta_t).exp())
+            .neg()
+            .add_scalar(1.0)
+    }
+
+    fn fsrs7_mean_reversion(&self, init: Tensor<B, 1>, current: Tensor<B, 1>) -> Tensor<B, 1> {
+        init.mul_scalar(0.01) + current.mul_scalar(0.99)
+    }
+
+    fn fsrs7_next_difficulty(
+        &self,
+        difficulty: Tensor<B, 1>,
+        rating: Tensor<B, 1>,
+    ) -> Tensor<B, 1> {
+        let delta_d = -self.w.get(6) * (rating - 3);
+        let new_d = difficulty.clone() + self.linear_damping(delta_d, difficulty);
+        let device = new_d.device();
+        let init = self.init_difficulty(Tensor::from_floats([4.0], &device));
+        self.fsrs7_mean_reversion(init, new_d).clamp(D_MIN, D_MAX)
+    }
+
     pub(crate) fn init_stability(&self, rating: Tensor<B, 1>) -> Tensor<B, 1> {
         self.w.val().select(0, rating.int() - 1)
     }
@@ -151,32 +340,54 @@ impl<B: Backend> Model<B> {
         let last_s = state.stability.clone().clamp(S_MIN, S_MAX);
         let last_d = state.difficulty.clone().clamp(D_MIN, D_MAX);
 
-        let retrievability = self.power_forgetting_curve(delta_t.clone(), last_s.clone());
-        let stability_after_success = self.stability_after_success(
-            last_s.clone(),
-            last_d.clone(),
-            retrievability.clone(),
-            rating.clone(),
-        );
-        let stability_after_failure =
-            self.stability_after_failure(last_s.clone(), last_d.clone(), retrievability);
-        let stability_short_term = self.stability_short_term(last_s.clone(), rating.clone());
-        let mut new_s = stability_after_success
-            .mask_where(rating.clone().equal_elem(1), stability_after_failure);
-        new_s = new_s.mask_where(delta_t.equal_elem(0), stability_short_term);
+        let mut new_s;
+        let mut new_d;
 
-        let mut new_d = self.next_difficulty(last_d.clone(), rating.clone());
-        new_d = self.mean_reversion(new_d).clamp(D_MIN, D_MAX);
+        if self.is_fsrs7() {
+            let retrievability = self.power_forgetting_curve(delta_t.clone(), last_s.clone());
+            let new_s_long_term = self.fsrs7_stability_for_set(
+                last_s.clone(),
+                last_d.clone(),
+                retrievability.clone(),
+                rating.clone(),
+                7,
+            );
+            let new_s_short_term = self.fsrs7_stability_for_set(
+                last_s.clone(),
+                last_d.clone(),
+                retrievability,
+                rating.clone(),
+                16,
+            );
+            let coefficient = self.fsrs7_transition_function(delta_t.clone());
+            let short_weight = coefficient.clone().neg().add_scalar(1.0);
+            new_s = coefficient * new_s_long_term + short_weight * new_s_short_term;
+            new_d = self.fsrs7_next_difficulty(last_d.clone(), rating.clone());
+        } else {
+            let retrievability = self.power_forgetting_curve(delta_t.clone(), last_s.clone());
+            let stability_after_success = self.stability_after_success(
+                last_s.clone(),
+                last_d.clone(),
+                retrievability.clone(),
+                rating.clone(),
+            );
+            let stability_after_failure =
+                self.stability_after_failure(last_s.clone(), last_d.clone(), retrievability);
+            let stability_short_term = self.stability_short_term(last_s.clone(), rating.clone());
+            new_s = stability_after_success
+                .mask_where(rating.clone().equal_elem(1), stability_after_failure);
+            new_s = new_s.mask_where(delta_t.equal_elem(0), stability_short_term);
+
+            new_d = self.next_difficulty(last_d.clone(), rating.clone());
+            new_d = self.mean_reversion(new_d).clamp(D_MIN, D_MAX);
+        }
 
         if nth == 0 {
-            // Check if state.stability is all zeros
             let is_initial = state.stability.equal_elem(0.0);
-            // If initial, use init_stability/init_difficulty, else use normal update
             let init_s = self.init_stability(rating.clone().clamp(1, 4));
             let init_d = self
                 .init_difficulty(rating.clone().clamp(1, 4))
                 .clamp(D_MIN, D_MAX);
-            // If state.stability == 0, use init values, else use calculated
             new_s = new_s.mask_where(is_initial.clone(), init_s);
             new_d = new_d.mask_where(is_initial, init_d);
         }
@@ -206,9 +417,7 @@ impl<B: Backend> Model<B> {
         };
         for i in 0..seq_len {
             let delta_t = delta_ts.get(i).squeeze(0);
-            // [batch_size]
             let rating = ratings.get(i).squeeze(0);
-            // [batch_size]
             state = self.step(delta_t, rating, state, i);
         }
         state
@@ -244,6 +453,7 @@ pub struct ModelConfig {
     #[config(default = false)]
     pub freeze_initial_stability: bool,
     pub initial_stability: Option<[f32; 4]>,
+    pub initial_forgetting_curve: Option<[f32; 8]>,
     #[config(default = false)]
     pub freeze_short_term_stability: bool,
     #[config(default = 1)]
@@ -303,10 +513,13 @@ pub(crate) fn parameters_to_model<B: Backend>(
 ) -> Model<B> {
     let config = ModelConfig::default();
     let mut model = Model::new_with_device(config.clone(), device);
+    let clipped = clip_parameters(parameters, config.num_relearning_steps, Default::default());
     model.w = Param::from_tensor(Tensor::from_floats(
         TensorData::new(
-            clip_parameters(parameters, config.num_relearning_steps, Default::default()),
-            Shape { dims: vec![21] },
+            clipped.clone(),
+            Shape {
+                dims: vec![clipped.len()],
+            },
         ),
         device,
     ));
@@ -329,7 +542,7 @@ pub(crate) fn check_and_fill_parameters(parameters: &Parameters) -> Result<Vec<f
             parameters.extend_from_slice(&[0.0, FSRS5_DEFAULT_DECAY]);
             parameters
         }
-        21 => parameters.to_vec(),
+        FSRS6_PARAM_LEN | FSRS7_PARAM_LEN => parameters.to_vec(),
         _ => return Err(FSRSError::InvalidParameters),
     };
     if parameters.iter().any(|&w| !w.is_finite()) {
@@ -341,17 +554,25 @@ pub(crate) fn check_and_fill_parameters(parameters: &Parameters) -> Result<Vec<f
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::FSRS6_DEFAULT_PARAMETERS;
     use crate::test_helpers::TestHelper;
     use crate::test_helpers::{Model, Tensor};
     use burn::tensor::{TensorData, Tolerance};
     static DEVICE: burn::backend::ndarray::NdArrayDevice = NdArrayDevice::Cpu;
+
+    fn fsrs6_model() -> Model {
+        parameters_to_model::<crate::test_helpers::NdArrayAutodiff>(
+            &FSRS6_DEFAULT_PARAMETERS,
+            &DEVICE,
+        )
+    }
 
     #[test]
     fn test_w() {
         let model = Model::new(ModelConfig::default());
         assert_eq!(
             model.w.val().to_data(),
-            TensorData::from(DEFAULT_PARAMETERS)
+            TensorData::new(DEFAULT_PARAMETERS.to_vec(), Shape { dims: vec![35] })
         )
     }
 
@@ -373,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_power_forgetting_curve() {
-        let model = Model::new(ModelConfig::default());
+        let model = fsrs6_model();
         let delta_t = Tensor::from_floats([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], &DEVICE);
         let stability = Tensor::from_floats([1.0, 2.0, 3.0, 4.0, 4.0, 2.0], &DEVICE);
         let retrievability = model.power_forgetting_curve(delta_t, stability);
@@ -386,43 +607,43 @@ mod tests {
 
     #[test]
     fn test_init_stability() {
-        let model = Model::new(ModelConfig::default());
+        let model = fsrs6_model();
         let rating = Tensor::from_floats([1.0, 2.0, 3.0, 4.0, 1.0, 2.0], &DEVICE);
         let stability = model.init_stability(rating);
         assert_eq!(
             stability.to_data(),
             TensorData::from([
-                DEFAULT_PARAMETERS[0],
-                DEFAULT_PARAMETERS[1],
-                DEFAULT_PARAMETERS[2],
-                DEFAULT_PARAMETERS[3],
-                DEFAULT_PARAMETERS[0],
-                DEFAULT_PARAMETERS[1]
+                FSRS6_DEFAULT_PARAMETERS[0],
+                FSRS6_DEFAULT_PARAMETERS[1],
+                FSRS6_DEFAULT_PARAMETERS[2],
+                FSRS6_DEFAULT_PARAMETERS[3],
+                FSRS6_DEFAULT_PARAMETERS[0],
+                FSRS6_DEFAULT_PARAMETERS[1]
             ])
         )
     }
 
     #[test]
     fn test_init_difficulty() {
-        let model = Model::new(ModelConfig::default());
+        let model = fsrs6_model();
         let rating = Tensor::from_floats([1.0, 2.0, 3.0, 4.0, 1.0, 2.0], &DEVICE);
         let difficulty = model.init_difficulty(rating);
         assert_eq!(
             difficulty.to_data(),
             TensorData::from([
-                DEFAULT_PARAMETERS[4],
-                DEFAULT_PARAMETERS[4] - DEFAULT_PARAMETERS[5].exp() + 1.0,
-                DEFAULT_PARAMETERS[4] - (2.0 * DEFAULT_PARAMETERS[5]).exp() + 1.0,
-                DEFAULT_PARAMETERS[4] - (3.0 * DEFAULT_PARAMETERS[5]).exp() + 1.0,
-                DEFAULT_PARAMETERS[4],
-                DEFAULT_PARAMETERS[4] - DEFAULT_PARAMETERS[5].exp() + 1.0,
+                FSRS6_DEFAULT_PARAMETERS[4],
+                FSRS6_DEFAULT_PARAMETERS[4] - FSRS6_DEFAULT_PARAMETERS[5].exp() + 1.0,
+                FSRS6_DEFAULT_PARAMETERS[4] - (2.0 * FSRS6_DEFAULT_PARAMETERS[5]).exp() + 1.0,
+                FSRS6_DEFAULT_PARAMETERS[4] - (3.0 * FSRS6_DEFAULT_PARAMETERS[5]).exp() + 1.0,
+                FSRS6_DEFAULT_PARAMETERS[4],
+                FSRS6_DEFAULT_PARAMETERS[4] - FSRS6_DEFAULT_PARAMETERS[5].exp() + 1.0,
             ])
         )
     }
 
     #[test]
     fn test_forward() {
-        let model = Model::new(ModelConfig::default());
+        let model = fsrs6_model();
         let delta_ts = Tensor::from_floats(
             [
                 [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -458,7 +679,7 @@ mod tests {
 
     #[test]
     fn test_next_difficulty() {
-        let model = Model::new(ModelConfig::default());
+        let model = fsrs6_model();
         let difficulty = Tensor::from_floats([5.0; 4], &DEVICE);
         let rating = Tensor::from_floats([1.0, 2.0, 3.0, 4.0], &DEVICE);
         let next_difficulty = model.next_difficulty(difficulty, rating);
@@ -481,7 +702,7 @@ mod tests {
 
     #[test]
     fn test_next_stability() {
-        let model = Model::new(ModelConfig::default());
+        let model = fsrs6_model();
         let stability = Tensor::from_floats([5.0; 4], &DEVICE);
         let difficulty = Tensor::from_floats([1.0, 2.0, 3.0, 4.0], &DEVICE);
         let retrievability = Tensor::from_floats([0.9, 0.8, 0.7, 0.6], &DEVICE);
@@ -536,6 +757,27 @@ mod tests {
         assert!(FSRS::new(&[]).is_ok());
         assert!(FSRS::new(&[1.]).is_err());
         assert!(FSRS::new(DEFAULT_PARAMETERS.as_slice()).is_ok());
-        assert!(FSRS::new(&DEFAULT_PARAMETERS[..17]).is_ok());
+        assert!(FSRS::new(&FSRS6_DEFAULT_PARAMETERS[..17]).is_ok());
+        assert!(FSRS::new(&FSRS6_DEFAULT_PARAMETERS).is_ok());
+    }
+
+    #[test]
+    fn test_fsrs7_path_produces_finite_interval() {
+        let model = Model::new(ModelConfig::default());
+        let delta_ts = Tensor::from_floats([[0.0], [3.0]], &DEVICE);
+        let ratings = Tensor::from_floats([[3.0], [3.0]], &DEVICE);
+        let state = model.forward(delta_ts, ratings, None);
+        let stability: f32 = state.stability.into_scalar();
+        assert!(stability.is_finite());
+        assert!(stability > 0.0);
+
+        let interval = model
+            .next_interval(
+                Tensor::from_floats([stability], &DEVICE),
+                Tensor::from_floats([0.9], &DEVICE),
+            )
+            .into_scalar();
+        assert!(interval.is_finite());
+        assert!(interval >= 0.0);
     }
 }

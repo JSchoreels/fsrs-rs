@@ -204,30 +204,91 @@ fn init_s(w: &[f32], rating: usize) -> f32 {
     w[rating - 1]
 }
 
-fn stability_after_success(w: &[f32], s: f32, r: f32, d: f32, rating: usize) -> f32 {
-    let hard_penalty = if rating == 2 { w[15] } else { 1.0 };
-    let easy_bonus = if rating == 4 { w[16] } else { 1.0 };
-    (s * (f32::exp(w[8])
-        * (11.0 - d)
-        * s.powf(-w[9])
-        * (f32::exp((1.0 - r) * w[10]) - 1.0)
-        * hard_penalty)
-        .mul_add(easy_bonus, 1.0))
-    .clamp(S_MIN, S_MAX)
+fn is_fsrs7(w: &[f32]) -> bool {
+    w.len() >= 35
 }
 
-fn stability_after_failure(w: &[f32], s: f32, r: f32, d: f32) -> f32 {
-    let new_s_min = s / (w[17] * w[18]).exp();
-    let new_s =
-        (w[11] * d.powf(-w[12]) * ((s + 1.0).powf(w[13]) - 1.0) * f32::exp((1.0 - r) * w[14]))
-            .min(new_s_min);
-    new_s.clamp(S_MIN, S_MAX)
+fn fsrs7_transition(w: &[f32], delta_t: f32) -> f32 {
+    1.0 - w[26] * (-w[25] * delta_t).exp()
 }
 
-fn stability_short_term(w: &[f32], s: f32, rating: usize) -> f32 {
-    let sinc = (w[17] * (rating as f32 - 3.0 + w[18])).exp() * s.powf(-w[19]);
-    let new_s = s * if rating >= 3 { sinc.max(1.0) } else { sinc };
-    new_s.clamp(S_MIN, S_MAX)
+fn fsrs7_stability_after_review_set(
+    w: &[f32],
+    s: f32,
+    r: f32,
+    d: f32,
+    rating: usize,
+    start: usize,
+) -> f32 {
+    let hard_penalty = if rating == 2 { w[start + 7] } else { 1.0 };
+    let easy_bonus = if rating == 4 { w[start + 8] } else { 1.0 };
+
+    let new_s_fail = w[start + 3]
+        * d.powf(-w[start + 4])
+        * ((s + 1.0).powf(w[start + 5]) - 1.0)
+        * ((1.0 - r) * w[start + 6]).exp();
+    let pls = s.min(new_s_fail);
+
+    if rating > 1 {
+        let sinc = 1.0
+            + (w[start] - 1.5).exp()
+                * (11.0 - d)
+                * s.powf(-w[start + 1])
+                * (((1.0 - r) * w[start + 2]).exp() - 1.0)
+                * hard_penalty
+                * easy_bonus;
+        pls.max(s * sinc)
+    } else {
+        pls
+    }
+}
+
+fn stability_after_success(w: &[f32], s: f32, r: f32, d: f32, rating: usize, delta_t: f32) -> f32 {
+    if is_fsrs7(w) {
+        let long = fsrs7_stability_after_review_set(w, s, r, d, rating, 7);
+        let short = fsrs7_stability_after_review_set(w, s, r, d, rating, 16);
+        let coefficient = fsrs7_transition(w, delta_t);
+        (coefficient * long + (1.0 - coefficient) * short).clamp(S_MIN, S_MAX)
+    } else {
+        let hard_penalty = if rating == 2 { w[15] } else { 1.0 };
+        let easy_bonus = if rating == 4 { w[16] } else { 1.0 };
+        (s * (f32::exp(w[8])
+            * (11.0 - d)
+            * s.powf(-w[9])
+            * (f32::exp((1.0 - r) * w[10]) - 1.0)
+            * hard_penalty)
+            .mul_add(easy_bonus, 1.0))
+        .clamp(S_MIN, S_MAX)
+    }
+}
+
+fn stability_after_failure(w: &[f32], s: f32, r: f32, d: f32, delta_t: f32) -> f32 {
+    if is_fsrs7(w) {
+        let long = fsrs7_stability_after_review_set(w, s, r, d, 1, 7);
+        let short = fsrs7_stability_after_review_set(w, s, r, d, 1, 16);
+        let coefficient = fsrs7_transition(w, delta_t);
+        (coefficient * long + (1.0 - coefficient) * short).clamp(S_MIN, S_MAX)
+    } else {
+        let new_s_min = s / (w[17] * w[18]).exp();
+        let new_s =
+            (w[11] * d.powf(-w[12]) * ((s + 1.0).powf(w[13]) - 1.0) * f32::exp((1.0 - r) * w[14]))
+                .min(new_s_min);
+        new_s.clamp(S_MIN, S_MAX)
+    }
+}
+
+fn stability_short_term(w: &[f32], s: f32, d: f32, rating: usize) -> f32 {
+    if is_fsrs7(w) {
+        let r = 1.0;
+        let long = fsrs7_stability_after_review_set(w, s, r, d, rating, 7);
+        let short = fsrs7_stability_after_review_set(w, s, r, d, rating, 16);
+        let coefficient = fsrs7_transition(w, 0.0);
+        (coefficient * long + (1.0 - coefficient) * short).clamp(S_MIN, S_MAX)
+    } else {
+        let sinc = (w[17] * (rating as f32 - 3.0 + w[18])).exp() * s.powf(-w[19]);
+        let new_s = s * if rating >= 3 { sinc.max(1.0) } else { sinc };
+        new_s.clamp(S_MIN, S_MAX)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -261,7 +322,7 @@ fn memory_state_short_term(
         }
         let next_rating_dist = WeightedIndex::new(step_transitions[rating - 1]).unwrap();
         rating = RATINGS[next_rating_dist.sample(rng)];
-        new_s = stability_short_term(w, new_s, rating);
+        new_s = stability_short_term(w, new_s, new_d, rating);
         new_d = next_d(w, new_d, rating);
         cost += rating_costs[rating - 1];
         if rating > 2 {
@@ -288,20 +349,64 @@ fn next_d(w: &[f32], d: f32, rating: usize) -> f32 {
 }
 
 fn mean_reversion(w: &[f32], init: f32, current: f32) -> f32 {
-    w[7] * init + (1.0 - w[7]) * current
+    if is_fsrs7(w) {
+        0.01 * init + 0.99 * current
+    } else {
+        w[7] * init + (1.0 - w[7]) * current
+    }
 }
 
 fn power_forgetting_curve(w: &[f32], t: f32, s: f32) -> f32 {
     debug_assert!(t >= 0.);
-    let decay = -w[20];
-    let factor = 0.9f32.powf(1.0 / decay) - 1.0;
-    (t / s).mul_add(factor, 1.0).powf(decay)
+    if is_fsrs7(w) {
+        let s = s.max(S_MIN);
+        let t_over_s = t / s;
+        let decay1 = -w[27];
+        let decay2 = -w[28];
+        let base1 = w[29];
+        let base2 = w[30];
+        let factor1 = base1.powf(1.0 / decay1) - 1.0;
+        let factor2 = base2.powf(1.0 / decay2) - 1.0;
+        let r1 = (1.0 + factor1 * t_over_s).powf(decay1);
+        let r2 = (1.0 + factor2 * t_over_s).powf(decay2);
+        let weight1 = w[31] * s.powf(-w[33]);
+        let weight2 = w[32] * s.powf(w[34]);
+        (weight1 * r1 + weight2 * r2) / (weight1 + weight2)
+    } else {
+        let decay = -w[20];
+        let factor = 0.9f32.powf(1.0 / decay) - 1.0;
+        (t / s).mul_add(factor, 1.0).powf(decay)
+    }
 }
 
 fn next_interval(w: &[f32], stability: f32, desired_retention: f32) -> f32 {
-    let decay = -w[20];
-    let factor = 0.9f32.powf(1.0 / decay) - 1.0;
-    stability / factor * (desired_retention.powf(1.0 / decay) - 1.0)
+    if is_fsrs7(w) {
+        let desired_retention = desired_retention.clamp(0.0001, 0.9999);
+        if desired_retention >= 0.9999 {
+            return 0.0;
+        }
+        let mut low = 0.0;
+        let mut high = stability.max(1.0);
+        while power_forgetting_curve(w, high, stability) > desired_retention && high < S_MAX {
+            high = (high * 2.0).min(S_MAX);
+            if (high - S_MAX).abs() < f32::EPSILON {
+                break;
+            }
+        }
+        for _ in 0..50 {
+            let mid = (low + high) / 2.0;
+            if power_forgetting_curve(w, mid, stability) > desired_retention {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        ((low + high) / 2.0).clamp(0.0, S_MAX)
+    } else {
+        let decay = -w[20];
+        let factor = 0.9f32.powf(1.0 / decay) - 1.0;
+        stability / factor * (desired_retention.powf(1.0 / decay) - 1.0)
+    }
 }
 
 /// Dynamic programming-based workload estimator
@@ -418,9 +523,9 @@ impl WorkloadEstimator {
                 let d = self.d_state[d_idx];
                 for rating in 1..=4 {
                     let next_s = if rating == 1 {
-                        stability_after_failure(w, s, r, d)
+                        stability_after_failure(w, s, r, d, ivl)
                     } else {
-                        stability_after_success(w, s, r, d, rating)
+                        stability_after_success(w, s, r, d, rating, ivl)
                     };
                     let next_d_val = next_d(w, d, rating);
                     let next_ivl =
@@ -537,7 +642,13 @@ impl WorkloadEstimator {
             let (new_stability, new_difficulty) = if rating == 1 {
                 // Failed recall - use failure transition
                 (
-                    stability_after_failure(w, card.stability, retrievability, card.difficulty),
+                    stability_after_failure(
+                        w,
+                        card.stability,
+                        retrievability,
+                        card.difficulty,
+                        ivl,
+                    ),
                     next_d(w, card.difficulty, rating),
                 )
             } else {
@@ -549,6 +660,7 @@ impl WorkloadEstimator {
                         retrievability,
                         card.difficulty,
                         rating,
+                        ivl,
                     ),
                     next_d(w, card.difficulty, rating),
                 )
@@ -866,6 +978,7 @@ pub fn simulate(
         } else {
             // For review cards
             let last_stability = card.stability;
+            let ivl = card.due - card.last_date;
 
             // Calculate retrievability for entries where has_learned is true
             let retrievability = card.retrievability();
@@ -891,6 +1004,7 @@ pub fn simulate(
                     last_stability,
                     retrievability,
                     card.difficulty,
+                    card.due - card.last_date,
                 );
                 let post_lapse_difficulty = next_d(&card.parameters, card.difficulty, rating);
                 let (new_s, new_d, cost) = memory_state_short_term(
@@ -916,6 +1030,7 @@ pub fn simulate(
                         retrievability,
                         card.difficulty,
                         rating,
+                        ivl,
                     ),
                     next_d(&card.parameters, card.difficulty, rating),
                     config.state_rating_costs[REVIEW][rating - 1],
@@ -1545,7 +1660,7 @@ mod tests {
 
         let s = 10.0;
         let d = 5.0;
-        let post_lapse_s = stability_after_failure(&w, s, 0.9, d);
+        let post_lapse_s = stability_after_failure(&w, s, 0.9, d, 1.0);
         let post_lapse_d = next_d(&w, d, 1);
         let cost = config.state_rating_costs[REVIEW][0];
         dbg!(post_lapse_s, post_lapse_d, cost);
