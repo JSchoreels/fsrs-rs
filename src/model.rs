@@ -10,9 +10,22 @@ use burn::{
     module::{Module, Param},
     tensor::{Shape, Tensor, TensorData, backend::Backend},
 };
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const FSRS6_PARAM_LEN: usize = 21;
 const FSRS7_PARAM_LEN: usize = 35;
+const FSRS7_S90_TARGET: f32 = 0.9;
+const FSRS7_LUT_SIZE: usize = 256;
+const FSRS7_BISECTION_ITERS: usize = 50;
+const FSRS7_BRENT_ITERS: usize = 10;
+const FSRS7_BRENT_TOL: f64 = 1e-3;
+const FSRS7_DR_MIN: f32 = 0.0001;
+const FSRS7_DR_MAX: f32 = 0.9999;
+const FSRS7_LUT_S_MIN: f32 = 0.03;
+const FSRS7_LUT_S_MAX: f32 = 3000.0;
 
 #[derive(Module, Debug)]
 pub struct Model<B: Backend> {
@@ -57,16 +70,167 @@ fn fsrs7_forgetting_curve_scalar(w: &[f32], t: f32, s: f32) -> f32 {
     (weight1 * r1 + weight2 * r2) / (weight1 + weight2)
 }
 
-fn fsrs7_next_interval_scalar(w: &[f32], stability: f32, desired_retention: f32) -> f32 {
-    let desired_retention = desired_retention.clamp(0.0001, 0.9999);
+#[derive(Debug)]
+struct Fsrs7S90Lut {
+    log_s_min: f32,
+    log_s_step: f32,
+    t90_grid: Vec<f32>,
+}
+
+impl Fsrs7S90Lut {
+    fn build(w: &[f32]) -> Self {
+        let log_s_min = FSRS7_LUT_S_MIN.max(S_MIN).ln();
+        let log_s_max = FSRS7_LUT_S_MAX.min(S_MAX).ln();
+        let log_s_step = (log_s_max - log_s_min) / (FSRS7_LUT_SIZE - 1) as f32;
+        let mut t90_grid = Vec::with_capacity(FSRS7_LUT_SIZE);
+        for i in 0..FSRS7_LUT_SIZE {
+            let log_s = log_s_min + i as f32 * log_s_step;
+            let s = log_s.exp();
+            t90_grid.push(fsrs7_next_interval_bisection_scalar(
+                w,
+                s,
+                FSRS7_S90_TARGET,
+                None,
+            ));
+        }
+        Self {
+            log_s_min,
+            log_s_step,
+            t90_grid,
+        }
+    }
+
+    fn interpolate_t90(&self, stability: f32) -> f32 {
+        if self.t90_grid.len() == 1 {
+            return self.t90_grid[0];
+        }
+        let s = stability
+            .max(FSRS7_LUT_S_MIN.max(S_MIN))
+            .min(FSRS7_LUT_S_MAX.min(S_MAX));
+        let max_index = (self.t90_grid.len() - 1) as f32;
+        let position = ((s.ln() - self.log_s_min) / self.log_s_step).clamp(0.0, max_index);
+        let left = position.floor() as usize;
+        let right = (left + 1).min(self.t90_grid.len() - 1);
+        if left == right {
+            return self.t90_grid[left];
+        }
+        let weight = position - left as f32;
+        self.t90_grid[left] + weight * (self.t90_grid[right] - self.t90_grid[left])
+    }
+}
+
+static FSRS7_S90_LUT_CACHE: OnceLock<Mutex<HashMap<u64, Arc<Fsrs7S90Lut>>>> = OnceLock::new();
+
+fn fsrs7_params_hash(w: &[f32]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    w.iter()
+        .take(FSRS7_PARAM_LEN)
+        .for_each(|x| x.to_bits().hash(&mut hasher));
+    hasher.finish()
+}
+
+fn fsrs7_s90_lut(w: &[f32]) -> Arc<Fsrs7S90Lut> {
+    let key = fsrs7_params_hash(w);
+    let cache = FSRS7_S90_LUT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(lut) = cache
+        .lock()
+        .expect("fsrs7 lut cache lock poisoned")
+        .get(&key)
+        .cloned()
+    {
+        return lut;
+    }
+    let built = Arc::new(Fsrs7S90Lut::build(w));
+    let mut guard = cache.lock().expect("fsrs7 lut cache lock poisoned");
+    guard.entry(key).or_insert_with(|| built.clone()).clone()
+}
+
+fn brent_root_f64<F>(mut f: F, mut a: f64, mut b: f64, tol: f64, max_iter: usize) -> Option<f64>
+where
+    F: FnMut(f64) -> f64,
+{
+    let mut fa = f(a);
+    let mut fb = f(b);
+    if !fa.is_finite() || !fb.is_finite() || fa * fb > 0.0 {
+        return None;
+    }
+    if fa.abs() < fb.abs() {
+        std::mem::swap(&mut a, &mut b);
+        std::mem::swap(&mut fa, &mut fb);
+    }
+
+    let mut c = a;
+    let mut fc = fa;
+    let mut d = c;
+    let mut mflag = true;
+
+    for _ in 0..max_iter {
+        let mut s = if (fa - fc).abs() > f64::EPSILON && (fb - fc).abs() > f64::EPSILON {
+            a * fb * fc / ((fa - fb) * (fa - fc))
+                + b * fa * fc / ((fb - fa) * (fb - fc))
+                + c * fa * fb / ((fc - fa) * (fc - fb))
+        } else if (fb - fa).abs() > f64::EPSILON {
+            b - fb * (b - a) / (fb - fa)
+        } else {
+            (a + b) * 0.5
+        };
+
+        let lower = ((3.0 * a) + b) * 0.25;
+        let upper = b;
+        let cond1 = (s <= lower && s <= upper) || (s >= lower && s >= upper);
+        let cond2 = mflag && (s - b).abs() >= (b - c).abs() * 0.5;
+        let cond3 = !mflag && (s - b).abs() >= (c - d).abs() * 0.5;
+        let cond4 = mflag && (b - c).abs() < tol;
+        let cond5 = !mflag && (c - d).abs() < tol;
+        if cond1 || cond2 || cond3 || cond4 || cond5 {
+            s = (a + b) * 0.5;
+            mflag = true;
+        } else {
+            mflag = false;
+        }
+
+        let fs = f(s);
+        d = c;
+        c = b;
+        fc = fb;
+        if fa * fs < 0.0 {
+            b = s;
+            fb = fs;
+        } else {
+            a = s;
+            fa = fs;
+        }
+
+        if fa.abs() < fb.abs() {
+            std::mem::swap(&mut a, &mut b);
+            std::mem::swap(&mut fa, &mut fb);
+        }
+
+        if fb.abs() <= tol {
+            return Some(b);
+        }
+    }
+    None
+}
+
+fn fsrs7_next_interval_bisection_scalar(
+    w: &[f32],
+    stability: f32,
+    desired_retention: f32,
+    high_hint: Option<f32>,
+) -> f32 {
+    let desired_retention = desired_retention.clamp(FSRS7_DR_MIN, FSRS7_DR_MAX);
     let stability = stability.max(S_MIN);
 
-    if desired_retention >= 0.9999 {
+    if desired_retention >= FSRS7_DR_MAX {
         return 0.0;
     }
 
     let mut low = 0.0;
-    let mut high = stability.max(1.0);
+    let mut high = high_hint
+        .unwrap_or_else(|| stability.max(1.0))
+        .clamp(0.0, S_MAX)
+        .max(S_MIN);
 
     while fsrs7_forgetting_curve_scalar(w, high, stability) > desired_retention && high < S_MAX {
         high = (high * 2.0).min(S_MAX);
@@ -75,7 +239,7 @@ fn fsrs7_next_interval_scalar(w: &[f32], stability: f32, desired_retention: f32)
         }
     }
 
-    for _ in 0..50 {
+    for _ in 0..FSRS7_BISECTION_ITERS {
         let mid = (low + high) / 2.0;
         let r = fsrs7_forgetting_curve_scalar(w, mid, stability);
         if r > desired_retention {
@@ -86,6 +250,49 @@ fn fsrs7_next_interval_scalar(w: &[f32], stability: f32, desired_retention: f32)
     }
 
     ((low + high) / 2.0).clamp(0.0, S_MAX)
+}
+
+fn fsrs7_next_interval_scalar(
+    w: &[f32],
+    stability: f32,
+    desired_retention: f32,
+    lut: &Fsrs7S90Lut,
+) -> f32 {
+    let desired_retention = desired_retention.clamp(FSRS7_DR_MIN, FSRS7_DR_MAX);
+    let stability = stability.max(S_MIN);
+    if desired_retention >= FSRS7_DR_MAX {
+        return 0.0;
+    }
+
+    let f = |t: f32| fsrs7_forgetting_curve_scalar(w, t, stability) - desired_retention;
+    let mut high = lut.interpolate_t90(stability).clamp(0.0, S_MAX).max(S_MIN);
+    let mut f_high = f(high);
+    if !f_high.is_finite() {
+        return fsrs7_next_interval_bisection_scalar(w, stability, desired_retention, Some(high));
+    }
+    while f_high > 0.0 && high < S_MAX {
+        high = (high * 2.0).min(S_MAX);
+        f_high = f(high);
+    }
+    if !f_high.is_finite() {
+        return fsrs7_next_interval_bisection_scalar(w, stability, desired_retention, Some(high));
+    }
+    if f_high > 0.0 {
+        return S_MAX;
+    }
+
+    let brent = brent_root_f64(
+        |x| f(x as f32) as f64,
+        0.0,
+        high as f64,
+        FSRS7_BRENT_TOL,
+        FSRS7_BRENT_ITERS,
+    );
+    if let Some(root) = brent {
+        root as f32
+    } else {
+        fsrs7_next_interval_bisection_scalar(w, stability, desired_retention, Some(high))
+    }
 }
 
 impl<B: Backend> Model<B> {
@@ -176,6 +383,7 @@ impl<B: Backend> Model<B> {
     ) -> Tensor<B, 1> {
         let device = stability.device();
         let w = self.w.val().to_data().to_vec::<f32>().unwrap();
+        let lut = fsrs7_s90_lut(&w);
         let stabilities = stability.to_data().to_vec::<f32>().unwrap();
         let desired = desired_retention.to_data().to_vec::<f32>().unwrap();
 
@@ -184,7 +392,7 @@ impl<B: Backend> Model<B> {
             .enumerate()
             .map(|(i, &s)| {
                 let dr = desired.get(i).copied().unwrap_or_else(|| desired[0]);
-                fsrs7_next_interval_scalar(&w, s, dr)
+                fsrs7_next_interval_scalar(&w, s, dr, lut.as_ref())
             })
             .collect();
         Tensor::from_floats(intervals.as_slice(), &device)
@@ -779,5 +987,137 @@ mod tests {
             .into_scalar();
         assert!(interval.is_finite());
         assert!(interval >= 0.0);
+    }
+
+    #[test]
+    fn test_fsrs7_scalar_interval_hits_target_retrievability() {
+        let w = DEFAULT_PARAMETERS;
+        let lut = Fsrs7S90Lut::build(&w);
+        for stability in [0.2, 1.0, 10.0, 100.0, 1000.0] {
+            for desired in [0.5, 0.7, 0.8, 0.9, 0.95] {
+                let t = fsrs7_next_interval_scalar(&w, stability, desired, &lut);
+                let r = fsrs7_forgetting_curve_scalar(&w, t, stability);
+                assert!(
+                    (r - desired).abs() <= 1e-3 || (t - S_MAX).abs() < 1e-4,
+                    "stability={stability}, desired={desired}, t={t}, r={r}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fsrs7_scalar_interval_matches_bisection_baseline() {
+        let w = DEFAULT_PARAMETERS;
+        let lut = Fsrs7S90Lut::build(&w);
+        for stability in [0.2, 1.0, 10.0, 100.0, 1000.0] {
+            for desired in [0.4, 0.6, 0.8, 0.9, 0.95] {
+                let baseline = fsrs7_next_interval_bisection_scalar(&w, stability, desired, None);
+                let optimized = fsrs7_next_interval_scalar(&w, stability, desired, &lut);
+                let baseline_r = fsrs7_forgetting_curve_scalar(&w, baseline, stability);
+                let optimized_r = fsrs7_forgetting_curve_scalar(&w, optimized, stability);
+                assert!(
+                    (optimized_r - baseline_r).abs() <= 1e-3,
+                    "stability={stability}, desired={desired}, baseline={baseline}, optimized={optimized}, baseline_r={baseline_r}, optimized_r={optimized_r}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fsrs7_s90_lut_cache_reuse() {
+        let w = DEFAULT_PARAMETERS;
+        let lut_a = fsrs7_s90_lut(&w);
+        let lut_b = fsrs7_s90_lut(&w);
+        assert!(std::sync::Arc::ptr_eq(&lut_a, &lut_b));
+
+        let mut w2 = DEFAULT_PARAMETERS;
+        w2[27] += 0.001;
+        let lut_c = fsrs7_s90_lut(&w2);
+        assert!(!std::sync::Arc::ptr_eq(&lut_a, &lut_c));
+    }
+
+    #[test]
+    fn test_fsrs7_scalar_interval_monotonicity() {
+        let w = DEFAULT_PARAMETERS;
+        let lut = Fsrs7S90Lut::build(&w);
+
+        for stability in [0.2, 1.0, 10.0, 100.0, 1000.0] {
+            let desireds = [0.2, 0.4, 0.6, 0.8, 0.9, 0.95];
+            let intervals: Vec<f32> = desireds
+                .iter()
+                .map(|&dr| fsrs7_next_interval_scalar(&w, stability, dr, &lut))
+                .collect();
+            for pair in intervals.windows(2) {
+                assert!(
+                    pair[0] >= pair[1],
+                    "expected interval to decrease with higher retention: stability={stability}, intervals={intervals:?}"
+                );
+            }
+        }
+
+        for desired in [0.5, 0.7, 0.9] {
+            let stabilities = [0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 100.0, 1000.0];
+            let intervals: Vec<f32> = stabilities
+                .iter()
+                .map(|&s| fsrs7_next_interval_scalar(&w, s, desired, &lut))
+                .collect();
+            for pair in intervals.windows(2) {
+                assert!(
+                    pair[1] >= pair[0],
+                    "expected interval to increase with stability: desired={desired}, intervals={intervals:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fsrs7_scalar_interval_matches_bisection_dense_grid() {
+        let w = DEFAULT_PARAMETERS;
+        let lut = Fsrs7S90Lut::build(&w);
+        let desireds = [0.25, 0.4, 0.55, 0.7, 0.8, 0.9, 0.95, 0.98];
+
+        for i in 0..25 {
+            let p = i as f32 / 24.0;
+            let stability = (S_MIN.ln() + (S_MAX.ln() - S_MIN.ln()) * p).exp();
+            for desired in desireds {
+                let baseline = fsrs7_next_interval_bisection_scalar(&w, stability, desired, None);
+                let optimized = fsrs7_next_interval_scalar(&w, stability, desired, &lut);
+                let baseline_r = fsrs7_forgetting_curve_scalar(&w, baseline, stability);
+                let optimized_r = fsrs7_forgetting_curve_scalar(&w, optimized, stability);
+                assert!(
+                    (optimized_r - baseline_r).abs() <= 1e-3,
+                    "stability={stability}, desired={desired}, baseline={baseline}, optimized={optimized}, baseline_r={baseline_r}, optimized_r={optimized_r}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fsrs7_model_next_interval_vectorized_matches_scalar() {
+        let model = Model::new(ModelConfig::default());
+        let w = model.w.val().to_data().to_vec::<f32>().unwrap();
+        let lut = fsrs7_s90_lut(&w);
+
+        let stabilities = [0.2, 0.8, 3.0, 12.0, 40.0, 200.0];
+        let desired = [0.95, 0.9, 0.8, 0.7, 0.6, 0.5];
+
+        let model_out = model
+            .next_interval(
+                Tensor::from_floats(stabilities, &DEVICE),
+                Tensor::from_floats(desired, &DEVICE),
+            )
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        let scalar_out: Vec<f32> = stabilities
+            .iter()
+            .zip(desired.iter())
+            .map(|(&s, &dr)| fsrs7_next_interval_scalar(&w, s, dr, lut.as_ref()))
+            .collect();
+
+        for (model_value, scalar_value) in model_out.iter().zip(scalar_out.iter()) {
+            assert!((model_value - scalar_value).abs() < 1e-4);
+        }
     }
 }

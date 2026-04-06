@@ -25,6 +25,7 @@ pub type Parameters = [f32];
 
 pub const FSRS5_DEFAULT_DECAY: f32 = 0.5;
 pub const FSRS6_DEFAULT_DECAY: f32 = 0.1542;
+const FSRS7_PARAM_LEN: usize = 35;
 
 pub static FSRS6_DEFAULT_PARAMETERS: [f32; 21] = [
     0.212,
@@ -418,6 +419,32 @@ impl<B: Backend> FSRS<B> {
             )
             .into_scalar()
             .elem()
+    }
+
+    /// Return the interval (in days) at which retrievability reaches `target_retrievability`.
+    ///
+    /// For legacy models (17/19/21 params), `target_retrievability == 0.9` maps directly to
+    /// the model stability by definition, so this function returns `state.stability` exactly.
+    /// For FSRS-7, this is solved via the model's bisection-based `next_interval` path.
+    pub fn interval_at_retrievability(
+        &self,
+        state: MemoryState,
+        target_retrievability: f32,
+    ) -> f32 {
+        let target_retrievability = target_retrievability.clamp(0.0001, 0.9999);
+        let stability = state.stability.max(S_MIN);
+        let is_fsrs7 = self.model().w.val().dims()[0] >= FSRS7_PARAM_LEN;
+
+        if !is_fsrs7 && (target_retrievability - 0.9).abs() <= f32::EPSILON {
+            stability
+        } else {
+            self.next_interval(Some(stability), target_retrievability, 3)
+        }
+    }
+
+    /// Convenience helper for "S90": the interval (in days) where retrievability is 90%.
+    pub fn s90(&self, state: MemoryState) -> f32 {
+        self.interval_at_retrievability(state, 0.9)
     }
 
     /// The intervals and memory states for each answer button.
@@ -1559,5 +1586,29 @@ mod tests {
             / interval as f32;
         assert!((fsrs_factor - ease_factor).abs() < 0.01);
         Ok(())
+    }
+
+    #[test]
+    fn test_s90_legacy_equals_stability() {
+        let fsrs = FSRS::new(&FSRS6_DEFAULT_PARAMETERS).unwrap();
+        let state = MemoryState {
+            stability: 12.345,
+            difficulty: 5.0,
+        };
+
+        assert_eq!(fsrs.s90(state), state.stability);
+    }
+
+    #[test]
+    fn test_s90_fsrs7_hits_90_retrievability() {
+        let fsrs = FSRS::new(&DEFAULT_PARAMETERS).unwrap();
+        let state = MemoryState {
+            stability: 10.0,
+            difficulty: 5.0,
+        };
+
+        let s90 = fsrs.s90(state);
+        let r = fsrs.current_retrievability(state, s90);
+        assert!((r - 0.9).abs() <= 1e-3);
     }
 }
