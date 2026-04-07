@@ -51,28 +51,17 @@ fn synthetic_items() -> Vec<FSRSItem> {
 fn benchmark_compute_parameters_fsrs7_penalty(c: &mut Criterion) {
     let items = synthetic_items();
 
-    let input_off = ComputeParametersInput {
-        train_set: items.clone(),
-        progress: None,
-        enable_short_term: true,
-        num_relearning_steps: None,
-        fsrs7_penalty: false,
-    };
-    let input_on = ComputeParametersInput {
+    let input = ComputeParametersInput {
         train_set: items,
         progress: None,
         enable_short_term: true,
         num_relearning_steps: None,
-        fsrs7_penalty: true,
     };
 
     let mut group = c.benchmark_group("fsrs7_penalty");
     group.sample_size(10);
-    group.bench_function("compute_parameters_penalty_off", |b| {
-        b.iter(|| compute_parameters(black_box(input_off.clone())).unwrap())
-    });
-    group.bench_function("compute_parameters_penalty_on", |b| {
-        b.iter(|| compute_parameters(black_box(input_on.clone())).unwrap())
+    group.bench_function("compute_parameters", |b| {
+        b.iter(|| compute_parameters(black_box(input.clone())).unwrap())
     });
     group.finish();
 }

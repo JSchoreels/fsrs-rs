@@ -1062,8 +1062,6 @@ pub(crate) struct TrainingConfig {
     pub learning_rate: f64,
     #[config(default = 1024)]
     pub max_seq_len: usize,
-    #[config(default = false)]
-    pub fsrs7_penalty: bool,
 }
 
 pub(crate) fn calculate_average_recall(items: &[FSRSItem]) -> f32 {
@@ -1091,8 +1089,6 @@ pub struct ComputeParametersInput {
     pub enable_short_term: bool,
     /// Number of relearning steps
     pub num_relearning_steps: Option<usize>,
-    /// When enabled, use FSRS-7 interval penalty objective during optimization.
-    pub fsrs7_penalty: bool,
 }
 
 impl Default for ComputeParametersInput {
@@ -1102,7 +1098,6 @@ impl Default for ComputeParametersInput {
             progress: None,
             enable_short_term: true,
             num_relearning_steps: None,
-            fsrs7_penalty: false,
         }
     }
 }
@@ -1121,7 +1116,6 @@ pub fn compute_parameters(
         progress,
         enable_short_term,
         num_relearning_steps,
-        fsrs7_penalty,
         ..
     }: ComputeParametersInput,
 ) -> Result<Vec<f32>> {
@@ -1155,7 +1149,7 @@ pub fn compute_parameters(
         finish_progress();
         return Ok(initialized_parameters);
     }
-    let mut config = TrainingConfig::new(
+    let config = TrainingConfig::new(
         ModelConfig {
             freeze_initial_stability: !enable_short_term,
             initial_stability: Some(initial_stability),
@@ -1168,7 +1162,6 @@ pub fn compute_parameters(
             .with_beta_2(0.85)
             .with_epsilon(1e-8),
     );
-    config.fsrs7_penalty = fsrs7_penalty;
     let mut weighted_train_set = recency_weighted_fsrs_items(train_set);
     weighted_train_set.retain(|item| item.item.reviews.len() <= config.max_seq_len);
 
@@ -1227,7 +1220,6 @@ pub fn benchmark(
         train_set,
         enable_short_term,
         num_relearning_steps,
-        fsrs7_penalty,
         ..
     }: ComputeParametersInput,
 ) -> Vec<f32> {
@@ -1251,7 +1243,6 @@ pub fn benchmark(
             .with_beta_2(0.85)
             .with_epsilon(1e-8),
     );
-    config.fsrs7_penalty = fsrs7_penalty;
     // save RAM and speed up training
     config.max_seq_len = 64;
     let mut weighted_train_set = recency_weighted_fsrs_items(train_set);
@@ -1312,11 +1303,7 @@ fn train<B: AutodiffBackend>(
             let real_batch_size = item.delta_ts.shape().dims[0];
             let lr = LrScheduler::step(&mut lr_scheduler);
             let progress = iterator.progress();
-            let l2_weight = if config.fsrs7_penalty {
-                FSRS7_PENALTY_W_L2
-            } else {
-                1.0
-            };
+            let l2_weight = FSRS7_PENALTY_W_L2;
             let w_vec = model.w.val().to_data().to_vec::<f32>().unwrap();
             let (_l2_penalty_value, mut manual_grad) = l2_penalty_value_and_grad(
                 &w_vec,
@@ -1325,13 +1312,11 @@ fn train<B: AutodiffBackend>(
                 total_size,
                 l2_weight,
             );
-            if config.fsrs7_penalty {
-                let (_schedule_value, schedule_grad) =
-                    fsrs7_schedule_penalty_value_and_grad(&w_vec, real_batch_size);
-                let inv_total = 1.0 / total_size as f64;
-                for i in 0..manual_grad.len().min(schedule_grad.len()) {
-                    manual_grad[i] += (schedule_grad[i] * inv_total) as f32;
-                }
+            let (_schedule_value, schedule_grad) =
+                fsrs7_schedule_penalty_value_and_grad(&w_vec, real_batch_size);
+            let inv_total = 1.0 / total_size as f64;
+            for i in 0..manual_grad.len().min(schedule_grad.len()) {
+                manual_grad[i] += (schedule_grad[i] * inv_total) as f32;
             }
             let loss = model.forward_classification(
                 item.t_historys,
@@ -1377,11 +1362,7 @@ fn train<B: AutodiffBackend>(
         let mut loss_valid = 0.0;
         for batch in dataloader_valid.iter() {
             let real_batch_size = batch.delta_ts.shape().dims[0];
-            let l2_weight = if config.fsrs7_penalty {
-                FSRS7_PENALTY_W_L2
-            } else {
-                1.0
-            };
+            let l2_weight = FSRS7_PENALTY_W_L2;
             let w_vec = model_valid.w.val().to_data().to_vec::<f32>().unwrap();
             let (l2_penalty_value, _) = l2_penalty_value_and_grad(
                 &w_vec,
@@ -1390,13 +1371,9 @@ fn train<B: AutodiffBackend>(
                 total_size,
                 l2_weight,
             );
-            let schedule_penalty = if config.fsrs7_penalty {
-                let (schedule_value, _) =
-                    fsrs7_schedule_penalty_value_and_grad(&w_vec, real_batch_size);
-                schedule_value / total_size as f64
-            } else {
-                0.0
-            };
+            let (schedule_value, _) =
+                fsrs7_schedule_penalty_value_and_grad(&w_vec, real_batch_size);
+            let schedule_penalty = schedule_value / total_size as f64;
             let loss = model_valid.forward_classification(
                 batch.t_historys,
                 batch.r_historys,
@@ -1745,7 +1722,6 @@ mod tests {
                     progress: progress2,
                     enable_short_term,
                     num_relearning_steps: None,
-                    fsrs7_penalty: false,
                 })
                 .unwrap();
                 dbg!(&parameters);

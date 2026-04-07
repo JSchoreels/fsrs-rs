@@ -860,7 +860,6 @@ where
             enable_short_term,
             num_relearning_steps,
             progress: None,
-            fsrs7_penalty: false,
         };
         let parameters = training::compute_parameters(input)?;
 
@@ -1330,7 +1329,6 @@ mod tests {
             progress: None,
             enable_short_term: true,
             num_relearning_steps: None,
-            fsrs7_penalty: false,
         };
 
         let metrics = evaluate_with_time_series_splits(input.clone(), |_| true).unwrap();
@@ -1343,7 +1341,6 @@ mod tests {
                 progress: None,
                 enable_short_term: true,
                 num_relearning_steps: None,
-                fsrs7_penalty: false,
             },
             |_| true,
         );

@@ -229,7 +229,6 @@ fn benchmark_evaluate_with_time_series_splits(c: &mut Criterion) {
         progress: None,
         enable_short_term: true,    // Default/typical value
         num_relearning_steps: None, // Default/typical value
-        fsrs7_penalty: false,
     };
 
     let mut group = c.benchmark_group("parameters");
@@ -250,7 +249,6 @@ fn benchmark_compute_parameters(c: &mut Criterion) {
         progress: None,
         enable_short_term: true,    // Default/typical value
         num_relearning_steps: None, // Default/typical value
-        fsrs7_penalty: false,
     };
 
     let mut group = c.benchmark_group("parameters");

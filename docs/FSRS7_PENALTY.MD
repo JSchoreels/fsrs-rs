@@ -2,18 +2,16 @@
 
 ## Purpose
 
-Provide an optional FSRS-7 training objective that adds scheduling penalties to
-the existing optimization loss, while keeping inference behavior unchanged.
+Provide the FSRS-7 training objective with scheduling penalties, while keeping
+inference behavior unchanged.
 
 ## API Surface
 
-- `ComputeParametersInput.fsrs7_penalty` (default: `false`)
-  - `false`: existing objective (`BCE + L2`)
-  - `true`: `BCE + weighted_L2 + FSRS7_schedule_penalties`
+- `compute_parameters()` now always trains with the FSRS-7 penalty objective.
 
 ## Objective Components
 
-When `fsrs7_penalty = true`, training uses:
+Training uses:
 
 - `L2` with weight `0.5` (applied via `FSRS7_PENALTY_W_L2`)
 - schedule penalty 1 with weight `0.5`
