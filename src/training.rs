@@ -4,9 +4,10 @@ use crate::dataset::{
     FSRSDataset, FSRSItem, WeightedFSRSItem, prepare_training_data, recency_weighted_fsrs_items,
 };
 use crate::error::Result;
-use crate::model::{Model, ModelConfig};
+use crate::model::{Get, Model, ModelConfig};
 use crate::parameter_clipper::parameter_clipper;
 use crate::parameter_initialization::{initialize_parameters, smooth_and_fill};
+use crate::simulation::{S_MAX, S_MIN};
 use crate::{DEFAULT_PARAMETERS, FSRSError};
 use burn::backend::Autodiff;
 use burn::backend::ndarray::NdArray;
@@ -33,6 +34,20 @@ static PARAMS_STDDEV: [f32; 35] = [
     0.175, 0.3812, 0.3013, 0.9104, 0.3234, 0.2448, 0.3273, 0.1842, 0.1542, 0.1735, 0.4608, 0.311,
     0.864, 0.4053, 0.162, 0.0418, 0.2596, 0.0798, 0.0682, 0.1282, 0.1397, 0.1407, 0.1489,
 ];
+
+const FSRS7_PARAM_LEN: usize = 35;
+const FSRS7_PENALTY_W_1: f64 = 0.5;
+const FSRS7_PENALTY_W_2: f64 = 0.0015;
+const FSRS7_PENALTY_W_L2: f64 = 0.5;
+const FSRS7_PENALTY_N_REVIEWS: usize = 10;
+const FSRS7_PENALTY_TARGET_DR: f32 = 0.90;
+const FSRS7_PENALTY_TARGET_DRS: [f32; 1] = [0.99];
+const FSRS7_PENALTY_N_NEWTON: usize = 4;
+const FSRS7_MIN_T: f32 = 1.0 / 86400.0;
+const FSRS7_MAX_T: f32 = 36500.0;
+const FSRS7_ONE_DAY: f32 = 1.0;
+const FSRS7_SHORT_C: f32 = 600.0 / 86400.0;
+const FSRS7_INV_C: f32 = 1.0 / FSRS7_SHORT_C;
 
 pub struct BCELoss<B: Backend> {
     backend: PhantomData<B>,
@@ -93,6 +108,283 @@ impl<B: Backend> Model<B> {
             .div(params_stddev.powi_scalar(2))
             .sum()
             .mul_scalar(gamma * batch_size as f64 / total_size as f64)
+    }
+
+    fn fsrs7_fc_r_and_drdt(
+        &self,
+        t: Tensor<B, 1>,
+        s: Tensor<B, 1>,
+    ) -> (Tensor<B, 1>, Tensor<B, 1>) {
+        let w = self.w.val();
+        let decay1 = -w.get(27);
+        let decay2 = -w.get(28);
+        let base1 = w.get(29).clamp_min(1e-4);
+        let base2 = w.get(30).clamp_min(1e-4);
+        let bw1 = w.get(31).clamp_min(1e-4);
+        let bw2 = w.get(32).clamp_min(1e-4);
+        let swp1 = w.get(33);
+        let swp2 = w.get(34);
+
+        let c1 = base1.powf(decay1.clone().powi_scalar(-1)) - 1.0;
+        let c2 = base2.powf(decay2.clone().powi_scalar(-1)) - 1.0;
+        let tos = t / s.clone();
+        let inner1 = (c1.clone() * tos.clone() + 1.0).clamp_min(1e-9);
+        let inner2 = (c2.clone() * tos + 1.0).clamp_min(1e-9);
+
+        let r1 = inner1.clone().powf(decay1.clone());
+        let r2 = inner2.clone().powf(decay2.clone());
+
+        let wt1 = bw1 * s.clone().powf(-swp1);
+        let wt2 = bw2 * s.clone().powf(swp2);
+        let wt_sum = (wt1.clone() + wt2.clone()).clamp_min(1e-9);
+
+        let r = ((wt1.clone() * r1 + wt2.clone() * r2) / wt_sum.clone()).clamp(0.0, 1.0);
+
+        let dr1_dt = decay1.clone() * inner1.powf(decay1 - 1.0) * (c1 / s.clone());
+        let dr2_dt = decay2.clone() * inner2.powf(decay2 - 1.0) * (c2 / s);
+        let dr_dt = ((wt1 * dr1_dt + wt2 * dr2_dt) / wt_sum).clamp(-1e9, 0.0);
+        (r, dr_dt)
+    }
+
+    fn fsrs7_init_d(&self, rating: f32) -> Tensor<B, 1> {
+        let w = self.w.val();
+        (w.get(4) - (w.get(5) * (rating - 1.0)).exp() + 1.0).clamp(1.0, 10.0)
+    }
+
+    fn fsrs7_next_d_good(&self, d: Tensor<B, 1>) -> Tensor<B, 1> {
+        (self.fsrs7_init_d(4.0).mul_scalar(0.01) + d.mul_scalar(0.99)).clamp(1.0, 10.0)
+    }
+
+    fn fsrs7_s_fail_long(&self, s: Tensor<B, 1>, d: Tensor<B, 1>, r: Tensor<B, 1>) -> Tensor<B, 1> {
+        let w = self.w.val();
+        let raw = w.get(10)
+            * d.powf(-w.get(11))
+            * ((s.clone() + 1.0).powf(w.get(12)) - 1.0)
+            * ((r.neg() + 1.0) * w.get(13)).exp();
+        s.clone().mask_where(s.clone().greater(raw.clone()), raw)
+    }
+
+    fn fsrs7_s_fail_short(
+        &self,
+        s: Tensor<B, 1>,
+        d: Tensor<B, 1>,
+        r: Tensor<B, 1>,
+    ) -> Tensor<B, 1> {
+        let w = self.w.val();
+        let raw = w.get(19)
+            * d.powf(-w.get(20))
+            * ((s.clone() + 1.0).powf(w.get(21)) - 1.0)
+            * ((r.neg() + 1.0) * w.get(22)).exp();
+        s.clone().mask_where(s.clone().greater(raw.clone()), raw)
+    }
+
+    fn fsrs7_next_s_good(
+        &self,
+        s: Tensor<B, 1>,
+        d: Tensor<B, 1>,
+        delta_t: Tensor<B, 1>,
+    ) -> Tensor<B, 1> {
+        let w = self.w.val();
+        let r = self
+            .fsrs7_fc_r_and_drdt(delta_t.clone(), s.clone())
+            .0
+            .clamp(0.0001, 0.9999);
+
+        let sf_l = self.fsrs7_s_fail_long(s.clone(), d.clone(), r.clone());
+        let si_l = (w.get(7) - 1.5).exp()
+            * (d.clone().neg() + 11.0)
+            * s.clone().powf(-w.get(8))
+            * (((r.clone().neg() + 1.0) * w.get(9)).clamp(-1e9, 30.0).exp() - 1.0)
+            + 1.0;
+        let s_lng = sf_l.clone().mask_where(
+            sf_l.clone().lower((s.clone() * si_l.clone()).clone()),
+            s.clone() * si_l,
+        );
+
+        let sf_sh = self.fsrs7_s_fail_short(s.clone(), d.clone(), r.clone());
+        let si_sh = (w.get(16) - 1.5).exp()
+            * (d.clone().neg() + 11.0)
+            * s.clone().powf(-w.get(17))
+            * (((r.neg() + 1.0) * w.get(18)).clamp(-1e9, 30.0).exp() - 1.0)
+            + 1.0;
+        let s_sht = sf_sh.clone().mask_where(
+            sf_sh.clone().lower((s.clone() * si_sh.clone()).clone()),
+            s.clone() * si_sh,
+        );
+
+        let coef = ((w.get(26) * (-w.get(25) * delta_t).exp()).neg() + 1.0).clamp(0.0, 1.0);
+        (coef.clone() * s_lng + (coef.neg() + 1.0) * s_sht).clamp(S_MIN, S_MAX)
+    }
+
+    fn fsrs7_interval_differentiable(
+        &self,
+        s: Tensor<B, 1>,
+        target: f32,
+        n_newton: usize,
+        w_vec: &[f32],
+    ) -> Tensor<B, 1> {
+        let s_f = s.clone().into_scalar().to_f32() as f64;
+        let d1 = -w_vec[27] as f64;
+        let d2 = -w_vec[28] as f64;
+        let b1 = (w_vec[29].max(1e-4)) as f64;
+        let b2 = (w_vec[30].max(1e-4)) as f64;
+        let bw1 = (w_vec[31].max(1e-4)) as f64;
+        let bw2 = (w_vec[32].max(1e-4)) as f64;
+        let sw1 = w_vec[33] as f64;
+        let sw2 = w_vec[34] as f64;
+
+        let c1 = b1.powf(1.0 / d1) - 1.0;
+        let c2 = b2.powf(1.0 / d2) - 1.0;
+        let wt1 = bw1 * s_f.powf(-sw1);
+        let wt2 = bw2 * s_f.powf(sw2);
+        let wts = (wt1 + wt2).max(1e-9);
+
+        let mut u = s_f.max(1e-10).ln();
+        for _ in 0..n_newton {
+            u = u.clamp((FSRS7_MIN_T as f64).ln(), (FSRS7_MAX_T as f64).ln());
+            let t = u.exp().clamp(FSRS7_MIN_T as f64, FSRS7_MAX_T as f64);
+            let tos = t / s_f.max(1e-10);
+            let i1 = (1.0 + c1 * tos).max(1e-9);
+            let i2 = (1.0 + c2 * tos).max(1e-9);
+            let r = (wt1 * i1.powf(d1) + wt2 * i2.powf(d2)) / wts;
+            let dr1 = d1 * i1.powf(d1 - 1.0) * c1 / s_f.max(1e-10);
+            let dr2 = d2 * i2.powf(d2 - 1.0) * c2 / s_f.max(1e-10);
+            let drdt = (wt1 * dr1 + wt2 * dr2) / wts;
+            let dfdu = (drdt * t).min(-1e-12);
+            u -= (r - target as f64) / dfdu;
+        }
+
+        let t_star = u.exp().clamp(FSRS7_MIN_T as f64, FSRS7_MAX_T as f64) as f32;
+        let device = self.w.val().device();
+        let t_d = Tensor::from_floats([t_star], &device).detach();
+        let (r_s, drdt_s) = self.fsrs7_fc_r_and_drdt(t_d.clone(), s);
+        let residual = r_s - target;
+        let dfdu_s = (drdt_s * t_d.clone()).detach().clamp(-1e9, -1e-9);
+        let u_lifted = t_d.log() - residual / dfdu_s;
+        u_lifted.clamp(FSRS7_MIN_T.ln(), FSRS7_MAX_T.ln()).exp()
+    }
+
+    fn fsrs7_interval_growth_penalty(
+        &self,
+        n_reviews: usize,
+        target_dr: f32,
+        n_newton: usize,
+        w_vec: &[f32],
+    ) -> Tensor<B, 1> {
+        let mut s = self.w.val().get(2).clamp(S_MIN, S_MAX);
+        let mut d = self.fsrs7_init_d(3.0);
+        let mut intervals: Vec<Tensor<B, 1>> = Vec::with_capacity(n_reviews);
+        for _ in 0..n_reviews {
+            let t = self.fsrs7_interval_differentiable(s.clone(), target_dr, n_newton, w_vec);
+            intervals.push(t.clone());
+            s = self.fsrs7_next_s_good(s, d.clone(), t);
+            d = self.fsrs7_next_d_good(d);
+        }
+
+        let device = self.w.device();
+        let mut best_ratio: Option<Tensor<B, 1>> = None;
+        let mut best_val = f32::NEG_INFINITY;
+        for i in 0..intervals.len().saturating_sub(1) {
+            let prev = intervals[i].clone().detach().into_scalar().to_f32();
+            if prev < FSRS7_ONE_DAY {
+                continue;
+            }
+            let ratio = intervals[i + 1].clone() / intervals[i].clone();
+            let ratio_val = ratio.clone().detach().into_scalar().to_f32();
+            if ratio_val > best_val {
+                best_val = ratio_val;
+                best_ratio = Some(ratio);
+            }
+        }
+        if let Some(ratio) = best_ratio {
+            ratio.powi_scalar(2)
+        } else {
+            Tensor::zeros([1], &device)
+        }
+    }
+
+    fn fsrs7_short_interval_penalty(
+        &self,
+        n_reviews: usize,
+        n_newton: usize,
+        target_drs: &[f32],
+        w_vec: &[f32],
+    ) -> Tensor<B, 1> {
+        let device = self.w.val().device();
+        let mut penalties: Vec<Tensor<B, 1>> = Vec::with_capacity(target_drs.len());
+
+        for &target_dr in target_drs {
+            let mut s = self.w.val().get(2).clamp(S_MIN, S_MAX);
+            let mut d = self.fsrs7_init_d(3.0);
+            let mut intervals: Vec<Tensor<B, 1>> = Vec::with_capacity(n_reviews);
+
+            for _ in 0..n_reviews {
+                let t = self.fsrs7_interval_differentiable(s.clone(), target_dr, n_newton, w_vec);
+                intervals.push(t.clone());
+                s = self.fsrs7_next_s_good(s, d.clone(), t);
+                d = self.fsrs7_next_d_good(d);
+            }
+
+            let mut sum: Option<Tensor<B, 1>> = None;
+            let mut count = 0usize;
+            for interval in intervals {
+                let value = interval.clone().detach().into_scalar().to_f32();
+                if value >= FSRS7_ONE_DAY {
+                    continue;
+                }
+                sum = Some(match sum {
+                    Some(current) => current + interval,
+                    None => interval,
+                });
+                count += 1;
+            }
+
+            if count == 0 {
+                continue;
+            }
+
+            let avg_t = sum.unwrap().div_scalar(count as f64).clamp_min(FSRS7_MIN_T);
+            let inv_x = avg_t.powi_scalar(-1);
+            penalties.push(inv_x.clamp_min(FSRS7_INV_C) - FSRS7_INV_C);
+        }
+
+        if penalties.is_empty() {
+            Tensor::zeros([1], &device)
+        } else {
+            Tensor::cat(penalties, 0).mean()
+        }
+    }
+
+    pub(crate) fn fsrs7_schedule_penalty(&self, batch_size: usize) -> Tensor<B, 1> {
+        let device = self.w.val().device();
+        if self.w.val().dims()[0] < FSRS7_PARAM_LEN {
+            return Tensor::zeros([1], &device);
+        }
+        let w_vec = self.w.val().to_data().to_vec::<f32>().unwrap();
+        let p1 = self.fsrs7_interval_growth_penalty(
+            FSRS7_PENALTY_N_REVIEWS,
+            FSRS7_PENALTY_TARGET_DR,
+            FSRS7_PENALTY_N_NEWTON,
+            &w_vec,
+        );
+        let p1 = if p1.clone().detach().into_scalar().to_f32().is_finite() {
+            p1
+        } else {
+            Tensor::zeros([1], &device)
+        };
+        let p2 = self.fsrs7_short_interval_penalty(
+            FSRS7_PENALTY_N_REVIEWS,
+            FSRS7_PENALTY_N_NEWTON,
+            &FSRS7_PENALTY_TARGET_DRS,
+            &w_vec,
+        );
+        let p2 = if p2.clone().detach().into_scalar().to_f32().is_finite() {
+            p2
+        } else {
+            Tensor::zeros([1], &device)
+        };
+        (p1.mul_scalar(FSRS7_PENALTY_W_1) + p2.mul_scalar(FSRS7_PENALTY_W_2))
+            .mul_scalar(batch_size as f64)
     }
 }
 
@@ -219,6 +511,8 @@ pub(crate) struct TrainingConfig {
     pub max_seq_len: usize,
     #[config(default = 1.0)]
     pub gamma: f64,
+    #[config(default = false)]
+    pub fsrs7_penalty: bool,
 }
 
 pub(crate) fn calculate_average_recall(items: &[FSRSItem]) -> f32 {
@@ -246,6 +540,8 @@ pub struct ComputeParametersInput {
     pub enable_short_term: bool,
     /// Number of relearning steps
     pub num_relearning_steps: Option<usize>,
+    /// When enabled, use FSRS-7 interval penalty objective during optimization.
+    pub fsrs7_penalty: bool,
 }
 
 impl Default for ComputeParametersInput {
@@ -255,6 +551,7 @@ impl Default for ComputeParametersInput {
             progress: None,
             enable_short_term: true,
             num_relearning_steps: None,
+            fsrs7_penalty: false,
         }
     }
 }
@@ -273,6 +570,7 @@ pub fn compute_parameters(
         progress,
         enable_short_term,
         num_relearning_steps,
+        fsrs7_penalty,
         ..
     }: ComputeParametersInput,
 ) -> Result<Vec<f32>> {
@@ -306,7 +604,7 @@ pub fn compute_parameters(
         finish_progress();
         return Ok(initialized_parameters);
     }
-    let config = TrainingConfig::new(
+    let mut config = TrainingConfig::new(
         ModelConfig {
             freeze_initial_stability: !enable_short_term,
             initial_stability: Some(initial_stability),
@@ -316,6 +614,7 @@ pub fn compute_parameters(
         },
         AdamConfig::new().with_epsilon(1e-8),
     );
+    config.fsrs7_penalty = fsrs7_penalty;
     let mut weighted_train_set = recency_weighted_fsrs_items(train_set);
     weighted_train_set.retain(|item| item.item.reviews.len() <= config.max_seq_len);
 
@@ -374,6 +673,7 @@ pub fn benchmark(
         train_set,
         enable_short_term,
         num_relearning_steps,
+        fsrs7_penalty,
         ..
     }: ComputeParametersInput,
 ) -> Vec<f32> {
@@ -394,6 +694,7 @@ pub fn benchmark(
         },
         AdamConfig::new().with_epsilon(1e-8),
     );
+    config.fsrs7_penalty = fsrs7_penalty;
     // save RAM and speed up training
     config.max_seq_len = 64;
     let mut weighted_train_set = recency_weighted_fsrs_items(train_set);
@@ -454,13 +755,23 @@ fn train<B: AutodiffBackend>(
             let real_batch_size = item.delta_ts.shape().dims[0];
             let lr = LrScheduler::step(&mut lr_scheduler);
             let progress = iterator.progress();
+            let l2_gamma = if config.fsrs7_penalty {
+                config.gamma * FSRS7_PENALTY_W_L2
+            } else {
+                config.gamma
+            };
             let penalty = model.l2_regularization(
                 init_w.clone(),
                 params_stddev.clone(),
                 real_batch_size,
                 total_size,
-                config.gamma,
+                l2_gamma,
             );
+            let schedule_penalty = if config.fsrs7_penalty {
+                model.fsrs7_schedule_penalty(real_batch_size)
+            } else {
+                Tensor::zeros([1], &model.w.device())
+            };
             let loss = model.forward_classification(
                 item.t_historys,
                 item.r_historys,
@@ -469,7 +780,7 @@ fn train<B: AutodiffBackend>(
                 item.weights,
                 Reduction::Sum,
             );
-            let mut gradients = (loss + penalty).backward();
+            let mut gradients = (loss + penalty + schedule_penalty).backward();
             if config.model.freeze_initial_stability {
                 gradients = model.freeze_initial_stability(gradients);
             }
@@ -504,13 +815,26 @@ fn train<B: AutodiffBackend>(
         let mut loss_valid = 0.0;
         for batch in dataloader_valid.iter() {
             let real_batch_size = batch.delta_ts.shape().dims[0];
+            let l2_gamma = if config.fsrs7_penalty {
+                config.gamma * FSRS7_PENALTY_W_L2
+            } else {
+                config.gamma
+            };
             let penalty = model_valid.l2_regularization(
                 init_w.valid(),
                 params_stddev.valid(),
                 real_batch_size,
                 total_size,
-                config.gamma,
+                l2_gamma,
             );
+            let schedule_penalty = if config.fsrs7_penalty {
+                model_valid
+                    .fsrs7_schedule_penalty(real_batch_size)
+                    .into_scalar()
+                    .to_f64()
+            } else {
+                0.0
+            };
             let loss = model_valid.forward_classification(
                 batch.t_historys,
                 batch.r_historys,
@@ -521,7 +845,7 @@ fn train<B: AutodiffBackend>(
             );
             let loss = loss.into_scalar().to_f64();
             let penalty = penalty.into_scalar().to_f64();
-            loss_valid += loss + penalty;
+            loss_valid += loss + penalty + schedule_penalty;
 
             if interrupter.should_stop() {
                 break;
@@ -860,6 +1184,7 @@ mod tests {
                     progress: progress2,
                     enable_short_term,
                     num_relearning_steps: None,
+                    fsrs7_penalty: false,
                 })
                 .unwrap();
                 dbg!(&parameters);
@@ -870,5 +1195,37 @@ mod tests {
                 dbg!(&metrics);
             }
         }
+    }
+
+    #[test]
+    fn test_fsrs7_schedule_penalty_is_finite() {
+        use burn::backend::ndarray::NdArrayDevice;
+
+        let config = ModelConfig::default();
+        let device = NdArrayDevice::Cpu;
+        let model: Model<NdArray<f32>> = config.init();
+        let penalty = model
+            .fsrs7_schedule_penalty(512)
+            .to_device(&device)
+            .into_scalar()
+            .to_f32();
+        assert!(penalty.is_finite());
+        assert!(penalty >= 0.0);
+    }
+
+    #[test]
+    fn test_fsrs7_schedule_penalty_has_finite_gradients() {
+        type B = Autodiff<NdArray<f32>>;
+        let config = ModelConfig::default();
+        let model: Model<B> = config.init();
+        let penalty = model.fsrs7_schedule_penalty(512);
+        let value = penalty.clone().into_scalar().to_f32();
+        assert!(value.is_finite());
+
+        let gradients = penalty.backward();
+        let w_grad = model.w.grad(&gradients).unwrap();
+        let grads = w_grad.to_data().to_vec::<f32>().unwrap();
+        assert!(grads.iter().all(|v| v.is_finite()));
+        assert!(grads.iter().any(|v| v.abs() > 0.0));
     }
 }
