@@ -16,9 +16,10 @@ use burn::module::AutodiffModule;
 use burn::nn::loss::Reduction;
 use burn::optim::Optimizer;
 use burn::optim::{AdamConfig, GradientsParams};
+use burn::tensor::Int;
+use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
 use burn::tensor::cast::ToElement;
-use burn::tensor::{Int, Tensor};
 use burn::train::TrainingInterrupter;
 use burn::train::renderer::{MetricState, MetricsRenderer, TrainingProgress};
 use burn::{config::Config, tensor::backend::AutodiffBackend};
@@ -1965,13 +1966,17 @@ mod tests {
             Reduction::Sum,
         );
         let mut grad_new = loss_new.backward();
-        let (_l2_value, mut manual_grad) = l2_penalty_value_and_grad(
+        let mut manual_grad = vec![0.0f32; w_vec.len()];
+        let (_l2_value, l2_grad) = l2_penalty_value_and_grad(
             &w_vec,
             &init_w_vec,
             batch_size,
             total_size,
             FSRS7_PENALTY_W_L2,
         );
+        for (g, l2) in manual_grad.iter_mut().zip(l2_grad.iter()) {
+            *g += *l2;
+        }
         let (_schedule_value, schedule_grad) =
             fsrs7_schedule_penalty_value_and_grad(&w_vec, batch_size);
         let inv_total = 1.0 / total_size as f64;

@@ -26,13 +26,16 @@ Penalty simulation settings:
 - target DR set for penalty 2: `[0.99]`
 - Newton iterations: `4`
 
-## Penalty Backpropagation
+## Backpropagation
 
-Penalty terms are now differentiated without burn autograd:
+Training keeps burn autograd for the main BCE objective and computes penalty
+gradients in scalar code:
 
-1. `BCE` still uses burn autograd (`loss.backward()`).
+1. Main BCE loss uses `forward_classification(..., Reduction::Sum)` and
+   `backward()`.
 2. `L2` and FSRS7 schedule penalty are computed in scalar code.
-3. Manual penalty gradients are added to `w` gradients before optimizer step.
+3. Manual penalty gradients are written into `w` gradients before optimizer
+   step.
 
 The schedule interval inversion still uses the same two-phase math:
 
