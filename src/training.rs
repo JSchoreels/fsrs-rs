@@ -151,8 +151,8 @@ impl<B: Backend> Model<B> {
         (w.get(4) - (w.get(5) * (rating - 1.0)).exp() + 1.0).clamp(1.0, 10.0)
     }
 
-    fn fsrs7_next_d_good(&self, d: Tensor<B, 1>) -> Tensor<B, 1> {
-        (self.fsrs7_init_d(4.0).mul_scalar(0.01) + d.mul_scalar(0.99)).clamp(1.0, 10.0)
+    fn fsrs7_next_d_good(&self, d: Tensor<B, 1>, init_d4: Tensor<B, 1>) -> Tensor<B, 1> {
+        (init_d4.mul_scalar(0.01) + d.mul_scalar(0.99)).clamp(1.0, 10.0)
     }
 
     fn fsrs7_s_fail_long(&self, s: Tensor<B, 1>, d: Tensor<B, 1>, r: Tensor<B, 1>) -> Tensor<B, 1> {
@@ -272,34 +272,32 @@ impl<B: Backend> Model<B> {
         w_vec: &[f32],
     ) -> Tensor<B, 1> {
         let mut s = self.w.val().get(2).clamp(S_MIN, S_MAX);
+        let init_d4 = self.fsrs7_init_d(4.0);
         let mut d = self.fsrs7_init_d(3.0);
-        let mut intervals: Vec<Tensor<B, 1>> = Vec::with_capacity(n_reviews);
-        for _ in 0..n_reviews {
-            let t = self.fsrs7_interval_differentiable(s.clone(), target_dr, n_newton, w_vec);
-            intervals.push(t.clone());
-            s = self.fsrs7_next_s_good(s, d.clone(), t);
-            d = self.fsrs7_next_d_good(d);
-        }
-
-        let device = self.w.device();
+        let mut prev_interval: Option<Tensor<B, 1>> = None;
         let mut best_ratio: Option<Tensor<B, 1>> = None;
         let mut best_val = f32::NEG_INFINITY;
-        for i in 0..intervals.len().saturating_sub(1) {
-            let prev = intervals[i].clone().detach().into_scalar().to_f32();
-            if prev < FSRS7_ONE_DAY {
-                continue;
+        for _ in 0..n_reviews {
+            let t = self.fsrs7_interval_differentiable(s.clone(), target_dr, n_newton, w_vec);
+            if let Some(prev) = &prev_interval {
+                let prev_val = prev.clone().detach().into_scalar().to_f32();
+                if prev_val >= FSRS7_ONE_DAY {
+                    let ratio = t.clone() / prev.clone();
+                    let ratio_val = ratio.clone().detach().into_scalar().to_f32();
+                    if ratio_val > best_val {
+                        best_val = ratio_val;
+                        best_ratio = Some(ratio);
+                    }
+                }
             }
-            let ratio = intervals[i + 1].clone() / intervals[i].clone();
-            let ratio_val = ratio.clone().detach().into_scalar().to_f32();
-            if ratio_val > best_val {
-                best_val = ratio_val;
-                best_ratio = Some(ratio);
-            }
+            prev_interval = Some(t.clone());
+            s = self.fsrs7_next_s_good(s, d.clone(), t);
+            d = self.fsrs7_next_d_good(d, init_d4.clone());
         }
         if let Some(ratio) = best_ratio {
             ratio.powi_scalar(2)
         } else {
-            Tensor::zeros([1], &device)
+            Tensor::zeros([1], &self.w.device())
         }
     }
 
@@ -315,35 +313,32 @@ impl<B: Backend> Model<B> {
 
         for &target_dr in target_drs {
             let mut s = self.w.val().get(2).clamp(S_MIN, S_MAX);
+            let init_d4 = self.fsrs7_init_d(4.0);
             let mut d = self.fsrs7_init_d(3.0);
-            let mut intervals: Vec<Tensor<B, 1>> = Vec::with_capacity(n_reviews);
+            let mut short_sum: Option<Tensor<B, 1>> = None;
+            let mut short_count = 0usize;
 
             for _ in 0..n_reviews {
                 let t = self.fsrs7_interval_differentiable(s.clone(), target_dr, n_newton, w_vec);
-                intervals.push(t.clone());
-                s = self.fsrs7_next_s_good(s, d.clone(), t);
-                d = self.fsrs7_next_d_good(d);
-            }
-
-            let mut sum: Option<Tensor<B, 1>> = None;
-            let mut count = 0usize;
-            for interval in intervals {
-                let value = interval.clone().detach().into_scalar().to_f32();
-                if value >= FSRS7_ONE_DAY {
-                    continue;
+                if t.clone().detach().into_scalar().to_f32() < FSRS7_ONE_DAY {
+                    short_sum = Some(match short_sum {
+                        Some(current) => current + t.clone(),
+                        None => t.clone(),
+                    });
+                    short_count += 1;
                 }
-                sum = Some(match sum {
-                    Some(current) => current + interval,
-                    None => interval,
-                });
-                count += 1;
+                s = self.fsrs7_next_s_good(s, d.clone(), t);
+                d = self.fsrs7_next_d_good(d, init_d4.clone());
             }
 
-            if count == 0 {
+            if short_count == 0 {
                 continue;
             }
 
-            let avg_t = sum.unwrap().div_scalar(count as f64).clamp_min(FSRS7_MIN_T);
+            let avg_t = short_sum
+                .expect("short_sum must exist when short_count > 0")
+                .div_scalar(short_count as f64)
+                .clamp_min(FSRS7_MIN_T);
             let inv_x = avg_t.powi_scalar(-1);
             penalties.push(inv_x.clamp_min(FSRS7_INV_C) - FSRS7_INV_C);
         }
@@ -499,13 +494,13 @@ impl MetricsRenderer for ProgressCollector {
 pub(crate) struct TrainingConfig {
     pub model: ModelConfig,
     pub optimizer: AdamConfig,
-    #[config(default = 5)]
+    #[config(default = 8)]
     pub num_epochs: usize,
-    #[config(default = 512)]
+    #[config(default = 1024)]
     pub batch_size: usize,
     #[config(default = 2023)]
     pub seed: u64,
-    #[config(default = 4e-2)]
+    #[config(default = 2e-2)]
     pub learning_rate: f64,
     #[config(default = 1024)]
     pub max_seq_len: usize,
@@ -610,7 +605,10 @@ pub fn compute_parameters(
             freeze_short_term_stability: !enable_short_term,
             num_relearning_steps: num_relearning_steps.unwrap_or(1),
         },
-        AdamConfig::new().with_epsilon(1e-8),
+        AdamConfig::new()
+            .with_beta_1(0.8)
+            .with_beta_2(0.85)
+            .with_epsilon(1e-8),
     );
     config.fsrs7_penalty = fsrs7_penalty;
     let mut weighted_train_set = recency_weighted_fsrs_items(train_set);
@@ -690,7 +688,10 @@ pub fn benchmark(
             freeze_short_term_stability: !enable_short_term,
             num_relearning_steps: num_relearning_steps.unwrap_or(1),
         },
-        AdamConfig::new().with_epsilon(1e-8),
+        AdamConfig::new()
+            .with_beta_1(0.8)
+            .with_beta_2(0.85)
+            .with_epsilon(1e-8),
     );
     config.fsrs7_penalty = fsrs7_penalty;
     // save RAM and speed up training
@@ -1228,5 +1229,132 @@ mod tests {
         let grads = w_grad.to_data().to_vec::<f32>().unwrap();
         assert!(grads.iter().all(|v| v.is_finite()));
         assert!(grads.iter().any(|v| v.abs() > 0.0));
+    }
+
+    fn fsrs7_interval_growth_penalty_reference(
+        model: &Model<NdArray<f32>>,
+        n_reviews: usize,
+        target_dr: f32,
+        n_newton: usize,
+        w_vec: &[f32],
+    ) -> Tensor<NdArray<f32>, 1> {
+        let mut s = model.w.val().get(2).clamp(S_MIN, S_MAX);
+        let init_d4 = model.fsrs7_init_d(4.0);
+        let mut d = model.fsrs7_init_d(3.0);
+        let mut intervals: Vec<Tensor<NdArray<f32>, 1>> = Vec::with_capacity(n_reviews);
+        for _ in 0..n_reviews {
+            let t = model.fsrs7_interval_differentiable(s.clone(), target_dr, n_newton, w_vec);
+            intervals.push(t.clone());
+            s = model.fsrs7_next_s_good(s, d.clone(), t);
+            d = model.fsrs7_next_d_good(d, init_d4.clone());
+        }
+
+        let device = model.w.device();
+        let mut best_ratio: Option<Tensor<NdArray<f32>, 1>> = None;
+        let mut best_val = f32::NEG_INFINITY;
+        for i in 0..intervals.len().saturating_sub(1) {
+            let prev = intervals[i].clone().detach().into_scalar().to_f32();
+            if prev < FSRS7_ONE_DAY {
+                continue;
+            }
+            let ratio = intervals[i + 1].clone() / intervals[i].clone();
+            let ratio_val = ratio.clone().detach().into_scalar().to_f32();
+            if ratio_val > best_val {
+                best_val = ratio_val;
+                best_ratio = Some(ratio);
+            }
+        }
+        if let Some(ratio) = best_ratio {
+            ratio.powi_scalar(2)
+        } else {
+            Tensor::zeros([1], &device)
+        }
+    }
+
+    fn fsrs7_short_interval_penalty_reference(
+        model: &Model<NdArray<f32>>,
+        n_reviews: usize,
+        n_newton: usize,
+        target_drs: &[f32],
+        w_vec: &[f32],
+    ) -> Tensor<NdArray<f32>, 1> {
+        let device = model.w.val().device();
+        let mut penalties: Vec<Tensor<NdArray<f32>, 1>> = Vec::with_capacity(target_drs.len());
+
+        for &target_dr in target_drs {
+            let mut s = model.w.val().get(2).clamp(S_MIN, S_MAX);
+            let init_d4 = model.fsrs7_init_d(4.0);
+            let mut d = model.fsrs7_init_d(3.0);
+            let mut intervals: Vec<Tensor<NdArray<f32>, 1>> = Vec::with_capacity(n_reviews);
+
+            for _ in 0..n_reviews {
+                let t = model.fsrs7_interval_differentiable(s.clone(), target_dr, n_newton, w_vec);
+                intervals.push(t.clone());
+                s = model.fsrs7_next_s_good(s, d.clone(), t);
+                d = model.fsrs7_next_d_good(d, init_d4.clone());
+            }
+
+            let mut sum: Option<Tensor<NdArray<f32>, 1>> = None;
+            let mut count = 0usize;
+            for interval in intervals {
+                let value = interval.clone().detach().into_scalar().to_f32();
+                if value >= FSRS7_ONE_DAY {
+                    continue;
+                }
+                sum = Some(match sum {
+                    Some(current) => current + interval,
+                    None => interval,
+                });
+                count += 1;
+            }
+
+            if count == 0 {
+                continue;
+            }
+
+            let avg_t = sum.unwrap().div_scalar(count as f64).clamp_min(FSRS7_MIN_T);
+            let inv_x = avg_t.powi_scalar(-1);
+            penalties.push(inv_x.clamp_min(FSRS7_INV_C) - FSRS7_INV_C);
+        }
+
+        if penalties.is_empty() {
+            Tensor::zeros([1], &device)
+        } else {
+            Tensor::cat(penalties, 0).mean()
+        }
+    }
+
+    #[test]
+    fn test_fsrs7_schedule_penalty_matches_reference_rollout() {
+        let config = ModelConfig::default();
+        let model: Model<NdArray<f32>> = config.init();
+        let batch_size = 512usize;
+        let w_vec = model.w.val().to_data().to_vec::<f32>().unwrap();
+
+        let p1 = fsrs7_interval_growth_penalty_reference(
+            &model,
+            FSRS7_PENALTY_N_REVIEWS,
+            FSRS7_PENALTY_TARGET_DR,
+            FSRS7_PENALTY_N_NEWTON,
+            &w_vec,
+        );
+        let p2 = fsrs7_short_interval_penalty_reference(
+            &model,
+            FSRS7_PENALTY_N_REVIEWS,
+            FSRS7_PENALTY_N_NEWTON,
+            &FSRS7_PENALTY_TARGET_DRS,
+            &w_vec,
+        );
+        let expected = (p1.mul_scalar(FSRS7_PENALTY_W_1) + p2.mul_scalar(FSRS7_PENALTY_W_2))
+            .mul_scalar(batch_size as f64)
+            .into_scalar()
+            .to_f32();
+
+        let actual = model
+            .fsrs7_schedule_penalty(batch_size)
+            .into_scalar()
+            .to_f32();
+
+        assert!((actual - expected).abs() < 1e-6);
     }
 }
