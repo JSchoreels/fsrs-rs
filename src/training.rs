@@ -101,13 +101,13 @@ impl<B: Backend> Model<B> {
         params_stddev: Tensor<B, 1>,
         batch_size: usize,
         total_size: usize,
-        gamma: f64,
+        l2_weight: f64,
     ) -> Tensor<B, 1> {
         (self.w.val() - init_w)
             .powi_scalar(2)
             .div(params_stddev.powi_scalar(2))
             .sum()
-            .mul_scalar(gamma * batch_size as f64 / total_size as f64)
+            .mul_scalar(l2_weight * batch_size as f64 / total_size as f64)
     }
 
     fn fsrs7_fc_r_and_drdt(
@@ -509,8 +509,6 @@ pub(crate) struct TrainingConfig {
     pub learning_rate: f64,
     #[config(default = 1024)]
     pub max_seq_len: usize,
-    #[config(default = 1.0)]
-    pub gamma: f64,
     #[config(default = false)]
     pub fsrs7_penalty: bool,
 }
@@ -755,20 +753,22 @@ fn train<B: AutodiffBackend>(
             let real_batch_size = item.delta_ts.shape().dims[0];
             let lr = LrScheduler::step(&mut lr_scheduler);
             let progress = iterator.progress();
-            let l2_gamma = if config.fsrs7_penalty {
-                config.gamma * FSRS7_PENALTY_W_L2
+            let l2_weight = if config.fsrs7_penalty {
+                FSRS7_PENALTY_W_L2
             } else {
-                config.gamma
+                1.0
             };
             let penalty = model.l2_regularization(
                 init_w.clone(),
                 params_stddev.clone(),
                 real_batch_size,
                 total_size,
-                l2_gamma,
+                l2_weight,
             );
             let schedule_penalty = if config.fsrs7_penalty {
-                model.fsrs7_schedule_penalty(real_batch_size)
+                model
+                    .fsrs7_schedule_penalty(real_batch_size)
+                    .div_scalar(total_size as f64)
             } else {
                 Tensor::zeros([1], &model.w.device())
             };
@@ -815,21 +815,22 @@ fn train<B: AutodiffBackend>(
         let mut loss_valid = 0.0;
         for batch in dataloader_valid.iter() {
             let real_batch_size = batch.delta_ts.shape().dims[0];
-            let l2_gamma = if config.fsrs7_penalty {
-                config.gamma * FSRS7_PENALTY_W_L2
+            let l2_weight = if config.fsrs7_penalty {
+                FSRS7_PENALTY_W_L2
             } else {
-                config.gamma
+                1.0
             };
             let penalty = model_valid.l2_regularization(
                 init_w.valid(),
                 params_stddev.valid(),
                 real_batch_size,
                 total_size,
-                l2_gamma,
+                l2_weight,
             );
             let schedule_penalty = if config.fsrs7_penalty {
                 model_valid
                     .fsrs7_schedule_penalty(real_batch_size)
+                    .div_scalar(total_size as f64)
                     .into_scalar()
                     .to_f64()
             } else {
