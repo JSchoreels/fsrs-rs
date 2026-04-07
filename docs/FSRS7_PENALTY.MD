@@ -26,24 +26,29 @@ Penalty simulation settings:
 - target DR set for penalty 2: `[0.99]`
 - Newton iterations: `4`
 
-## Differentiable Interval Inversion
+## Penalty Backpropagation
 
-For schedule penalties, interval inversion uses a two-phase differentiable path:
+Penalty terms are now differentiated without burn autograd:
 
-1. Phase 1 (no autograd graph): Newton solve in `u = log(t)` scalar space.
-2. Phase 2 (autograd): one implicit-differentiation lift step around `t*`.
+1. `BCE` still uses burn autograd (`loss.backward()`).
+2. `L2` and FSRS7 schedule penalty are computed in scalar code.
+3. Manual penalty gradients are added to `w` gradients before optimizer step.
 
-This keeps gradients available for parameter optimization while avoiding deep
-unrolled Newton graphs.
+The schedule interval inversion still uses the same two-phase math:
+
+1. Phase 1: Newton solve in `u = log(t)` scalar space.
+2. Phase 2: one implicit-differentiation lift step around `t*`.
+
+The derivative is propagated by an internal dual-number engine for 35 params.
 
 ## Data Flow
 
 - Data created:
-  - temporary penalty tensors during each train/valid batch.
+  - temporary scalar penalty values and dual gradients during each train/valid batch.
 - Data read:
   - current model weights (`w[0..34]`), plus batch size for scaling.
 - Data updated:
-  - model parameters through optimizer steps, same as existing training.
+  - model gradient for `w` is updated by adding manual penalty gradients before optimizer step.
 - Data storage:
   - no new persistent data fields; only in-memory training-time values.
 
