@@ -1,6 +1,7 @@
 import os
 import sys
 from argparse import Namespace
+from pathlib import Path
 
 # Keep matplotlib cache writable in sandboxed environments
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
@@ -12,10 +13,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-SRS_BENCHMARK_ROOT = os.environ.get("SRS_BENCHMARK_ROOT", "../srs-benchmark")
-OUT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent.parent
+SRS_BENCHMARK_ROOT = Path(
+    os.environ.get("SRS_BENCHMARK_ROOT", str((REPO_ROOT.parent / "srs-benchmark").resolve()))
+)
+OUT_DIR = Path(os.environ.get("FSRS7_PLOTS_OUT_DIR", str(SCRIPT_DIR)))
 
-sys.path.insert(0, SRS_BENCHMARK_ROOT)
+if not SRS_BENCHMARK_ROOT.exists():
+    raise FileNotFoundError(
+        f"SRS benchmark repo not found at: {SRS_BENCHMARK_ROOT}. "
+        "Set SRS_BENCHMARK_ROOT to your local clone."
+    )
+
+sys.path.insert(0, str(SRS_BENCHMARK_ROOT))
 
 from config import Config  # noqa: E402
 from models.fsrs_v7 import FSRS7  # noqa: E402
@@ -82,7 +93,7 @@ def save_plot_1_forgetting_by_stability(model: FSRS7) -> None:
     plt.grid(True, alpha=0.25)
     plt.legend(title="Initial stability")
     plt.tight_layout()
-    plt.savefig(f"{OUT_DIR}/01_forgetting_curve_by_stability.png", dpi=180)
+    plt.savefig(OUT_DIR / "01_forgetting_curve_by_stability.png", dpi=180)
     plt.close()
 
 
@@ -139,7 +150,7 @@ def save_plot_2_grade_conditioned(model: FSRS7) -> None:
         y=1.03,
     )
     fig.tight_layout()
-    fig.savefig(f"{OUT_DIR}/02_grade_conditioned_curves.png", dpi=180, bbox_inches="tight")
+    fig.savefig(OUT_DIR / "02_grade_conditioned_curves.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -167,7 +178,7 @@ def save_plot_3_transition_coefficient(model: FSRS7) -> None:
     )
 
     plt.tight_layout()
-    plt.savefig(f"{OUT_DIR}/03_transition_coefficient.png", dpi=180)
+    plt.savefig(OUT_DIR / "03_transition_coefficient.png", dpi=180)
     plt.close()
 
 
@@ -181,9 +192,9 @@ def main() -> None:
     save_plot_3_transition_coefficient(model)
 
     print("generated:")
-    print(f"- {OUT_DIR}/01_forgetting_curve_by_stability.png")
-    print(f"- {OUT_DIR}/02_grade_conditioned_curves.png")
-    print(f"- {OUT_DIR}/03_transition_coefficient.png")
+    print(f"- {OUT_DIR / '01_forgetting_curve_by_stability.png'}")
+    print(f"- {OUT_DIR / '02_grade_conditioned_curves.png'}")
+    print(f"- {OUT_DIR / '03_transition_coefficient.png'}")
 
 
 if __name__ == "__main__":

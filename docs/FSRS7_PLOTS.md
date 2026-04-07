@@ -2,9 +2,9 @@
 
 This folder contains exploratory FSRS-7 behavior plots generated from the benchmark implementation:
 
-- Source model: `/Users/jschoreels/workspace/srs-benchmark/models/fsrs_v7.py`
-- Plot script: `/Users/jschoreels/workspace/fsrs-rs/docs/fsrs7-plots/generate_fsrs7_plots.py`
-- Output directory: `/Users/jschoreels/workspace/fsrs-rs/docs/fsrs7-plots`
+- Source model: `../srs-benchmark/models/fsrs_v7.py` (sibling repo)
+- Plot script: `docs/fsrs7-plots/generate_fsrs7_plots.py`
+- Output directory: `docs/fsrs7-plots`
 
 ## Assumptions Used
 
@@ -29,5 +29,9 @@ This folder contains exploratory FSRS-7 behavior plots generated from the benchm
 ## Regeneration
 
 ```bash
-python3 /Users/jschoreels/workspace/fsrs-rs/docs/fsrs7-plots/generate_fsrs7_plots.py
+python3 docs/fsrs7-plots/generate_fsrs7_plots.py
 ```
+
+Optional environment overrides:
+- `SRS_BENCHMARK_ROOT`: path to local `srs-benchmark` clone.
+- `FSRS7_PLOTS_OUT_DIR`: output folder for generated images.
