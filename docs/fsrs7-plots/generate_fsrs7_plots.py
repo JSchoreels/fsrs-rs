@@ -12,8 +12,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-SRS_BENCHMARK_ROOT = "/Users/jschoreels/workspace/srs-benchmark"
-OUT_DIR = "/Users/jschoreels/workspace/fsrs-rs/docs/fsrs7-plots"
+SRS_BENCHMARK_ROOT = os.environ.get("SRS_BENCHMARK_ROOT", "../srs-benchmark")
+OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 sys.path.insert(0, SRS_BENCHMARK_ROOT)
 
