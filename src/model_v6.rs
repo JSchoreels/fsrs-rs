@@ -123,11 +123,7 @@ pub(super) fn next_interval<B: Backend>(
     let decay = -model.w.get(20);
     let factor = decay.clone().powi_scalar(-1).mul_scalar(0.9f32.ln()).exp() - 1.0;
     (stability * (desired_retention.powf(decay.clone().powi_scalar(-1)) - 1.0) / factor)
-        .clamp(1.0, super::S_MAX)
-        .add_scalar(0.5)
-        .int()
-        .float()
-        .clamp(1.0, super::S_MAX)
+        .clamp(0.0, super::S_MAX)
 }
 
 pub(super) fn stability_after_success<B: Backend>(
@@ -229,9 +225,7 @@ pub(crate) fn next_interval_scalar(w: &[f32], stability: f32, desired_retention:
     let desired_retention = desired_retention.clamp(0.0001, 0.9999);
     let decay = -w[20];
     let factor = 0.9f32.powf(1.0 / decay) - 1.0;
-    (stability / factor * (desired_retention.powf(1.0 / decay) - 1.0))
-        .clamp(1.0, super::S_MAX)
-        .round()
+    (stability / factor * (desired_retention.powf(1.0 / decay) - 1.0)).clamp(0.0, super::S_MAX)
 }
 
 fn round_elapsed_days<B: Backend>(t: Tensor<B, 1>) -> Tensor<B, 1> {
@@ -324,10 +318,10 @@ mod tests {
     }
 
     #[test]
-    fn test_next_interval_scalar_returns_day_rounded_interval() {
+    fn test_next_interval_scalar_is_fractional() {
         let w = FSRS6_DEFAULT_PARAMETERS;
         let interval = super::next_interval_scalar(&w, 121.01552, 0.9);
-        assert_eq!(interval, 121.0);
+        assert!((interval - 121.01551).abs() < 1e-4);
     }
 
     #[test]

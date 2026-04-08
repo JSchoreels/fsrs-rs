@@ -18,5 +18,6 @@
 - `FSRS::next_states_with_elapsed_days()` accepts elapsed time in days as
   `f32`, including fractional intervals (for example, same-day reviews).
 - FSRS-6 keeps legacy day-based behavior internally by rounding elapsed days
-  and output intervals to the nearest day, while still using `f32` transport.
+  for recall updates, while still using `f32` transport.
+- FSRS-6 and FSRS-7 both return fractional intervals from scheduling APIs.
 - FSRS-7 keeps full fractional behavior for elapsed days and output intervals.

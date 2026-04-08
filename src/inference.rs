@@ -357,7 +357,7 @@ impl<B: Backend> FSRS<B> {
 
     /// Calculate the next interval for the current memory state, for rescheduling. Stability
     /// should be provided except when the card is new. Rating is ignored except when card is new.
-    /// FSRS-6 returns day-rounded intervals; FSRS-7 returns fractional intervals.
+    /// FSRS-6 and FSRS-7 both return fractional intervals.
     pub fn next_interval(
         &self,
         stability: Option<f32>,
@@ -1386,32 +1386,32 @@ mod tests {
                         stability: 2.9691455,
                         difficulty: 8.000659
                     },
-                    interval: 3.0
+                    interval: 2.9691455
                 },
                 hard: ItemState {
                     memory: MemoryState {
                         stability: 17.091452,
                         difficulty: 7.6913934
                     },
-                    interval: 17.0
+                    interval: 17.091452
                 },
                 good: ItemState {
                     memory: MemoryState {
                         stability: 31.722992,
                         difficulty: 7.382128
                     },
-                    interval: 32.0
+                    interval: 31.722992
                 },
                 easy: ItemState {
                     memory: MemoryState {
                         stability: 71.7502,
                         difficulty: 7.0728626
                     },
-                    interval: 72.0
+                    interval: 71.7502
                 }
             }
         );
-        assert!((fsrs.next_interval(Some(121.01552), 0.9, 1) - 121.0).abs() < 1e-6);
+        assert!((fsrs.next_interval(Some(121.01552), 0.9, 1) - 121.01551).abs() < 1e-4);
         Ok(())
     }
 
