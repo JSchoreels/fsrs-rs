@@ -10,7 +10,7 @@ use crate::dataset::{
 use crate::error::Result;
 use crate::model::Model;
 use crate::model::{FSRS, Get, MemoryStateTensors};
-use crate::simulation::{D_MAX, D_MIN, S_MIN};
+use crate::simulation::S_MIN;
 use crate::training::BCELoss;
 use crate::training::{self, ComputeParametersInput};
 use crate::{FSRSError, FSRSItem};
@@ -20,42 +20,16 @@ use burn::tensor::ElementConversion;
 use burn::tensor::cast::ToElement;
 use burn::tensor::{Shape, Tensor, TensorData};
 use burn::{data::dataloader::batcher::Batcher, tensor::backend::Backend};
+
+#[path = "inference_v6.rs"]
+pub(crate) mod inference_v6;
+#[path = "inference_v7.rs"]
+pub(crate) mod inference_v7;
+
+pub use inference_v6::{FSRS5_DEFAULT_DECAY, FSRS6_DEFAULT_DECAY, FSRS6_DEFAULT_PARAMETERS};
+pub use inference_v7::DEFAULT_PARAMETERS;
 /// This is a slice for efficiency, and may be 17/19/21/35 in length.
 pub type Parameters = [f32];
-
-pub const FSRS5_DEFAULT_DECAY: f32 = 0.5;
-pub const FSRS6_DEFAULT_DECAY: f32 = 0.1542;
-const FSRS7_PARAM_LEN: usize = 35;
-
-pub static FSRS6_DEFAULT_PARAMETERS: [f32; 21] = [
-    0.212,
-    1.2931,
-    2.3065,
-    8.2956,
-    6.4133,
-    0.8334,
-    3.0194,
-    0.001,
-    1.8722,
-    0.1666,
-    0.796,
-    1.4835,
-    0.0614,
-    0.2629,
-    1.6483,
-    0.6014,
-    1.8729,
-    0.5425,
-    0.0912,
-    0.0658,
-    FSRS6_DEFAULT_DECAY,
-];
-
-pub static DEFAULT_PARAMETERS: [f32; 35] = [
-    0.041, 2.4175, 4.1283, 11.9709, 5.6385, 0.4468, 3.262, 2.3054, 0.1688, 1.3325, 0.3524, 0.0049,
-    0.7503, 0.0896, 0.6625, 1.3, 0.882, 0.3072, 3.5875, 0.303, 0.0107, 0.2279, 2.6413, 0.5594, 1.3,
-    2.5, 1.0, 0.0723, 0.1634, 0.5, 0.9555, 0.2245, 0.6232, 0.1362, 0.3862,
-];
 
 fn infer<B: Backend>(
     model: &Model<B>,
@@ -364,24 +338,8 @@ impl<B: Backend> FSRS<B> {
         interval: f32,
         sm2_retention: f32,
     ) -> Result<MemoryState> {
-        let w = &self.model().w;
-        let decay: f32 = w.get(20).neg().into_scalar().elem();
-        let factor = 0.9f32.powf(1.0 / decay) - 1.0;
-        let stability = interval.max(S_MIN) * factor / (sm2_retention.powf(1.0 / decay) - 1.0);
-        let w8: f32 = w.get(8).into_scalar().elem();
-        let w9: f32 = w.get(9).into_scalar().elem();
-        let w10: f32 = w.get(10).into_scalar().elem();
-        let difficulty = 11.0
-            - (ease_factor - 1.0)
-                / (w8.exp() * stability.powf(-w9) * ((1.0 - sm2_retention) * w10).exp_m1());
-        if !stability.is_finite() || !difficulty.is_finite() {
-            Err(FSRSError::InvalidInput)
-        } else {
-            Ok(MemoryState {
-                stability,
-                difficulty: difficulty.clamp(D_MIN, D_MAX),
-            })
-        }
+        self.model()
+            .memory_state_from_sm2(ease_factor, interval, sm2_retention)
     }
 
     /// Calculate current retrievability using the model's active forgetting
@@ -433,13 +391,8 @@ impl<B: Backend> FSRS<B> {
     ) -> f32 {
         let target_retrievability = target_retrievability.clamp(0.0001, 0.9999);
         let stability = state.stability.max(S_MIN);
-        let is_fsrs7 = self.model().w.val().dims()[0] >= FSRS7_PARAM_LEN;
-
-        if !is_fsrs7 && (target_retrievability - 0.9).abs() <= f32::EPSILON {
-            stability
-        } else {
-            self.next_interval(Some(stability), target_retrievability, 3)
-        }
+        self.model()
+            .interval_at_retrievability(stability, target_retrievability)
     }
 
     /// Convenience helper for "S90": the interval (in days) where retrievability is 90%.
@@ -834,6 +787,7 @@ pub fn evaluate_with_time_series_splits<F>(
     ComputeParametersInput {
         train_set,
         enable_short_term,
+        enable_sched_penalties,
         num_relearning_steps,
         ..
     }: ComputeParametersInput,
@@ -858,6 +812,7 @@ where
         let input = ComputeParametersInput {
             train_set: split.train_items.clone(),
             enable_short_term,
+            enable_sched_penalties,
             num_relearning_steps,
             progress: None,
         };
@@ -1328,6 +1283,7 @@ mod tests {
             train_set: items.clone(),
             progress: None,
             enable_short_term: true,
+            enable_sched_penalties: true,
             num_relearning_steps: None,
         };
 
@@ -1340,6 +1296,7 @@ mod tests {
                 train_set: items[..5].to_vec(),
                 progress: None,
                 enable_short_term: true,
+                enable_sched_penalties: true,
                 num_relearning_steps: None,
             },
             |_| true,
@@ -1526,35 +1483,6 @@ mod tests {
     }
 
     #[test]
-    fn test_model_current_retrievability_matches_fsrs6_scalar() {
-        let fsrs = FSRS::new(&FSRS6_DEFAULT_PARAMETERS).unwrap();
-        let state = MemoryState {
-            stability: 10.0,
-            difficulty: 5.0,
-        };
-        let expected = current_retrievability(state, 3.0, FSRS6_DEFAULT_DECAY);
-        let actual = fsrs.current_retrievability(state, 3.0);
-        assert!((actual - expected).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_fsrs7_retrievability_does_not_depend_on_w20() {
-        let state = MemoryState {
-            stability: 12.0,
-            difficulty: 5.0,
-        };
-        let mut params_a = DEFAULT_PARAMETERS.to_vec();
-        let mut params_b = DEFAULT_PARAMETERS.to_vec();
-        params_a[20] = 0.001;
-        params_b[20] = 5.0;
-        let fsrs_a = FSRS::new(&params_a).unwrap();
-        let fsrs_b = FSRS::new(&params_b).unwrap();
-        let r_a = fsrs_a.current_retrievability(state, 10.0);
-        let r_b = fsrs_b.current_retrievability(state, 10.0);
-        assert!((r_a - r_b).abs() < 1e-7);
-    }
-
-    #[test]
     fn test_memory_from_sm2() -> Result<()> {
         let fsrs = FSRS::default();
         let memory_state = fsrs.memory_state_from_sm2(2.5, 10.0, 0.9).unwrap();
@@ -1586,29 +1514,5 @@ mod tests {
             / interval as f32;
         assert!((fsrs_factor - ease_factor).abs() < 0.01);
         Ok(())
-    }
-
-    #[test]
-    fn test_s90_legacy_equals_stability() {
-        let fsrs = FSRS::new(&FSRS6_DEFAULT_PARAMETERS).unwrap();
-        let state = MemoryState {
-            stability: 12.345,
-            difficulty: 5.0,
-        };
-
-        assert_eq!(fsrs.s90(state), state.stability);
-    }
-
-    #[test]
-    fn test_s90_fsrs7_hits_90_retrievability() {
-        let fsrs = FSRS::new(&DEFAULT_PARAMETERS).unwrap();
-        let state = MemoryState {
-            stability: 10.0,
-            difficulty: 5.0,
-        };
-
-        let s90 = fsrs.s90(state);
-        let r = fsrs.current_retrievability(state, s90);
-        assert!((r - 0.9).abs() <= 1e-3);
     }
 }

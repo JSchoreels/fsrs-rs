@@ -1,7 +1,7 @@
 use crate::DEFAULT_PARAMETERS;
 use crate::error::{FSRSError, Result};
 use crate::inference::{ItemProgress, Parameters};
-use crate::model::check_and_fill_parameters;
+use crate::model::{ModelVersion, check_and_fill_parameters, model_v6, model_v7};
 use itertools::{Itertools, izip};
 use ndarray::{Array1, Array2, Array3};
 use priority_queue::PriorityQueue;
@@ -204,90 +204,30 @@ fn init_s(w: &[f32], rating: usize) -> f32 {
     w[rating - 1]
 }
 
-fn is_fsrs7(w: &[f32]) -> bool {
-    w.len() >= 35
-}
-
-fn fsrs7_transition(w: &[f32], delta_t: f32) -> f32 {
-    1.0 - w[26] * (-w[25] * delta_t).exp()
-}
-
-fn fsrs7_stability_after_review_set(
-    w: &[f32],
-    s: f32,
-    r: f32,
-    d: f32,
-    rating: usize,
-    start: usize,
-) -> f32 {
-    let hard_penalty = if rating == 2 { w[start + 7] } else { 1.0 };
-    let easy_bonus = if rating == 4 { w[start + 8] } else { 1.0 };
-
-    let new_s_fail = w[start + 3]
-        * d.powf(-w[start + 4])
-        * ((s + 1.0).powf(w[start + 5]) - 1.0)
-        * ((1.0 - r) * w[start + 6]).exp();
-    let pls = s.min(new_s_fail);
-
-    if rating > 1 {
-        let sinc = 1.0
-            + (w[start] - 1.5).exp()
-                * (11.0 - d)
-                * s.powf(-w[start + 1])
-                * (((1.0 - r) * w[start + 2]).exp() - 1.0)
-                * hard_penalty
-                * easy_bonus;
-        pls.max(s * sinc)
-    } else {
-        pls
-    }
+fn model_version(w: &[f32]) -> ModelVersion {
+    ModelVersion::from_param_count(w.len())
 }
 
 fn stability_after_success(w: &[f32], s: f32, r: f32, d: f32, rating: usize, delta_t: f32) -> f32 {
-    if is_fsrs7(w) {
-        let long = fsrs7_stability_after_review_set(w, s, r, d, rating, 7);
-        let short = fsrs7_stability_after_review_set(w, s, r, d, rating, 16);
-        let coefficient = fsrs7_transition(w, delta_t);
-        (coefficient * long + (1.0 - coefficient) * short).clamp(S_MIN, S_MAX)
-    } else {
-        let hard_penalty = if rating == 2 { w[15] } else { 1.0 };
-        let easy_bonus = if rating == 4 { w[16] } else { 1.0 };
-        (s * (f32::exp(w[8])
-            * (11.0 - d)
-            * s.powf(-w[9])
-            * (f32::exp((1.0 - r) * w[10]) - 1.0)
-            * hard_penalty)
-            .mul_add(easy_bonus, 1.0))
-        .clamp(S_MIN, S_MAX)
+    match model_version(w) {
+        ModelVersion::Fsrs7 => {
+            model_v7::stability_after_success_scalar(w, s, r, d, rating, delta_t)
+        }
+        ModelVersion::Fsrs6 => model_v6::stability_after_success_scalar(w, s, r, d, rating),
     }
 }
 
 fn stability_after_failure(w: &[f32], s: f32, r: f32, d: f32, delta_t: f32) -> f32 {
-    if is_fsrs7(w) {
-        let long = fsrs7_stability_after_review_set(w, s, r, d, 1, 7);
-        let short = fsrs7_stability_after_review_set(w, s, r, d, 1, 16);
-        let coefficient = fsrs7_transition(w, delta_t);
-        (coefficient * long + (1.0 - coefficient) * short).clamp(S_MIN, S_MAX)
-    } else {
-        let new_s_min = s / (w[17] * w[18]).exp();
-        let new_s =
-            (w[11] * d.powf(-w[12]) * ((s + 1.0).powf(w[13]) - 1.0) * f32::exp((1.0 - r) * w[14]))
-                .min(new_s_min);
-        new_s.clamp(S_MIN, S_MAX)
+    match model_version(w) {
+        ModelVersion::Fsrs7 => model_v7::stability_after_failure_scalar(w, s, r, d, delta_t),
+        ModelVersion::Fsrs6 => model_v6::stability_after_failure_scalar(w, s, r, d),
     }
 }
 
 fn stability_short_term(w: &[f32], s: f32, d: f32, rating: usize) -> f32 {
-    if is_fsrs7(w) {
-        let r = 1.0;
-        let long = fsrs7_stability_after_review_set(w, s, r, d, rating, 7);
-        let short = fsrs7_stability_after_review_set(w, s, r, d, rating, 16);
-        let coefficient = fsrs7_transition(w, 0.0);
-        (coefficient * long + (1.0 - coefficient) * short).clamp(S_MIN, S_MAX)
-    } else {
-        let sinc = (w[17] * (rating as f32 - 3.0 + w[18])).exp() * s.powf(-w[19]);
-        let new_s = s * if rating >= 3 { sinc.max(1.0) } else { sinc };
-        new_s.clamp(S_MIN, S_MAX)
+    match model_version(w) {
+        ModelVersion::Fsrs7 => model_v7::stability_short_term_scalar(w, s, 1.0, d, rating),
+        ModelVersion::Fsrs6 => model_v6::stability_short_term_scalar(w, s, rating),
     }
 }
 
@@ -335,77 +275,53 @@ fn memory_state_short_term(
 }
 
 fn init_d(w: &[f32], rating: usize) -> f32 {
-    w[4] - (w[5] * (rating - 1) as f32).exp() + 1.0
-}
-
-fn linear_damping(delta_d: f32, old_d: f32) -> f32 {
-    (10.0 - old_d) / 9.0 * delta_d
+    match model_version(w) {
+        ModelVersion::Fsrs7 => model_v7::init_difficulty_scalar(w, rating),
+        ModelVersion::Fsrs6 => model_v6::init_difficulty_scalar(w, rating),
+    }
 }
 
 fn next_d(w: &[f32], d: f32, rating: usize) -> f32 {
-    let delta_d = -w[6] * (rating as f32 - 3.0);
-    let new_d = d + linear_damping(delta_d, d);
-    mean_reversion(w, init_d(w, 4), new_d).clamp(D_MIN, D_MAX)
-}
-
-fn mean_reversion(w: &[f32], init: f32, current: f32) -> f32 {
-    if is_fsrs7(w) {
-        0.01 * init + 0.99 * current
-    } else {
-        w[7] * init + (1.0 - w[7]) * current
+    match model_version(w) {
+        ModelVersion::Fsrs7 => model_v7::next_difficulty_scalar(w, d, rating),
+        ModelVersion::Fsrs6 => model_v6::next_difficulty_scalar(w, d, rating),
     }
 }
 
 fn power_forgetting_curve(w: &[f32], t: f32, s: f32) -> f32 {
     debug_assert!(t >= 0.);
-    if is_fsrs7(w) {
-        let s = s.max(S_MIN);
-        let t_over_s = t / s;
-        let decay1 = -w[27];
-        let decay2 = -w[28];
-        let base1 = w[29];
-        let base2 = w[30];
-        let factor1 = base1.powf(1.0 / decay1) - 1.0;
-        let factor2 = base2.powf(1.0 / decay2) - 1.0;
-        let r1 = (1.0 + factor1 * t_over_s).powf(decay1);
-        let r2 = (1.0 + factor2 * t_over_s).powf(decay2);
-        let weight1 = w[31] * s.powf(-w[33]);
-        let weight2 = w[32] * s.powf(w[34]);
-        (weight1 * r1 + weight2 * r2) / (weight1 + weight2)
-    } else {
-        let decay = -w[20];
-        let factor = 0.9f32.powf(1.0 / decay) - 1.0;
-        (t / s).mul_add(factor, 1.0).powf(decay)
+    match model_version(w) {
+        ModelVersion::Fsrs7 => model_v7::fsrs7_forgetting_curve_scalar(w, t, s),
+        ModelVersion::Fsrs6 => model_v6::power_forgetting_curve_scalar(w, t, s),
     }
 }
 
 fn next_interval(w: &[f32], stability: f32, desired_retention: f32) -> f32 {
-    if is_fsrs7(w) {
-        let desired_retention = desired_retention.clamp(0.0001, 0.9999);
-        if desired_retention >= 0.9999 {
-            return 0.0;
-        }
-        let mut low = 0.0;
-        let mut high = stability.max(1.0);
-        while power_forgetting_curve(w, high, stability) > desired_retention && high < S_MAX {
-            high = (high * 2.0).min(S_MAX);
-            if (high - S_MAX).abs() < f32::EPSILON {
-                break;
+    match model_version(w) {
+        ModelVersion::Fsrs7 => {
+            let desired_retention = desired_retention.clamp(0.0001, 0.9999);
+            if desired_retention >= 0.9999 {
+                return 0.0;
             }
-        }
-        for _ in 0..50 {
-            let mid = (low + high) / 2.0;
-            if power_forgetting_curve(w, mid, stability) > desired_retention {
-                low = mid;
-            } else {
-                high = mid;
+            let mut low = 0.0;
+            let mut high = stability.max(1.0);
+            while power_forgetting_curve(w, high, stability) > desired_retention && high < S_MAX {
+                high = (high * 2.0).min(S_MAX);
+                if (high - S_MAX).abs() < f32::EPSILON {
+                    break;
+                }
             }
+            for _ in 0..50 {
+                let mid = (low + high) / 2.0;
+                if power_forgetting_curve(w, mid, stability) > desired_retention {
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+            }
+            ((low + high) / 2.0).clamp(0.0, S_MAX)
         }
-        ((low + high) / 2.0).clamp(0.0, S_MAX)
-    } else {
-        let decay = -w[20];
-        let factor = 0.9f32.powf(1.0 / decay) - 1.0;
-        stability / factor * (desired_retention.powf(1.0 / decay) - 1.0)
+        ModelVersion::Fsrs6 => model_v6::next_interval_scalar(w, stability, desired_retention),
     }
 }
 

@@ -7,7 +7,10 @@ inference behavior unchanged.
 
 ## API Surface
 
-- `compute_parameters()` now always trains with the FSRS-7 penalty objective.
+- `compute_parameters()` exposes `enable_sched_penalties` (default `true`).
+- When `enable_sched_penalties = true`, FSRS-7 schedule penalties (penalty 1 & 2) are added.
+- When `enable_sched_penalties = false`, schedule penalties are skipped.
+- `L2` regularization remains enabled in both modes.
 
 ## Objective Components
 
@@ -48,6 +51,7 @@ The derivative is propagated by an internal dual-number engine for 35 params.
   - temporary scalar penalty values and dual gradients during each train/valid batch.
 - Data read:
   - current model weights (`w[0..34]`), plus batch size for scaling.
+  - input flag `enable_sched_penalties` to decide whether schedule penalties are computed.
 - Data updated:
   - model gradient for `w` is updated by adding manual penalty gradients before optimizer step.
 - Data storage:
@@ -58,3 +62,10 @@ The derivative is propagated by an internal dual-number engine for 35 params.
 - Affects optimization only (`compute_parameters` path).
 - Does not change runtime scheduling/inference formulas used by `FSRS::next_interval`,
   `FSRS::interval_at_retrievability`, or Anki runtime calls.
+
+## Short-Term Opt-Out
+
+- `compute_parameters(..., enable_short_term = false)` is honored for FSRS-7.
+- Training enforces long-term-only FSRS-7 updates by zeroing transition weight
+  `w[26]` in the training clipper path and freezing FSRS-7 short-term/transition
+  gradient slots.

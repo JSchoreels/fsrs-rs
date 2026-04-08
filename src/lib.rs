@@ -10,6 +10,7 @@ mod inference;
 mod model;
 mod parameter_clipper;
 mod parameter_initialization;
+mod parameter_initialization_fsrs7;
 mod simulation;
 #[cfg(test)]
 mod test_helpers;
