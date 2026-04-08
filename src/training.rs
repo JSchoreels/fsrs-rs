@@ -4,11 +4,11 @@ use crate::dataset::{
     FSRSDataset, FSRSItem, WeightedFSRSItem, prepare_training_data, recency_weighted_fsrs_items,
 };
 use crate::error::Result;
-use crate::model::{Model, ModelConfig, ModelVersion};
+use crate::model::{Model, ModelConfig, ModelVersion, parameters_to_model};
 use crate::parameter_clipper::parameter_clipper;
 use crate::parameter_initialization::smooth_and_fill;
 use crate::parameter_initialization_fsrs7::initialize_parameters_fsrs7;
-use crate::{DEFAULT_PARAMETERS, FSRSError};
+use crate::{DEFAULT_PARAMETERS, FSRS6_DEFAULT_PARAMETERS, FSRSError};
 use burn::backend::Autodiff;
 use burn::backend::ndarray::NdArray;
 use burn::lr_scheduler::LrScheduler;
@@ -26,6 +26,7 @@ use burn::{config::Config, tensor::backend::AutodiffBackend};
 use core::marker::PhantomData;
 use log::info;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 #[path = "training_v6.rs"]
@@ -35,65 +36,24 @@ mod training_v7;
 
 type B = NdArray<f32>;
 
-static PARAMS_STDDEV: [f32; 35] = [
-    9999.0, 9999.0, 9999.0, 9999.0, 0.523, 0.2528, 0.4329, 0.2966, 0.2139, 0.2889, 0.1862, 0.0829,
-    0.175, 0.3812, 0.3013, 0.9104, 0.3234, 0.2448, 0.3273, 0.1842, 0.1542, 0.1735, 0.4608, 0.311,
-    0.864, 0.4053, 0.162, 0.0418, 0.2596, 0.0798, 0.0682, 0.1282, 0.1397, 0.1407, 0.1489,
-];
 const L2_PENALTY_WEIGHT: f64 = training_v7::PENALTY_W_L2;
 const PENALTY_GRAD_LEN: usize = training_v7::GRAD_LEN;
 
-fn maybe_schedule_penalty_value_and_grad(
-    version: ModelVersion,
-    w: &[f32],
-    batch_size: usize,
-    enable_sched_penalties: bool,
-) -> (f64, [f64; PENALTY_GRAD_LEN]) {
+type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN]);
+type L2PenaltyFn = fn(&[f32], &[f32], usize, usize, f64, &[f32]) -> (f64, Vec<f32>);
+
+fn schedule_penalty_fn(version: ModelVersion) -> SchedulePenaltyFn {
     match version {
-        ModelVersion::Fsrs6 => training_v6::maybe_schedule_penalty_value_and_grad(
-            w,
-            batch_size,
-            enable_sched_penalties,
-        ),
-        ModelVersion::Fsrs7 => training_v7::maybe_schedule_penalty_value_and_grad(
-            w,
-            batch_size,
-            enable_sched_penalties,
-        ),
+        ModelVersion::Fsrs6 => training_v6::maybe_schedule_penalty_value_and_grad,
+        ModelVersion::Fsrs7 => training_v7::maybe_schedule_penalty_value_and_grad,
     }
 }
 
-fn l2_penalty_value_and_grad(
-    w: &[f32],
-    init_w: &[f32],
-    batch_size: usize,
-    total_size: usize,
-    l2_weight: f64,
-) -> (f64, Vec<f32>) {
-    let mut grad = vec![0.0f32; w.len()];
-    if total_size == 0 {
-        return (0.0, grad);
+fn l2_penalty_fn(version: ModelVersion) -> L2PenaltyFn {
+    match version {
+        ModelVersion::Fsrs6 => training_v6::l2_penalty_value_and_grad,
+        ModelVersion::Fsrs7 => training_v7::l2_penalty_value_and_grad,
     }
-    let size = w.len().min(init_w.len()).min(PARAMS_STDDEV.len());
-    let scale = l2_weight * batch_size as f64 / total_size as f64;
-    let mut penalty_sum = 0.0f64;
-    for i in 0..size {
-        let sigma = PARAMS_STDDEV[i] as f64;
-        let denom = sigma * sigma;
-        let diff = w[i] as f64 - init_w[i] as f64;
-        penalty_sum += diff * diff / denom;
-        grad[i] = (2.0 * diff / denom * scale) as f32;
-    }
-    let penalty = penalty_sum * scale;
-    if !penalty.is_finite() {
-        return (0.0, vec![0.0; w.len()]);
-    }
-    for g in &mut grad {
-        if !g.is_finite() {
-            *g = 0.0;
-        }
-    }
-    (penalty, grad)
 }
 
 pub struct BCELoss<B: Backend> {
@@ -140,22 +100,6 @@ impl<B: Backend> Model<B> {
         let state = self.forward(t_historys, r_historys, None);
         let retrievability = self.power_forgetting_curve(delta_ts, state.stability);
         BCELoss::new().forward(retrievability, labels.float(), weights, reduce)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn l2_regularization(
-        &self,
-        init_w: Tensor<B, 1>,
-        params_stddev: Tensor<B, 1>,
-        batch_size: usize,
-        total_size: usize,
-        l2_weight: f64,
-    ) -> Tensor<B, 1> {
-        (self.w.val() - init_w)
-            .powi_scalar(2)
-            .div(params_stddev.powi_scalar(2))
-            .sum()
-            .mul_scalar(l2_weight * batch_size as f64 / total_size as f64)
     }
 }
 
@@ -317,6 +261,13 @@ pub(crate) fn calculate_average_recall(items: &[FSRSItem]) -> f32 {
     total_recall as f32 / total_reviews as f32
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ComputeParametersVersion {
+    Fsrs6,
+    #[default]
+    Fsrs7,
+}
+
 /// Input parameters for computing FSRS parameters
 #[derive(Clone, Debug)]
 pub struct ComputeParametersInput {
@@ -328,6 +279,8 @@ pub struct ComputeParametersInput {
     pub enable_short_term: bool,
     /// Whether to enable FSRS-7 schedule penalties (penalty 1 & 2)
     pub enable_sched_penalties: bool,
+    /// Target parameter version to optimize.
+    pub model_version: ComputeParametersVersion,
     /// Number of relearning steps
     pub num_relearning_steps: Option<usize>,
 }
@@ -339,8 +292,27 @@ impl Default for ComputeParametersInput {
             progress: None,
             enable_short_term: true,
             enable_sched_penalties: true,
+            model_version: ComputeParametersVersion::default(),
             num_relearning_steps: None,
         }
+    }
+}
+
+fn normalize_for_model_version(
+    train_set: Vec<FSRSItem>,
+    model_version: ComputeParametersVersion,
+) -> Vec<FSRSItem> {
+    match model_version {
+        ComputeParametersVersion::Fsrs6 => train_set
+            .into_iter()
+            .map(|mut item| {
+                for review in &mut item.reviews {
+                    review.delta_t = review.delta_t.max(0.0).round();
+                }
+                item
+            })
+            .collect(),
+        ComputeParametersVersion::Fsrs7 => train_set,
     }
 }
 /// Computes optimized parameters for the FSRS model based on training data.
@@ -358,6 +330,7 @@ pub fn compute_parameters(
         progress,
         enable_short_term,
         enable_sched_penalties,
+        model_version,
         num_relearning_steps,
         ..
     }: ComputeParametersInput,
@@ -372,21 +345,31 @@ pub fn compute_parameters(
         }
     };
 
+    let train_set = normalize_for_model_version(train_set, model_version);
     let (dataset_for_initialization, train_set) = prepare_training_data(train_set);
     let average_recall = calculate_average_recall(&train_set);
     if train_set.len() < 8 {
         finish_progress();
-        return Ok(DEFAULT_PARAMETERS.to_vec());
+        return Ok(match model_version {
+            ComputeParametersVersion::Fsrs6 => FSRS6_DEFAULT_PARAMETERS.to_vec(),
+            ComputeParametersVersion::Fsrs7 => DEFAULT_PARAMETERS.to_vec(),
+        });
     }
 
-    let (initial_stability, initial_forgetting_curve, initial_rating_count) =
-        initialize_parameters_fsrs7(dataset_for_initialization.clone(), average_recall)
-            .inspect_err(|_e| {
-                finish_progress();
-            })?;
-    let mut initialized_parameters = DEFAULT_PARAMETERS.to_vec();
-    initialized_parameters[0..4].copy_from_slice(&initial_stability);
-    initialized_parameters[27..35].copy_from_slice(&initial_forgetting_curve);
+    let (initialized_parameters, initial_rating_count) = match model_version {
+        ComputeParametersVersion::Fsrs6 => (FSRS6_DEFAULT_PARAMETERS.to_vec(), None),
+        ComputeParametersVersion::Fsrs7 => {
+            let (initial_stability, initial_forgetting_curve, initial_rating_count) =
+                initialize_parameters_fsrs7(dataset_for_initialization.clone(), average_recall)
+                    .inspect_err(|_e| {
+                        finish_progress();
+                    })?;
+            let mut initialized_parameters = DEFAULT_PARAMETERS.to_vec();
+            initialized_parameters[0..4].copy_from_slice(&initial_stability);
+            initialized_parameters[27..35].copy_from_slice(&initial_forgetting_curve);
+            (initialized_parameters, Some(initial_rating_count))
+        }
+    };
     if train_set.len() == dataset_for_initialization.len() || train_set.len() < 64 {
         finish_progress();
         return Ok(initialized_parameters);
@@ -394,8 +377,8 @@ pub fn compute_parameters(
     let config = TrainingConfig::new(
         ModelConfig {
             freeze_initial_stability: !enable_short_term,
-            initial_stability: Some(initial_stability),
-            initial_forgetting_curve: Some(initial_forgetting_curve),
+            initial_stability: None,
+            initial_forgetting_curve: None,
             freeze_short_term_stability: !enable_short_term,
             num_relearning_steps: num_relearning_steps.unwrap_or(1),
         },
@@ -420,6 +403,7 @@ pub fn compute_parameters(
     let model = train::<Autodiff<B>>(
         weighted_train_set.clone(),
         weighted_train_set,
+        &initialized_parameters,
         &config,
         progress.clone().map(|p| ProgressCollector::new(p, 0)),
     );
@@ -443,19 +427,21 @@ pub fn compute_parameters(
         return Err(FSRSError::InvalidInput);
     }
 
-    let mut optimized_initial_stability = optimized_parameters[0..4]
-        .iter()
-        .enumerate()
-        .map(|(i, &val)| (i as u32 + 1, val))
-        .collect();
-    let clamped_stability =
-        smooth_and_fill(&mut optimized_initial_stability, &initial_rating_count).unwrap();
-    let optimized_parameters = clamped_stability
-        .into_iter()
-        .chain(optimized_parameters[4..].iter().copied())
-        .collect();
-
-    Ok(optimized_parameters)
+    if let Some(initial_rating_count) = initial_rating_count {
+        let mut optimized_initial_stability = optimized_parameters[0..4]
+            .iter()
+            .enumerate()
+            .map(|(i, &val)| (i as u32 + 1, val))
+            .collect::<HashMap<_, _>>();
+        let clamped_stability =
+            smooth_and_fill(&mut optimized_initial_stability, &initial_rating_count).unwrap();
+        Ok(clamped_stability
+            .into_iter()
+            .chain(optimized_parameters[4..].iter().copied())
+            .collect())
+    } else {
+        Ok(optimized_parameters)
+    }
 }
 
 pub fn benchmark(
@@ -463,22 +449,33 @@ pub fn benchmark(
         train_set,
         enable_short_term,
         enable_sched_penalties,
+        model_version,
         num_relearning_steps,
         ..
     }: ComputeParametersInput,
 ) -> Vec<f32> {
+    let train_set = normalize_for_model_version(train_set, model_version);
     let average_recall = calculate_average_recall(&train_set);
     let (dataset_for_initialization, _next_train_set) = train_set
         .clone()
         .into_iter()
         .partition(|item| item.long_term_review_cnt() == 1);
-    let (initial_stability, initial_forgetting_curve, _rating_count) =
-        initialize_parameters_fsrs7(dataset_for_initialization, average_recall).unwrap();
+    let initialized_parameters = match model_version {
+        ComputeParametersVersion::Fsrs6 => FSRS6_DEFAULT_PARAMETERS.to_vec(),
+        ComputeParametersVersion::Fsrs7 => {
+            let (initial_stability, initial_forgetting_curve, _rating_count) =
+                initialize_parameters_fsrs7(dataset_for_initialization, average_recall).unwrap();
+            let mut initialized_parameters = DEFAULT_PARAMETERS.to_vec();
+            initialized_parameters[0..4].copy_from_slice(&initial_stability);
+            initialized_parameters[27..35].copy_from_slice(&initial_forgetting_curve);
+            initialized_parameters
+        }
+    };
     let mut config = TrainingConfig::new(
         ModelConfig {
             freeze_initial_stability: !enable_short_term,
-            initial_stability: Some(initial_stability),
-            initial_forgetting_curve: Some(initial_forgetting_curve),
+            initial_stability: None,
+            initial_forgetting_curve: None,
             freeze_short_term_stability: !enable_short_term,
             num_relearning_steps: num_relearning_steps.unwrap_or(1),
         },
@@ -495,6 +492,7 @@ pub fn benchmark(
     let model = train::<Autodiff<B>>(
         weighted_train_set.clone(),
         weighted_train_set,
+        &initialized_parameters,
         &config,
         None,
     );
@@ -505,6 +503,7 @@ pub fn benchmark(
 fn train<B: AutodiffBackend>(
     train_set: Vec<WeightedFSRSItem>,
     test_set: Vec<WeightedFSRSItem>,
+    initial_parameters: &[f32],
     config: &TrainingConfig,
     progress: Option<ProgressCollector>,
 ) -> Result<Model<B>> {
@@ -533,7 +532,9 @@ fn train<B: AutodiffBackend>(
         None => Box::new(NoProgress {}),
     };
 
-    let mut model: Model<B> = config.model.init();
+    let mut model: Model<B> = parameters_to_model::<B>(initial_parameters, &B::Device::default());
+    let schedule_penalty = schedule_penalty_fn(model.version());
+    let l2_penalty = l2_penalty_fn(model.version());
     let init_w = model.w.val();
     let init_w_vec = init_w.to_data().to_vec::<f32>().unwrap();
     let mut optim = config.optimizer.init::<B, Model<B>>();
@@ -550,19 +551,16 @@ fn train<B: AutodiffBackend>(
             let progress = iterator.progress();
             let l2_weight = L2_PENALTY_WEIGHT;
             let w_vec = model.w.val().to_data().to_vec::<f32>().unwrap();
-            let (_l2_penalty_value, mut manual_grad) = l2_penalty_value_and_grad(
+            let (_l2_penalty_value, mut manual_grad) = l2_penalty(
                 &w_vec,
                 &init_w_vec,
                 real_batch_size,
                 total_size,
                 l2_weight,
+                &training_v7::PARAMS_STDDEV,
             );
-            let (_schedule_value, schedule_grad) = maybe_schedule_penalty_value_and_grad(
-                model.version(),
-                &w_vec,
-                real_batch_size,
-                config.enable_sched_penalties,
-            );
+            let (_schedule_value, schedule_grad) =
+                schedule_penalty(&w_vec, real_batch_size, config.enable_sched_penalties);
             let inv_total = 1.0 / total_size as f64;
             for i in 0..manual_grad.len().min(schedule_grad.len()) {
                 manual_grad[i] += (schedule_grad[i] * inv_total) as f32;
@@ -613,19 +611,16 @@ fn train<B: AutodiffBackend>(
             let real_batch_size = batch.delta_ts.shape().dims[0];
             let l2_weight = L2_PENALTY_WEIGHT;
             let w_vec = model_valid.w.val().to_data().to_vec::<f32>().unwrap();
-            let (l2_penalty_value, _) = l2_penalty_value_and_grad(
+            let (l2_penalty_value, _) = l2_penalty(
                 &w_vec,
                 &init_w_vec,
                 real_batch_size,
                 total_size,
                 l2_weight,
+                &training_v7::PARAMS_STDDEV,
             );
-            let (schedule_value, _) = maybe_schedule_penalty_value_and_grad(
-                model_valid.version(),
-                &w_vec,
-                real_batch_size,
-                config.enable_sched_penalties,
-            );
+            let (schedule_value, _) =
+                schedule_penalty(&w_vec, real_batch_size, config.enable_sched_penalties);
             let schedule_penalty = schedule_value / total_size as f64;
             let loss = model_valid.forward_classification(
                 batch.t_historys,
@@ -682,8 +677,9 @@ mod tests {
     use crate::convertor_tests::anki21_sample_file_converted_to_fsrs;
     use crate::convertor_tests::data_from_csv;
     use crate::dataset::FSRSBatch;
-    use crate::model::FSRS;
+    use crate::model::{FSRS, parameters_to_model};
     use crate::test_helpers::TestHelper;
+    use crate::{DEFAULT_PARAMETERS, FSRS6_DEFAULT_PARAMETERS};
     use burn::backend::NdArray;
     use log::LevelFilter;
 
@@ -695,16 +691,68 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_for_model_version_rounds_fsrs6_only() {
+        let train_set = vec![FSRSItem {
+            reviews: vec![
+                crate::FSRSReview {
+                    rating: 1,
+                    delta_t: -0.2,
+                },
+                crate::FSRSReview {
+                    rating: 3,
+                    delta_t: 0.49,
+                },
+                crate::FSRSReview {
+                    rating: 3,
+                    delta_t: 0.51,
+                },
+            ],
+        }];
+        let fsrs6 = normalize_for_model_version(train_set.clone(), ComputeParametersVersion::Fsrs6);
+        let fsrs7 = normalize_for_model_version(train_set, ComputeParametersVersion::Fsrs7);
+        let fsrs6_days: Vec<f32> = fsrs6[0].reviews.iter().map(|r| r.delta_t).collect();
+        let fsrs7_days: Vec<f32> = fsrs7[0].reviews.iter().map(|r| r.delta_t).collect();
+        assert_eq!(fsrs6_days, vec![0.0, 0.0, 1.0]);
+        assert_eq!(fsrs7_days, vec![-0.2, 0.49, 0.51]);
+    }
+
+    #[test]
+    fn test_compute_parameters_small_dataset_fsrs6_defaults() {
+        let parameters = compute_parameters(ComputeParametersInput {
+            train_set: vec![],
+            progress: None,
+            enable_short_term: true,
+            enable_sched_penalties: true,
+            model_version: ComputeParametersVersion::Fsrs6,
+            num_relearning_steps: None,
+        })
+        .unwrap();
+        assert_eq!(parameters, FSRS6_DEFAULT_PARAMETERS.to_vec());
+    }
+
+    #[test]
+    fn test_compute_parameters_small_dataset_fsrs7_defaults() {
+        let parameters = compute_parameters(ComputeParametersInput {
+            train_set: vec![],
+            progress: None,
+            enable_short_term: true,
+            enable_sched_penalties: true,
+            model_version: ComputeParametersVersion::Fsrs7,
+            num_relearning_steps: None,
+        })
+        .unwrap();
+        assert_eq!(parameters, DEFAULT_PARAMETERS.to_vec());
+    }
+
+    #[test]
     fn test_loss_and_grad() {
         use burn::backend::ndarray::NdArrayDevice;
         use burn::tensor::TensorData;
 
-        let config = ModelConfig::default();
         let device = NdArrayDevice::Cpu;
         type B = Autodiff<NdArray<f32>>;
-        let mut model: Model<B> = config.init();
+        let mut model: Model<B> = parameters_to_model::<B>(&FSRS6_DEFAULT_PARAMETERS, &device);
         let init_w = model.w.val();
-        let params_stddev = Tensor::from_floats(PARAMS_STDDEV, &device);
 
         let item = FSRSBatch {
             t_historys: Tensor::from_floats(
@@ -747,7 +795,6 @@ mod tests {
         let gradients = loss.backward();
 
         let w_grad = model.w.grad(&gradients).unwrap();
-
         w_grad.to_data().to_vec::<f32>().unwrap().assert_approx_eq([
             -0.095688485,
             -0.0051607806,
@@ -813,35 +860,18 @@ mod tests {
                 0.1142,
             ]);
 
-        let penalty =
-            model.l2_regularization(init_w.clone(), params_stddev.clone(), 512, 1000, 2.0);
-        assert_eq!(penalty.clone().into_scalar().to_f32(), 0.67711145);
-
-        let gradients = penalty.backward();
-        let w_grad = model.w.grad(&gradients).unwrap();
-        w_grad.to_data().to_vec::<f32>().unwrap().assert_approx_eq([
-            0.0019813816,
-            0.00087788026,
-            0.00026506148,
-            -0.000105618295,
-            -0.25213888,
-            1.0448985,
-            -0.22755535,
-            5.688889,
-            -0.5385926,
-            2.5283954,
-            -0.75225013,
-            0.9102214,
-            -10.113569,
-            3.1999993,
-            0.2521374,
-            1.3107208,
-            -0.07721739,
-            -0.85244584,
-            0.79999936,
-            4.1795917,
-            -1.1237311,
-        ]);
+        let init_w_vec = init_w.to_data().to_vec::<f32>().unwrap();
+        let w_vec = model.w.val().to_data().to_vec::<f32>().unwrap();
+        let (penalty_value, grad_vec) = training_v6::l2_penalty_value_and_grad(
+            &w_vec,
+            &init_w_vec,
+            512,
+            1000,
+            L2_PENALTY_WEIGHT,
+            &training_v7::PARAMS_STDDEV,
+        );
+        assert_eq!(penalty_value, 0.0);
+        assert_eq!(grad_vec, vec![0.0; w_vec.len()]);
 
         let item = FSRSBatch {
             t_historys: Tensor::from_floats(
@@ -957,33 +987,43 @@ mod tests {
                 .unwrap();
         }
         for items in [anki21_sample_file_converted_to_fsrs(), data_from_csv()] {
-            for enable_short_term in [true, false] {
-                let progress = CombinedProgressState::new_shared();
-                let progress2 = Some(progress.clone());
-                thread::spawn(move || {
-                    let mut finished = false;
-                    while !finished {
-                        thread::sleep(Duration::from_millis(500));
-                        let guard = progress.lock().unwrap();
-                        finished = guard.finished();
-                        println!("progress: {}/{}", guard.current(), guard.total());
+            for model_version in [
+                ComputeParametersVersion::Fsrs6,
+                ComputeParametersVersion::Fsrs7,
+            ] {
+                for enable_short_term in [true, false] {
+                    let progress = CombinedProgressState::new_shared();
+                    let progress2 = Some(progress.clone());
+                    thread::spawn(move || {
+                        let mut finished = false;
+                        while !finished {
+                            thread::sleep(Duration::from_millis(500));
+                            let guard = progress.lock().unwrap();
+                            finished = guard.finished();
+                            println!("progress: {}/{}", guard.current(), guard.total());
+                        }
+                    });
+
+                    let parameters = compute_parameters(ComputeParametersInput {
+                        train_set: items.clone(),
+                        progress: progress2,
+                        enable_short_term,
+                        enable_sched_penalties: true,
+                        model_version,
+                        num_relearning_steps: None,
+                    })
+                    .unwrap();
+                    dbg!(&parameters);
+                    match model_version {
+                        ComputeParametersVersion::Fsrs6 => assert_eq!(parameters.len(), 21),
+                        ComputeParametersVersion::Fsrs7 => assert_eq!(parameters.len(), 35),
                     }
-                });
 
-                let parameters = compute_parameters(ComputeParametersInput {
-                    train_set: items.clone(),
-                    progress: progress2,
-                    enable_short_term,
-                    enable_sched_penalties: true,
-                    num_relearning_steps: None,
-                })
-                .unwrap();
-                dbg!(&parameters);
-
-                // evaluate
-                let model = FSRS::new(&parameters).unwrap();
-                let metrics = model.evaluate(items.clone(), |_| true).unwrap();
-                dbg!(&metrics);
+                    // evaluate
+                    let model = FSRS::new(&parameters).unwrap();
+                    let metrics = model.evaluate(items.clone(), |_| true).unwrap();
+                    dbg!(&metrics);
+                }
             }
         }
     }
@@ -1001,8 +1041,12 @@ mod tests {
         }
 
         let init_w = Tensor::from_floats(init_w_vec.as_slice(), &device);
-        let params_stddev = Tensor::from_floats(PARAMS_STDDEV, &device);
-        let penalty = model.l2_regularization(init_w, params_stddev, 512, 1000, L2_PENALTY_WEIGHT);
+        let params_stddev = Tensor::from_floats(training_v7::PARAMS_STDDEV, &device);
+        let penalty = (model.w.val() - init_w)
+            .powi_scalar(2)
+            .div(params_stddev.powi_scalar(2))
+            .sum()
+            .mul_scalar(L2_PENALTY_WEIGHT * 512.0 / 1000.0);
         let expected_value = penalty.clone().into_scalar().to_f64();
         let gradients = penalty.backward();
         let expected_grad = model
@@ -1013,8 +1057,14 @@ mod tests {
             .to_vec::<f32>()
             .unwrap();
 
-        let (actual_value, actual_grad) =
-            l2_penalty_value_and_grad(&w_vec, &init_w_vec, 512, 1000, L2_PENALTY_WEIGHT);
+        let (actual_value, actual_grad) = training_v7::l2_penalty_value_and_grad(
+            &w_vec,
+            &init_w_vec,
+            512,
+            1000,
+            L2_PENALTY_WEIGHT,
+            &training_v7::PARAMS_STDDEV,
+        );
         assert!(
             (actual_value - expected_value).abs() < 1e-6,
             "l2 value mismatch actual={} expected={}",

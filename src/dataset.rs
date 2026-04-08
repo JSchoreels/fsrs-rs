@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// first one.
 /// When used during review, the last item should include the correct delta_t, but
 /// the provided rating is ignored as all four ratings are returned by .next_states()
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub struct FSRSItem {
     pub reviews: Vec<FSRSReview>,
 }
@@ -25,14 +25,14 @@ pub(crate) struct WeightedFSRSItem {
     pub item: FSRSItem,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 pub struct FSRSReview {
     /// 1-4
     pub rating: u32,
-    /// The number of days that passed
+    /// The number of days that passed (can be fractional).
     /// # Warning
     /// `delta_t` for item first(initial) review must be 0
-    pub delta_t: u32,
+    pub delta_t: f32,
 }
 
 impl FSRSItem {
@@ -48,7 +48,7 @@ impl FSRSItem {
     pub fn long_term_review_cnt(&self) -> usize {
         self.reviews
             .iter()
-            .filter(|review| review.delta_t > 0)
+            .filter(|review| review.delta_t >= 1.0)
             .count()
     }
 
@@ -56,8 +56,8 @@ impl FSRSItem {
         *self
             .reviews
             .iter()
-            .find(|review| review.delta_t > 0)
-            .expect("Invalid FSRS item: at least one review with delta_t > 0 is required")
+            .find(|review| review.delta_t >= 1.0)
+            .expect("Invalid FSRS item: at least one review with delta_t >= 1.0 is required")
     }
 
     pub(crate) fn r_matrix_index(&self) -> (u32, u32, u32) {
@@ -67,7 +67,7 @@ impl FSRSItem {
         let length_bin = (1.99 * 1.89f64.powf(length.log(1.89).floor())).round() as u32;
         let lapse = self
             .history()
-            .filter(|review| review.rating == 1 && review.delta_t > 0)
+            .filter(|review| review.rating == 1 && review.delta_t >= 1.0)
             .count();
         if lapse == 0 {
             return (delta_t_bin, length_bin, 0);
@@ -116,7 +116,7 @@ impl<B: Backend> Batcher<B, WeightedFSRSItem, FSRSBatch<B>> for FSRSBatcher<B> {
                     .history()
                     .map(|r| (r.delta_t, r.rating))
                     .unzip();
-                delta_t.resize(pad_size, 0);
+                delta_t.resize(pad_size, 0.0);
                 rating.resize(pad_size, 0);
                 let delta_t = Tensor::<B, 2>::from_floats(
                     TensorData::new(
@@ -144,7 +144,7 @@ impl<B: Backend> Batcher<B, WeightedFSRSItem, FSRSBatch<B>> for FSRSBatcher<B> {
             .iter()
             .map(|weighted_item| {
                 let current = weighted_item.item.current();
-                let delta_t: Tensor<B, 1> = Tensor::from_floats([current.delta_t as f32], device);
+                let delta_t: Tensor<B, 1> = Tensor::from_floats([current.delta_t], device);
                 let label = match current.rating {
                     1 => 0,
                     _ => 1,
@@ -203,13 +203,17 @@ pub fn filter_outlier(
     dataset_for_initialization: Vec<FSRSItem>,
     mut trainset: Vec<FSRSItem>,
 ) -> (Vec<FSRSItem>, Vec<FSRSItem>) {
+    let to_key = |delta_t: f32| delta_t.to_bits();
+    let from_key = |key: u32| f32::from_bits(key);
     let mut groups = HashMap::<u32, HashMap<u32, Vec<FSRSItem>>>::new();
 
     // group by rating of first review and delta_t of second review
     for item in dataset_for_initialization.into_iter() {
         let (first_review, second_review) = (item.reviews.first().unwrap(), item.current());
         let rating_group = groups.entry(first_review.rating).or_default();
-        let delta_t_group = rating_group.entry(second_review.delta_t).or_default();
+        let delta_t_group = rating_group
+            .entry(to_key(second_review.delta_t))
+            .or_default();
         delta_t_group.push(item);
     }
 
@@ -224,7 +228,7 @@ pub fn filter_outlier(
             subv_b
                 .len()
                 .cmp(&subv_a.len())
-                .then(delta_t_b.cmp(delta_t_a))
+                .then(from_key(*delta_t_b).total_cmp(&from_key(*delta_t_a)))
         });
 
         let total = sub_groups.iter().map(|(_, vec)| vec.len()).sum::<usize>();
@@ -236,7 +240,9 @@ pub fn filter_outlier(
                 // keep the sub_group if it includes at least six items
                 // and the delta_t is less than 100 days if rating is not 4
                 // or less than 365 days if rating is 4
-                if sub_group.len() >= 6 && *delta_t <= if rating != 4 { 100 } else { 365 } {
+                if sub_group.len() >= 6
+                    && from_key(*delta_t) <= if rating != 4 { 100.0 } else { 365.0 }
+                {
                     filtered_items.extend_from_slice(sub_group);
                 } else {
                     removed_pairs[rating as usize].insert(*delta_t);
@@ -250,7 +256,7 @@ pub fn filter_outlier(
     // keep the items in trainset if they are not removed from filtered_items
     trainset.retain(|item| {
         !removed_pairs[item.reviews[0].rating as usize]
-            .contains(&item.first_long_term_review().delta_t)
+            .contains(&to_key(item.first_long_term_review().delta_t))
     });
     (filtered_items, trainset)
 }
@@ -317,11 +323,11 @@ mod tests {
                 reviews: vec![
                     FSRSReview {
                         rating: 4,
-                        delta_t: 0
+                        delta_t: 0.0
                     },
                     FSRSReview {
                         rating: 3,
-                        delta_t: 3
+                        delta_t: 3.0
                     }
                 ],
             }
@@ -350,49 +356,73 @@ mod tests {
             FSRSItem {
                 reviews: [(4, 0), (3, 5)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
             FSRSItem {
                 reviews: [(4, 0), (3, 5), (3, 11)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
             FSRSItem {
                 reviews: [(4, 0), (3, 2)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
             FSRSItem {
                 reviews: [(4, 0), (3, 2), (3, 6)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
             FSRSItem {
                 reviews: [(4, 0), (3, 2), (3, 6), (3, 16)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
             FSRSItem {
                 reviews: [(4, 0), (3, 2), (3, 6), (3, 16), (3, 39)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
             FSRSItem {
                 reviews: [(1, 0), (1, 1)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
             FSRSItem {
                 reviews: [(1, 0), (1, 1), (3, 1)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
         ];

@@ -55,6 +55,8 @@ impl<B: Backend> VersionOps<B> for Fsrs6Ops {
         last_s: Tensor<B, 1>,
         last_d: Tensor<B, 1>,
     ) -> MemoryStateTensors<B> {
+        // FSRS-6 stays day-based: keep f32 transport, but round elapsed days to nearest day.
+        let delta_t = round_elapsed_days(delta_t);
         let retrievability = power_forgetting_curve(model, delta_t.clone(), last_s.clone());
         let stability_after_success = stability_after_success(
             model,
@@ -107,6 +109,7 @@ pub(super) fn power_forgetting_curve<B: Backend>(
     t: Tensor<B, 1>,
     s: Tensor<B, 1>,
 ) -> Tensor<B, 1> {
+    let t = round_elapsed_days(t);
     let decay = -model.w.get(20);
     let factor = decay.clone().powi_scalar(-1).mul_scalar(0.9f32.ln()).exp() - 1.0;
     (t / s * factor + 1.0).powf(decay)
@@ -120,6 +123,10 @@ pub(super) fn next_interval<B: Backend>(
     let decay = -model.w.get(20);
     let factor = decay.clone().powi_scalar(-1).mul_scalar(0.9f32.ln()).exp() - 1.0;
     (stability * (desired_retention.powf(decay.clone().powi_scalar(-1)) - 1.0) / factor)
+        .clamp(1.0, super::S_MAX)
+        .add_scalar(0.5)
+        .int()
+        .float()
         .clamp(1.0, super::S_MAX)
 }
 
@@ -213,7 +220,8 @@ pub(crate) fn power_forgetting_curve_scalar(w: &[f32], t: f32, s: f32) -> f32 {
     let s = s.max(super::S_MIN);
     let decay = -w[20];
     let factor = 0.9f32.powf(1.0 / decay) - 1.0;
-    (t.max(0.0) / s).mul_add(factor, 1.0).powf(decay)
+    let t = t.max(0.0).round();
+    (t / s).mul_add(factor, 1.0).powf(decay)
 }
 
 pub(crate) fn next_interval_scalar(w: &[f32], stability: f32, desired_retention: f32) -> f32 {
@@ -221,7 +229,13 @@ pub(crate) fn next_interval_scalar(w: &[f32], stability: f32, desired_retention:
     let desired_retention = desired_retention.clamp(0.0001, 0.9999);
     let decay = -w[20];
     let factor = 0.9f32.powf(1.0 / decay) - 1.0;
-    (stability / factor * (desired_retention.powf(1.0 / decay) - 1.0)).clamp(1.0, super::S_MAX)
+    (stability / factor * (desired_retention.powf(1.0 / decay) - 1.0))
+        .clamp(1.0, super::S_MAX)
+        .round()
+}
+
+fn round_elapsed_days<B: Backend>(t: Tensor<B, 1>) -> Tensor<B, 1> {
+    t.clamp_min(0.0).add_scalar(0.5).int().float()
 }
 
 pub(crate) fn stability_after_success_scalar(
@@ -295,6 +309,25 @@ mod tests {
             &TensorData::from([1.0, 0.9403443, 0.9253786, 0.9185229, 0.9, 0.8261359]),
             Tolerance::absolute(1e-5),
         );
+    }
+
+    #[test]
+    fn test_power_forgetting_curve_scalar_rounds_elapsed_days() {
+        let w = FSRS6_DEFAULT_PARAMETERS;
+        let s = 10.0;
+        let at_zero = super::power_forgetting_curve_scalar(&w, 0.0, s);
+        let at_half_minus = super::power_forgetting_curve_scalar(&w, 0.49, s);
+        let at_one = super::power_forgetting_curve_scalar(&w, 1.0, s);
+        let at_half_plus = super::power_forgetting_curve_scalar(&w, 0.51, s);
+        assert!((at_zero - at_half_minus).abs() < 1e-6);
+        assert!((at_one - at_half_plus).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_next_interval_scalar_returns_day_rounded_interval() {
+        let w = FSRS6_DEFAULT_PARAMETERS;
+        let interval = super::next_interval_scalar(&w, 121.01552, 0.9);
+        assert_eq!(interval, 121.0);
     }
 
     #[test]

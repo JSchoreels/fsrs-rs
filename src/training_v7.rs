@@ -22,6 +22,45 @@ pub(crate) const ONE_DAY: f32 = 1.0;
 pub(crate) const SHORT_C: f32 = 600.0 / 86400.0;
 pub(crate) const INV_C: f32 = 1.0 / SHORT_C;
 pub(crate) const GRAD_LEN: usize = 35;
+pub(crate) const PARAMS_STDDEV: [f32; 35] = [
+    9999.0, 9999.0, 9999.0, 9999.0, 0.523, 0.2528, 0.4329, 0.2966, 0.2139, 0.2889, 0.1862, 0.0829,
+    0.175, 0.3812, 0.3013, 0.9104, 0.3234, 0.2448, 0.3273, 0.1842, 0.1542, 0.1735, 0.4608, 0.311,
+    0.864, 0.4053, 0.162, 0.0418, 0.2596, 0.0798, 0.0682, 0.1282, 0.1397, 0.1407, 0.1489,
+];
+
+pub(crate) fn l2_penalty_value_and_grad(
+    w: &[f32],
+    init_w: &[f32],
+    batch_size: usize,
+    total_size: usize,
+    l2_weight: f64,
+    params_stddev: &[f32],
+) -> (f64, Vec<f32>) {
+    let mut grad = vec![0.0f32; w.len()];
+    if total_size == 0 {
+        return (0.0, grad);
+    }
+    let size = w.len().min(init_w.len()).min(params_stddev.len());
+    let scale = l2_weight * batch_size as f64 / total_size as f64;
+    let mut penalty_sum = 0.0f64;
+    for i in 0..size {
+        let sigma = params_stddev[i] as f64;
+        let denom = sigma * sigma;
+        let diff = w[i] as f64 - init_w[i] as f64;
+        penalty_sum += diff * diff / denom;
+        grad[i] = (2.0 * diff / denom * scale) as f32;
+    }
+    let penalty = penalty_sum * scale;
+    if !penalty.is_finite() {
+        return (0.0, vec![0.0; w.len()]);
+    }
+    for g in &mut grad {
+        if !g.is_finite() {
+            *g = 0.0;
+        }
+    }
+    (penalty, grad)
+}
 
 // Keep Dual35 local to FSRS-7 training: the penalty objective and its gradients
 // are expressed against FSRS-7's fixed 35-parameter layout and index mapping.
@@ -951,14 +990,12 @@ mod tests {
             Reduction::Sum,
         );
         let init_w_tensor = Tensor::from_floats(init_w_vec.as_slice(), &device);
-        let params_stddev = Tensor::from_floats(super::super::PARAMS_STDDEV, &device);
-        let l2_ref = model.l2_regularization(
-            init_w_tensor,
-            params_stddev,
-            batch_size,
-            total_size,
-            PENALTY_W_L2,
-        );
+        let params_stddev = Tensor::from_floats(PARAMS_STDDEV, &device);
+        let l2_ref = (model.w.val() - init_w_tensor)
+            .powi_scalar(2)
+            .div(params_stddev.powi_scalar(2))
+            .sum()
+            .mul_scalar(PENALTY_W_L2 * batch_size as f64 / total_size as f64);
         let schedule_ref = model
             .fsrs7_schedule_penalty(batch_size)
             .div_scalar(total_size as f64);
@@ -982,12 +1019,13 @@ mod tests {
         );
         let mut grad_new = loss_new.backward();
         let mut manual_grad = vec![0.0f32; w_vec.len()];
-        let (_l2_value, l2_grad) = super::super::l2_penalty_value_and_grad(
+        let (_l2_value, l2_grad) = l2_penalty_value_and_grad(
             &w_vec,
             &init_w_vec,
             batch_size,
             total_size,
             PENALTY_W_L2,
+            &PARAMS_STDDEV,
         );
         for (g, l2) in manual_grad.iter_mut().zip(l2_grad.iter()) {
             *g += *l2;

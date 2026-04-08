@@ -1,19 +1,17 @@
-use crate::DEFAULT_PARAMETERS;
+use crate::FSRS6_DEFAULT_PARAMETERS;
 #[cfg(test)]
 use crate::FSRSItem;
 use crate::error::{FSRSError, Result};
-#[cfg(test)]
-use crate::parameter_initialization_fsrs7::initialize_parameters_fsrs7;
 use crate::simulation::S_MIN;
 #[cfg(test)]
 use ndarray::Array1;
 use std::collections::HashMap;
 
 static R_S0_DEFAULT_ARRAY: &[(u32, f32); 4] = &[
-    (1, DEFAULT_PARAMETERS[0]),
-    (2, DEFAULT_PARAMETERS[1]),
-    (3, DEFAULT_PARAMETERS[2]),
-    (4, DEFAULT_PARAMETERS[3]),
+    (1, FSRS6_DEFAULT_PARAMETERS[0]),
+    (2, FSRS6_DEFAULT_PARAMETERS[1]),
+    (3, FSRS6_DEFAULT_PARAMETERS[2]),
+    (4, FSRS6_DEFAULT_PARAMETERS[3]),
 ];
 
 #[cfg(test)]
@@ -21,17 +19,75 @@ pub(crate) fn initialize_stability_parameters(
     fsrs_items: Vec<FSRSItem>,
     average_recall: f32,
 ) -> Result<([f32; 4], HashMap<u32, u32>)> {
-    let (initial_stability, _forgetting_curve, rating_count) =
-        initialize_parameters_fsrs7(fsrs_items, average_recall)?;
-    Ok((initial_stability, rating_count))
+    let dataset_for_initialization = prepare_dataset_for_initialization(fsrs_items);
+    let rating_count = total_rating_count(&dataset_for_initialization);
+    let mut rating_stability = search_parameters(dataset_for_initialization, average_recall);
+    Ok((
+        smooth_and_fill(&mut rating_stability, &rating_count)?,
+        rating_count,
+    ))
 }
 
 #[cfg(test)]
 type FirstRating = u32;
+#[cfg(test)]
+type Count = u32;
+
+#[cfg(test)]
+fn prepare_dataset_for_initialization(
+    fsrs_items: Vec<FSRSItem>,
+) -> HashMap<FirstRating, Vec<AverageRecall>> {
+    let to_key = |delta_t: f32| delta_t.to_bits();
+    let from_key = |key: u32| f32::from_bits(key);
+    // filter FSRSItem instances with exactly 1 long term review.
+    let items: Vec<_> = fsrs_items
+        .into_iter()
+        .filter(|item| item.long_term_review_cnt() == 1)
+        .collect();
+
+    // use a nested HashMap (groups) to group items first by the rating in the first FSRSReview
+    // and then by the delta_t in the second FSRSReview.
+    // (first_rating -> first_long_term_delta_t -> vec![0/1 for fail/pass])
+    let mut groups = HashMap::new();
+
+    for item in items {
+        let first_rating = item.reviews[0].rating;
+        let first_long_term_review = item.first_long_term_review();
+        let first_long_term_delta_t = to_key(first_long_term_review.delta_t);
+        let first_long_term_label = (first_long_term_review.rating > 1) as i32;
+
+        let inner_map = groups.entry(first_rating).or_insert_with(HashMap::new);
+        let ratings = inner_map
+            .entry(first_long_term_delta_t)
+            .or_insert_with(Vec::new);
+        ratings.push(first_long_term_label);
+    }
+
+    let mut results = HashMap::new();
+
+    for (first_rating, inner_map) in &groups {
+        let mut data = vec![];
+
+        // calculate the average (recall) and count for each group.
+        for (second_delta_t, ratings) in inner_map {
+            let avg = ratings.iter().map(|&x| x as f64).sum::<f64>() / ratings.len() as f64;
+            data.push(AverageRecall {
+                delta_t: from_key(*second_delta_t) as f64,
+                recall: avg,
+                count: ratings.len() as f64,
+            })
+        }
+
+        // Sort by delta_t in ascending order
+        data.sort_unstable_by(|a, b| a.delta_t.total_cmp(&b.delta_t));
+
+        results.insert(*first_rating, data);
+    }
+    results
+}
 
 /// The average pass rate & count for a single delta_t for a given first rating.
 #[cfg(test)]
-#[derive(Clone)]
 struct AverageRecall {
     delta_t: f64,
     recall: f64,
@@ -39,8 +95,21 @@ struct AverageRecall {
 }
 
 #[cfg(test)]
+fn total_rating_count(
+    dataset_for_initialization: &HashMap<FirstRating, Vec<AverageRecall>>,
+) -> HashMap<FirstRating, Count> {
+    dataset_for_initialization
+        .iter()
+        .map(|(first_rating, data)| {
+            let count = data.iter().map(|d| d.count).sum::<f64>() as u32;
+            (*first_rating, count)
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn power_forgetting_curve(t: &Array1<f64>, s: f64) -> Array1<f64> {
-    let decay = -DEFAULT_PARAMETERS[20] as f64;
+    let decay = -FSRS6_DEFAULT_PARAMETERS[20] as f64;
     let factor = 0.9f64.powf(1.0 / decay) - 1.0;
     (t / s * factor + 1.0).mapv(|v| v.powf(decay))
 }
@@ -248,7 +317,7 @@ mod tests {
             0.86666667, 0.90721649, 0.73015873, 0.76315789, 0.67857143,
         ]);
         let count = Array1::from(vec![435.0, 97.0, 63.0, 38.0, 28.0]);
-        let default_s0 = DEFAULT_PARAMETERS[0] as f64;
+        let default_s0 = FSRS6_DEFAULT_PARAMETERS[0] as f64;
         let actual = loss(&delta_t, &recall, &count, 0.7840586, default_s0);
         assert_eq!(actual, 279.9206961069712);
         let actual = loss(&delta_t, &recall, &count, 0.7840590622451964, default_s0);

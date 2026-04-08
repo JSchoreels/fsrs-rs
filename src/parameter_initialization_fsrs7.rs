@@ -81,6 +81,8 @@ fn default_forgetting_curve_params() -> [f32; 8] {
 fn prepare_dataset_for_initialization(
     fsrs_items: Vec<FSRSItem>,
 ) -> HashMap<FirstRating, Vec<AverageRecall>> {
+    let to_key = |delta_t: f32| delta_t.to_bits();
+    let from_key = |key: u32| f32::from_bits(key);
     let items: Vec<_> = fsrs_items
         .into_iter()
         .filter(|item| item.long_term_review_cnt() == 1)
@@ -91,7 +93,7 @@ fn prepare_dataset_for_initialization(
     for item in items {
         let first_rating = item.reviews[0].rating;
         let first_long_term_review = item.first_long_term_review();
-        let first_long_term_delta_t = first_long_term_review.delta_t;
+        let first_long_term_delta_t = to_key(first_long_term_review.delta_t);
         let first_long_term_label = (first_long_term_review.rating > 1) as i32;
 
         let inner_map = groups.entry(first_rating).or_insert_with(HashMap::new);
@@ -106,7 +108,7 @@ fn prepare_dataset_for_initialization(
         let mut data = vec![];
         for (second_delta_t, ratings) in inner_map {
             let avg = ratings.iter().map(|&x| x as f64).sum::<f64>() / ratings.len() as f64;
-            data.push((*second_delta_t as f64, avg, ratings.len() as f64));
+            data.push((from_key(*second_delta_t) as f64, avg, ratings.len() as f64));
         }
         data.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         results.insert(*first_rating, data);

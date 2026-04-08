@@ -99,7 +99,49 @@ pub(super) trait VersionOps<B: Backend> {
 pub(super) struct Fsrs6Ops;
 pub(super) struct Fsrs7Ops;
 
+type ApplyFreezeShortTermFn = fn(&mut [f32]);
+type PowerForgettingCurveFn<B> = fn(&Model<B>, Tensor<B, 1>, Tensor<B, 1>) -> Tensor<B, 1>;
+type NextIntervalFn<B> = fn(&Model<B>, Tensor<B, 1>, Tensor<B, 1>) -> Tensor<B, 1>;
+type UpdateStateFn<B> =
+    fn(&Model<B>, Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>) -> MemoryStateTensors<B>;
+type MemoryStateFromSm2Fn<B> = fn(&Model<B>, f32, f32, f32) -> Result<MemoryState>;
+type IntervalAtRetrievabilityFn<B> = fn(&Model<B>, f32, f32) -> f32;
+
+#[derive(Clone, Copy)]
+struct VersionFns<B: Backend> {
+    apply_freeze_short_term: ApplyFreezeShortTermFn,
+    power_forgetting_curve: PowerForgettingCurveFn<B>,
+    next_interval: NextIntervalFn<B>,
+    update_state: UpdateStateFn<B>,
+    memory_state_from_sm2: MemoryStateFromSm2Fn<B>,
+    interval_at_retrievability: IntervalAtRetrievabilityFn<B>,
+}
+
+impl<B: Backend> VersionFns<B> {
+    fn from_version(version: ModelVersion) -> Self {
+        match version {
+            ModelVersion::Fsrs6 => Self {
+                apply_freeze_short_term: <Fsrs6Ops as VersionOps<B>>::apply_freeze_short_term,
+                power_forgetting_curve: <Fsrs6Ops as VersionOps<B>>::power_forgetting_curve,
+                next_interval: <Fsrs6Ops as VersionOps<B>>::next_interval,
+                update_state: <Fsrs6Ops as VersionOps<B>>::update_state,
+                memory_state_from_sm2: <Fsrs6Ops as VersionOps<B>>::memory_state_from_sm2_fsrs,
+                interval_at_retrievability: <Fsrs6Ops as VersionOps<B>>::interval_at_retrievability,
+            },
+            ModelVersion::Fsrs7 => Self {
+                apply_freeze_short_term: <Fsrs7Ops as VersionOps<B>>::apply_freeze_short_term,
+                power_forgetting_curve: <Fsrs7Ops as VersionOps<B>>::power_forgetting_curve,
+                next_interval: <Fsrs7Ops as VersionOps<B>>::next_interval,
+                update_state: <Fsrs7Ops as VersionOps<B>>::update_state,
+                memory_state_from_sm2: <Fsrs7Ops as VersionOps<B>>::memory_state_from_sm2_fsrs,
+                interval_at_retrievability: <Fsrs7Ops as VersionOps<B>>::interval_at_retrievability,
+            },
+        }
+    }
+}
+
 impl<B: Backend> Model<B> {
+    #[cfg(test)]
     pub fn new(config: ModelConfig) -> Self {
         Self::new_with_device(config, &B::Device::default())
     }
@@ -114,14 +156,8 @@ impl<B: Backend> Model<B> {
             initial_params[27..35].copy_from_slice(&initial_forgetting_curve);
         }
         if config.freeze_short_term_stability {
-            match version {
-                ModelVersion::Fsrs7 => {
-                    <Fsrs7Ops as VersionOps<B>>::apply_freeze_short_term(&mut initial_params)
-                }
-                ModelVersion::Fsrs6 => {
-                    <Fsrs6Ops as VersionOps<B>>::apply_freeze_short_term(&mut initial_params)
-                }
-            }
+            let ops = VersionFns::<B>::from_version(version);
+            (ops.apply_freeze_short_term)(&mut initial_params);
         }
 
         Self {
@@ -148,21 +184,13 @@ impl<B: Backend> Model<B> {
         interval: f32,
         sm2_retention: f32,
     ) -> Result<MemoryState> {
-        match self.version() {
-            ModelVersion::Fsrs6 => {
-                Fsrs6Ops::memory_state_from_sm2_fsrs(self, ease_factor, interval, sm2_retention)
-            }
-            ModelVersion::Fsrs7 => {
-                Fsrs7Ops::memory_state_from_sm2_fsrs(self, ease_factor, interval, sm2_retention)
-            }
-        }
+        let ops = VersionFns::<B>::from_version(self.version());
+        (ops.memory_state_from_sm2)(self, ease_factor, interval, sm2_retention)
     }
 
     pub fn power_forgetting_curve(&self, t: Tensor<B, 1>, s: Tensor<B, 1>) -> Tensor<B, 1> {
-        match self.version() {
-            ModelVersion::Fsrs6 => Fsrs6Ops::power_forgetting_curve(self, t, s),
-            ModelVersion::Fsrs7 => Fsrs7Ops::power_forgetting_curve(self, t, s),
-        }
+        let ops = VersionFns::<B>::from_version(self.version());
+        (ops.power_forgetting_curve)(self, t, s)
     }
 
     pub fn next_interval(
@@ -170,10 +198,8 @@ impl<B: Backend> Model<B> {
         stability: Tensor<B, 1>,
         desired_retention: Tensor<B, 1>,
     ) -> Tensor<B, 1> {
-        match self.version() {
-            ModelVersion::Fsrs6 => Fsrs6Ops::next_interval(self, stability, desired_retention),
-            ModelVersion::Fsrs7 => Fsrs7Ops::next_interval(self, stability, desired_retention),
-        }
+        let ops = VersionFns::<B>::from_version(self.version());
+        (ops.next_interval)(self, stability, desired_retention)
     }
 
     pub(crate) fn interval_at_retrievability(
@@ -181,14 +207,8 @@ impl<B: Backend> Model<B> {
         stability: f32,
         target_retrievability: f32,
     ) -> f32 {
-        match self.version() {
-            ModelVersion::Fsrs6 => {
-                Fsrs6Ops::interval_at_retrievability(self, stability, target_retrievability)
-            }
-            ModelVersion::Fsrs7 => {
-                Fsrs7Ops::interval_at_retrievability(self, stability, target_retrievability)
-            }
-        }
+        let ops = VersionFns::<B>::from_version(self.version());
+        (ops.interval_at_retrievability)(self, stability, target_retrievability)
     }
 
     pub(crate) fn init_stability(&self, rating: Tensor<B, 1>) -> Tensor<B, 1> {
@@ -215,24 +235,27 @@ impl<B: Backend> Model<B> {
         state: MemoryStateTensors<B>,
         nth: usize,
     ) -> MemoryStateTensors<B> {
+        let ops = VersionFns::<B>::from_version(self.version());
+        self.step_with_ops(&ops, delta_t, rating, state, nth)
+    }
+
+    fn step_with_ops(
+        &self,
+        ops: &VersionFns<B>,
+        delta_t: Tensor<B, 1>,
+        rating: Tensor<B, 1>,
+        state: MemoryStateTensors<B>,
+        nth: usize,
+    ) -> MemoryStateTensors<B> {
         let last_s = state.stability.clone().clamp(S_MIN, S_MAX);
         let last_d = state.difficulty.clone().clamp(D_MIN, D_MAX);
-        let mut new_state = match self.version() {
-            ModelVersion::Fsrs6 => Fsrs6Ops::update_state(
-                self,
-                delta_t.clone(),
-                rating.clone(),
-                last_s.clone(),
-                last_d.clone(),
-            ),
-            ModelVersion::Fsrs7 => Fsrs7Ops::update_state(
-                self,
-                delta_t.clone(),
-                rating.clone(),
-                last_s.clone(),
-                last_d.clone(),
-            ),
-        };
+        let mut new_state = (ops.update_state)(
+            self,
+            delta_t.clone(),
+            rating.clone(),
+            last_s.clone(),
+            last_d.clone(),
+        );
 
         if nth == 0 {
             let is_initial = state.stability.clone().equal_elem(0.0);
@@ -270,10 +293,11 @@ impl<B: Backend> Model<B> {
         } else {
             MemoryStateTensors::zeros(batch_size)
         };
+        let ops = VersionFns::<B>::from_version(self.version());
         for i in 0..seq_len {
             let delta_t = delta_ts.get(i).squeeze(0);
             let rating = ratings.get(i).squeeze(0);
-            state = self.step(delta_t, rating, state, i);
+            state = self.step_with_ops(&ops, delta_t, rating, state, i);
         }
         state
     }
@@ -316,6 +340,7 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    #[cfg(test)]
     pub fn init<B: Backend>(&self) -> Model<B> {
         Model::new(self.clone())
     }
