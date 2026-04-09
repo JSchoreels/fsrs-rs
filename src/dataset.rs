@@ -35,6 +35,21 @@ pub struct FSRSReview {
     pub delta_t: f32,
 }
 
+const LONG_TERM_DELTA_T_BUCKET_DAYS: f32 = 1.0;
+
+/// Bucket long-term elapsed days for preprocessing/grouping steps.
+///
+/// Training/inference still uses the original (possibly fractional) `delta_t`.
+/// This bucketing is only to keep initialization/outlier groups stable when
+/// interday fractional deltas are enabled.
+pub(crate) fn bucket_long_term_delta_t(delta_t: f32) -> f32 {
+    if !delta_t.is_finite() {
+        return 1.0;
+    }
+    let clamped = delta_t.max(1.0);
+    (clamped / LONG_TERM_DELTA_T_BUCKET_DAYS).floor() * LONG_TERM_DELTA_T_BUCKET_DAYS
+}
+
 impl FSRSItem {
     // The previous reviews done before the current one.
     pub(crate) fn history(&self) -> impl Iterator<Item = &FSRSReview> {
@@ -203,16 +218,18 @@ pub fn filter_outlier(
     dataset_for_initialization: Vec<FSRSItem>,
     mut trainset: Vec<FSRSItem>,
 ) -> (Vec<FSRSItem>, Vec<FSRSItem>) {
-    let to_key = |delta_t: f32| delta_t.to_bits();
+    let to_key = |delta_t: f32| bucket_long_term_delta_t(delta_t).to_bits();
     let from_key = |key: u32| f32::from_bits(key);
     let mut groups = HashMap::<u32, HashMap<u32, Vec<FSRSItem>>>::new();
 
-    // group by rating of first review and delta_t of second review
+    // Group by first rating and first long-term review delta_t.
+    // (For FSRS-7, current review can be same-day and should not define the group.)
     for item in dataset_for_initialization.into_iter() {
-        let (first_review, second_review) = (item.reviews.first().unwrap(), item.current());
+        let first_review = item.reviews.first().unwrap();
+        let first_long_term_review = item.first_long_term_review();
         let rating_group = groups.entry(first_review.rating).or_default();
         let delta_t_group = rating_group
-            .entry(to_key(second_review.delta_t))
+            .entry(to_key(first_long_term_review.delta_t))
             .or_default();
         delta_t_group.push(item);
     }
@@ -508,5 +525,25 @@ mod tests {
         let trainset = vec![same_day_only.clone()];
         let (_filtered, trainset) = filter_outlier(dataset_for_initialization, trainset);
         assert_eq!(trainset, vec![same_day_only]);
+    }
+
+    #[test]
+    fn test_filter_outlier_buckets_fractional_long_term_deltas() {
+        let make_item = |delta_t: f32| FSRSItem {
+            reviews: vec![
+                FSRSReview {
+                    rating: 3,
+                    delta_t: 0.0,
+                },
+                FSRSReview { rating: 3, delta_t },
+            ],
+        };
+        let mut dataset_for_initialization = vec![];
+        dataset_for_initialization.extend((0..12).map(|_| make_item(1.2)));
+        dataset_for_initialization.extend((0..12).map(|_| make_item(1.8)));
+        let trainset = dataset_for_initialization.clone();
+        let (filtered, trainset) = filter_outlier(dataset_for_initialization, trainset);
+        assert_eq!(filtered.len(), 24);
+        assert_eq!(trainset.len(), 24);
     }
 }

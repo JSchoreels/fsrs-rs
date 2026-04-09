@@ -1,5 +1,6 @@
 use crate::DEFAULT_PARAMETERS;
 use crate::FSRSItem;
+use crate::dataset::bucket_long_term_delta_t;
 use crate::error::{FSRSError, Result};
 use crate::simulation::S_MIN;
 use ndarray::Array1;
@@ -81,7 +82,7 @@ fn default_forgetting_curve_params() -> [f32; 8] {
 fn prepare_dataset_for_initialization(
     fsrs_items: Vec<FSRSItem>,
 ) -> HashMap<FirstRating, Vec<AverageRecall>> {
-    let to_key = |delta_t: f32| delta_t.to_bits();
+    let to_key = |delta_t: f32| bucket_long_term_delta_t(delta_t).to_bits();
     let from_key = |key: u32| f32::from_bits(key);
     let items: Vec<_> = fsrs_items
         .into_iter()

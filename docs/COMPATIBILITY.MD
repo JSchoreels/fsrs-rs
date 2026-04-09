@@ -28,3 +28,6 @@
   finite bounds before clamping.
 - Outlier filtering no longer assumes every training item has a long-term
   review (`delta_t >= 1.0`), so same-day-only items no longer panic.
+- Long-term `delta_t` grouping used by outlier filtering/initialization is
+  bucketed by day (floor), which avoids sparse fragmented groups when
+  training data contains fractional interday elapsed times.
