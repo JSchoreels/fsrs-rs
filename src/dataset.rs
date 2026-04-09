@@ -255,8 +255,12 @@ pub fn filter_outlier(
     }
     // keep the items in trainset if they are not removed from filtered_items
     trainset.retain(|item| {
-        !removed_pairs[item.reviews[0].rating as usize]
-            .contains(&to_key(item.first_long_term_review().delta_t))
+        if item.long_term_review_cnt() == 0 {
+            true
+        } else {
+            !removed_pairs[item.reviews[0].rating as usize]
+                .contains(&to_key(item.first_long_term_review().delta_t))
+        }
     });
     (filtered_items, trainset)
 }
@@ -473,5 +477,36 @@ mod tests {
             filter_outlier(dataset_for_initialization, trainset);
         assert_eq!(dataset_for_initialization.len(), 3265);
         assert_eq!(trainset.len(), 10900);
+    }
+
+    #[test]
+    fn test_filter_outlier_keeps_same_day_only_items_without_panic() {
+        let dataset_for_initialization = vec![FSRSItem {
+            reviews: vec![
+                FSRSReview {
+                    rating: 3,
+                    delta_t: 0.0,
+                },
+                FSRSReview {
+                    rating: 3,
+                    delta_t: 2.0,
+                },
+            ],
+        }];
+        let same_day_only = FSRSItem {
+            reviews: vec![
+                FSRSReview {
+                    rating: 2,
+                    delta_t: 0.0,
+                },
+                FSRSReview {
+                    rating: 3,
+                    delta_t: 0.5,
+                },
+            ],
+        };
+        let trainset = vec![same_day_only.clone()];
+        let (_filtered, trainset) = filter_outlier(dataset_for_initialization, trainset);
+        assert_eq!(trainset, vec![same_day_only]);
     }
 }

@@ -122,4 +122,20 @@ mod tests {
         assert!(clipped_on[26] > 0.0);
         assert_eq!(clipped_off[26], 0.0);
     }
+
+    #[test]
+    fn test_fsrs7_clipper_handles_nan_without_panic() {
+        let mut params = DEFAULT_PARAMETERS.to_vec();
+        for idx in [0, 1, 2, 3, 27, 28, 29, 30] {
+            params[idx] = f32::NAN;
+        }
+        let clipped = clip_parameters(&params, 1, true);
+        assert_eq!(clipped.len(), 35);
+        assert!(clipped.iter().all(|v| v.is_finite()));
+        assert!(clipped[1] >= clipped[0]);
+        assert!(clipped[2] >= clipped[1]);
+        assert!(clipped[3] >= clipped[2]);
+        assert!(clipped[28] >= clipped[27]);
+        assert!(clipped[30] >= clipped[29]);
+    }
 }

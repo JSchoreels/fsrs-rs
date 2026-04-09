@@ -21,3 +21,10 @@
   for recall updates, while still using `f32` transport.
 - FSRS-6 and FSRS-7 both return fractional intervals from scheduling APIs.
 - FSRS-7 keeps full fractional behavior for elapsed days and output intervals.
+
+## Training Robustness
+
+- FSRS-7 parameter clipping is NaN-safe: non-finite values are converted to
+  finite bounds before clamping.
+- Outlier filtering no longer assumes every training item has a long-term
+  review (`delta_t >= 1.0`), so same-day-only items no longer panic.

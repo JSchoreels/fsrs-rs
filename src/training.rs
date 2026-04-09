@@ -745,6 +745,48 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_parameters_fsrs7_with_same_day_only_items_no_panic() {
+        let train_set = vec![
+            FSRSItem {
+                reviews: vec![
+                    crate::FSRSReview {
+                        rating: 2,
+                        delta_t: 0.0,
+                    },
+                    crate::FSRSReview {
+                        rating: 3,
+                        delta_t: 0.5,
+                    },
+                ],
+            },
+            FSRSItem {
+                reviews: vec![
+                    crate::FSRSReview {
+                        rating: 1,
+                        delta_t: 0.0,
+                    },
+                    crate::FSRSReview {
+                        rating: 2,
+                        delta_t: 0.25,
+                    },
+                ],
+            },
+        ];
+
+        let parameters = compute_parameters(ComputeParametersInput {
+            train_set,
+            progress: None,
+            enable_short_term: true,
+            enable_sched_penalties: true,
+            model_version: ComputeParametersVersion::Fsrs7,
+            num_relearning_steps: None,
+        });
+
+        assert!(parameters.is_ok());
+        assert_eq!(parameters.unwrap().len(), 35);
+    }
+
+    #[test]
     fn test_loss_and_grad() {
         use burn::backend::ndarray::NdArrayDevice;
         use burn::tensor::TensorData;
