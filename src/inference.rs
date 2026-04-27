@@ -1469,6 +1469,95 @@ mod tests {
     }
 
     #[test]
+    fn test_fsrs7_low_retention_lapse_has_minute_again_but_good_graduates() -> Result<()> {
+        let params = [
+            0.0113, 0.7801, 2.2056, 17.8287, 5.7900, 0.4527, 3.1686, 2.1464, 0.2876, 1.2004,
+            0.4385, 0.0057, 0.8110, 0.2112, 0.5439, 1.7069, 0.9438, 0.3588, 3.6203, 0.3262, 0.0060,
+            0.2524, 2.6739, 0.5529, 1.3967, 2.5000, 0.9966, 0.0630, 0.2528, 0.6248, 0.9734, 0.1204,
+            0.6260, 0.1575, 0.4048,
+        ];
+        let fsrs = FSRS::new(&params)?;
+        let desired_retention = 0.65;
+        let minutes_as_days = |minutes: f32| minutes / 24.0 / 60.0;
+        let reviews = vec![
+            FSRSReview {
+                rating: 1,
+                delta_t: 0.0,
+            },
+            FSRSReview {
+                rating: 1,
+                delta_t: minutes_as_days(23.0 * 60.0 + 57.0),
+            },
+            FSRSReview {
+                rating: 1,
+                delta_t: minutes_as_days(19.0 * 60.0 + 46.0),
+            },
+            FSRSReview {
+                rating: 1,
+                delta_t: minutes_as_days(24.0 * 60.0 + 56.0),
+            },
+            FSRSReview {
+                rating: 3,
+                delta_t: minutes_as_days(2.0),
+            },
+            FSRSReview {
+                rating: 3,
+                delta_t: minutes_as_days(3.0),
+            },
+            FSRSReview {
+                rating: 3,
+                delta_t: minutes_as_days(3.0),
+            },
+            FSRSReview {
+                rating: 3,
+                delta_t: minutes_as_days(4.0),
+            },
+        ];
+        let history = FSRSItem {
+            reviews: reviews.clone(),
+        };
+
+        let mut state = None;
+        let mut selected_intervals_minutes = Vec::with_capacity(reviews.len());
+        for review in reviews {
+            let states =
+                fsrs.next_states_with_elapsed_days(state, desired_retention, review.delta_t)?;
+            let selected = match review.rating {
+                1 => states.again,
+                2 => states.hard,
+                3 => states.good,
+                4 => states.easy,
+                _ => unreachable!(),
+            };
+            selected_intervals_minutes.push(selected.interval * 24.0 * 60.0);
+            state = Some(selected.memory);
+        }
+
+        assert!(
+            (selected_intervals_minutes[3] - 1.75).abs() < 0.02,
+            "expected the fourth Again interval to match the reported minute-scale lapse interval, got {}",
+            selected_intervals_minutes[3]
+        );
+        assert!(
+            selected_intervals_minutes[4] > 300.0,
+            "core FSRS should move the first same-day Good out of the 1.75-minute lapse interval, got {}",
+            selected_intervals_minutes[4]
+        );
+
+        let state = fsrs.memory_state(history, None)?;
+        let next_good = fsrs
+            .next_states_with_elapsed_days(Some(state), desired_retention, minutes_as_days(1.75))?
+            .good;
+        let next_good_minutes = next_good.interval * 24.0 * 60.0;
+
+        assert!(
+            next_good_minutes > 24.0 * 60.0,
+            "core FSRS should not keep the next Good interval at 1.75 minutes, got {next_good_minutes}"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "just for exploration"]
     fn test_short_term_stability() -> Result<()> {
         let fsrs = FSRS::default();

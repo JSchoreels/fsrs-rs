@@ -22,6 +22,16 @@
 - FSRS-6 and FSRS-7 both return fractional intervals from scheduling APIs.
 - FSRS-7 keeps full fractional behavior for elapsed days and output intervals.
 
+## Anki Learning And Relearning Steps
+
+- `FSRS::next_states*()` returns model intervals. Anki may still show
+  learning or relearning step delays while a card is in the learning queue.
+- For low desired retention and very low post-lapse stability, FSRS-7 can
+  calculate a minute-scale `Again` interval. Once a same-day `Good` is applied
+  to that state, core FSRS can produce an interval of hours or days; repeated
+  minute-scale `Good` delays are therefore a scheduler step behavior rather
+  than the model interval solver repeating the same result.
+
 ## Training Robustness
 
 - FSRS-7 parameter clipping is NaN-safe: non-finite values are converted to
