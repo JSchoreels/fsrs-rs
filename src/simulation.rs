@@ -38,7 +38,7 @@ impl Round for f32 {
     }
 }
 
-pub(crate) const S_MIN: f32 = 0.001;
+pub(crate) const S_MIN: f32 = 0.0001;
 pub(crate) const S_MAX: f32 = 36500.0;
 pub(crate) const D_MIN: f32 = 1.0;
 pub(crate) const D_MAX: f32 = 10.0;

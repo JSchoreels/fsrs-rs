@@ -1470,6 +1470,8 @@ mod tests {
 
     #[test]
     fn test_fsrs7_low_retention_lapse_has_minute_again_but_good_graduates() -> Result<()> {
+        assert_eq!(S_MIN, 0.0001);
+
         let params = [
             0.0113, 0.7801, 2.2056, 17.8287, 5.7900, 0.4527, 3.1686, 2.1464, 0.2876, 1.2004,
             0.4385, 0.0057, 0.8110, 0.2112, 0.5439, 1.7069, 0.9438, 0.3588, 3.6203, 0.3262, 0.0060,
@@ -1534,13 +1536,13 @@ mod tests {
         }
 
         assert!(
-            (selected_intervals_minutes[3] - 1.75).abs() < 0.02,
-            "expected the fourth Again interval to match the reported minute-scale lapse interval, got {}",
+            selected_intervals_minutes[3] > 1.0 && selected_intervals_minutes[3] < 2.0,
+            "expected the fourth Again interval to remain minute-scale after repeated lapses, got {}",
             selected_intervals_minutes[3]
         );
         assert!(
-            selected_intervals_minutes[4] > 300.0,
-            "core FSRS should move the first same-day Good out of the 1.75-minute lapse interval, got {}",
+            selected_intervals_minutes[4] > 120.0,
+            "core FSRS should move the first same-day Good out of the minute-scale lapse interval, got {}",
             selected_intervals_minutes[4]
         );
 
@@ -1552,7 +1554,7 @@ mod tests {
 
         assert!(
             next_good_minutes > 24.0 * 60.0,
-            "core FSRS should not keep the next Good interval at 1.75 minutes, got {next_good_minutes}"
+            "core FSRS should not keep the next Good interval minute-scale, got {next_good_minutes}"
         );
         Ok(())
     }

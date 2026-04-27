@@ -22,6 +22,12 @@
 - FSRS-6 and FSRS-7 both return fractional intervals from scheduling APIs.
 - FSRS-7 keeps full fractional behavior for elapsed days and output intervals.
 
+## Stability Bounds
+
+- Minimum stability is clamped at `0.0001` days.
+- This same lower bound is used when initializing stability parameters and when
+  clamping inferred or updated memory states.
+
 ## Anki Learning And Relearning Steps
 
 - `FSRS::next_states*()` returns model intervals. Anki may still show
