@@ -40,6 +40,9 @@ type B = NdArray<f32>;
 
 const L2_PENALTY_WEIGHT: f64 = training_v7::PENALTY_W_L2;
 const PENALTY_GRAD_LEN: usize = training_v7::GRAD_LEN;
+const EARLY_STOPPING_MIN_EPOCHS: usize = 3;
+const EARLY_STOPPING_PATIENCE: usize = 2;
+const EARLY_STOPPING_MIN_RELATIVE_GAIN: f64 = 1e-3;
 
 type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN]);
 type L2PenaltyFn = fn(&[f32], &[f32], usize, usize, f64, &[f32]) -> (f64, Vec<f32>);
@@ -247,8 +250,16 @@ pub(crate) struct TrainingConfig {
     pub learning_rate: f64,
     #[config(default = 64)]
     pub max_seq_len: usize,
-    #[config(default = 10)]
+    #[config(default = 1)]
     pub validation_interval: usize,
+}
+
+fn relative_validation_gain(best_loss: f64, loss_valid: f64) -> f64 {
+    if best_loss.is_finite() && best_loss > 0.0 {
+        (best_loss - loss_valid) / best_loss
+    } else {
+        f64::INFINITY
+    }
 }
 
 pub(crate) fn calculate_average_recall(items: &[FSRSItem]) -> f32 {
@@ -575,6 +586,7 @@ fn train<B: AutodiffBackend>(
 
     let mut best_loss = f64::INFINITY;
     let mut best_model = model.clone();
+    let mut low_gain_count = 0;
     for epoch in 1..=config.num_epochs {
         let mut iterator = dataloader_train.iter();
         let mut iteration = 0;
@@ -677,9 +689,24 @@ fn train<B: AutodiffBackend>(
         }
         loss_valid /= test_set.len() as f64;
         info!("epoch: {:?} loss: {:?}", epoch, loss_valid);
+        let relative_gain = relative_validation_gain(best_loss, loss_valid);
+        if relative_gain >= EARLY_STOPPING_MIN_RELATIVE_GAIN {
+            low_gain_count = 0;
+        } else if epoch >= EARLY_STOPPING_MIN_EPOCHS {
+            low_gain_count += 1;
+        }
+
         if loss_valid < best_loss {
             best_loss = loss_valid;
             best_model = model.clone();
+        }
+
+        if low_gain_count >= EARLY_STOPPING_PATIENCE {
+            info!(
+                "early stopping at epoch: {:?}, relative_gain: {:?}, best_loss: {:?}",
+                epoch, relative_gain, best_loss
+            );
+            break;
         }
     }
 
@@ -729,7 +756,14 @@ mod tests {
         assert_eq!(config.batch_size, 2048);
         assert_eq!(config.learning_rate, 4e-2);
         assert_eq!(config.max_seq_len, 64);
-        assert_eq!(config.validation_interval, 10);
+        assert_eq!(config.validation_interval, 1);
+    }
+
+    #[test]
+    fn test_relative_validation_gain() {
+        assert_eq!(relative_validation_gain(f64::INFINITY, 0.5), f64::INFINITY);
+        assert!((relative_validation_gain(0.5, 0.4995) - 0.001).abs() < 1e-12);
+        assert!((relative_validation_gain(0.5, 0.501) + 0.002).abs() < 1e-12);
     }
 
     #[test]
