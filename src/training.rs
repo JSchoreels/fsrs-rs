@@ -43,6 +43,7 @@ const PENALTY_GRAD_LEN: usize = training_v7::GRAD_LEN;
 const EARLY_STOPPING_MIN_EPOCHS: usize = 3;
 const EARLY_STOPPING_PATIENCE: usize = 2;
 const EARLY_STOPPING_MIN_RELATIVE_GAIN: f64 = 1e-3;
+const LR_SCHEDULE_EPOCHS: usize = 10;
 
 type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN]);
 type L2PenaltyFn = fn(&[f32], &[f32], usize, usize, f64, &[f32]) -> (f64, Vec<f32>);
@@ -240,7 +241,7 @@ pub(crate) struct TrainingConfig {
     pub optimizer: AdamConfig,
     #[config(default = true)]
     pub enable_sched_penalties: bool,
-    #[config(default = 10)]
+    #[config(default = 30)]
     pub num_epochs: usize,
     #[config(default = 2048)]
     pub batch_size: usize,
@@ -556,7 +557,8 @@ fn train<B: AutodiffBackend>(
 
     // Training data
     let total_size = train_set.len();
-    let iterations = (total_size / config.batch_size + 1) * config.num_epochs;
+    let batches_per_epoch = total_size / config.batch_size + 1;
+    let iterations = batches_per_epoch * LR_SCHEDULE_EPOCHS;
     let batch_dataset =
         BatchTensorDataset::<B>::new(FSRSDataset::from(train_set), config.batch_size);
     let dataloader_train = ShuffleDataLoader::new(batch_dataset, config.seed);
@@ -752,7 +754,7 @@ mod tests {
     fn test_training_config_uses_tuned_defaults() {
         let config = TrainingConfig::new(ModelConfig::default(), AdamConfig::new());
 
-        assert_eq!(config.num_epochs, 10);
+        assert_eq!(config.num_epochs, 30);
         assert_eq!(config.batch_size, 2048);
         assert_eq!(config.learning_rate, 4e-2);
         assert_eq!(config.max_seq_len, 64);
