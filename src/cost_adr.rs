@@ -3,7 +3,7 @@ use crate::inference::{ItemState, MemoryState, Parameters};
 use crate::model::FSRS;
 use crate::simulation::{D_MAX, D_MIN, S_MAX, S_MIN, simulate_with_cost_adr_policy_for_evaluation};
 use crate::training::{CombinedProgressState, ProgressState};
-use crate::{SimulationResult, SimulatorConfig, simulate};
+use crate::{Card, SimulationResult, SimulatorConfig, simulate};
 use burn::tensor::backend::Backend;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -138,7 +138,16 @@ impl CostAdrPolicy {
         parameters: &Parameters,
         training_config: &CostAdrTrainingConfig,
     ) -> Result<CostAdrTrainingResult> {
-        train_cost_adr_single_user(config, parameters, training_config)
+        train_cost_adr_single_user(config, parameters, training_config, None)
+    }
+
+    pub fn train_single_user_with_existing_cards(
+        config: &SimulatorConfig,
+        parameters: &Parameters,
+        training_config: &CostAdrTrainingConfig,
+        existing_cards: &[Card],
+    ) -> Result<CostAdrTrainingResult> {
+        train_cost_adr_single_user(config, parameters, training_config, Some(existing_cards))
     }
 
     pub fn new(coefficients: Vec<f32>) -> Result<Self> {
@@ -233,7 +242,23 @@ impl CostAdrPolicy {
         parameters: &Parameters,
         evaluation_config: &CostAdrEvaluationConfig,
     ) -> Result<CostAdrEvaluationResult> {
-        evaluate_cost_adr_policy(config, parameters, self, evaluation_config)
+        evaluate_cost_adr_policy(config, parameters, self, evaluation_config, None)
+    }
+
+    pub fn evaluate_with_existing_cards(
+        &self,
+        config: &SimulatorConfig,
+        parameters: &Parameters,
+        evaluation_config: &CostAdrEvaluationConfig,
+        existing_cards: &[Card],
+    ) -> Result<CostAdrEvaluationResult> {
+        evaluate_cost_adr_policy(
+            config,
+            parameters,
+            self,
+            evaluation_config,
+            Some(existing_cards),
+        )
     }
 
     /// Return the memory states, cost-conditioned desired retentions, and intervals for each
@@ -319,6 +344,40 @@ impl CostAdrPolicy {
         point_count: usize,
         seed: Option<u64>,
     ) -> Result<Vec<CostAdrEvaluationPoint>> {
+        self.calibrate_average_desired_retention_range_inner(
+            config,
+            parameters,
+            point_count,
+            seed,
+            None,
+        )
+    }
+
+    pub fn calibrate_average_desired_retention_range_with_existing_cards(
+        &self,
+        config: &SimulatorConfig,
+        parameters: &Parameters,
+        point_count: usize,
+        seed: Option<u64>,
+        existing_cards: &[Card],
+    ) -> Result<Vec<CostAdrEvaluationPoint>> {
+        self.calibrate_average_desired_retention_range_inner(
+            config,
+            parameters,
+            point_count,
+            seed,
+            Some(existing_cards),
+        )
+    }
+
+    fn calibrate_average_desired_retention_range_inner(
+        &self,
+        config: &SimulatorConfig,
+        parameters: &Parameters,
+        point_count: usize,
+        seed: Option<u64>,
+        existing_cards: Option<&[Card]>,
+    ) -> Result<Vec<CostAdrEvaluationPoint>> {
         if point_count < COST_ADR_CALIBRATION_POINT_COUNT_MIN {
             return Err(FSRSError::InvalidInput);
         }
@@ -329,6 +388,7 @@ impl CostAdrPolicy {
             self,
             self.cost_weight_min,
             seed,
+            existing_cards,
         )?;
         let high = evaluate_cost_adr_rollout_for_weight(
             config,
@@ -336,6 +396,7 @@ impl CostAdrPolicy {
             self,
             self.cost_weight_max,
             seed,
+            existing_cards,
         )?;
         let low_avg = average_desired_retention_from_point(&low)?;
         let high_avg = average_desired_retention_from_point(&high)?;
@@ -347,8 +408,12 @@ impl CostAdrPolicy {
         for index in 0..point_count {
             let ratio = index as f32 / (point_count - 1) as f32;
             let target = low_avg + (high_avg - low_avg) * ratio;
-            let point = self.calibrate_cost_weight_for_average_desired_retention(
-                config, parameters, target, seed,
+            let point = self.calibrate_cost_weight_for_average_desired_retention_inner(
+                config,
+                parameters,
+                target,
+                seed,
+                existing_cards,
             )?;
             points.push(point);
         }
@@ -363,6 +428,40 @@ impl CostAdrPolicy {
         target_average_desired_retention: f32,
         seed: Option<u64>,
     ) -> Result<CostAdrEvaluationPoint> {
+        self.calibrate_cost_weight_for_average_desired_retention_inner(
+            config,
+            parameters,
+            target_average_desired_retention,
+            seed,
+            None,
+        )
+    }
+
+    pub fn calibrate_cost_weight_for_average_desired_retention_with_existing_cards(
+        &self,
+        config: &SimulatorConfig,
+        parameters: &Parameters,
+        target_average_desired_retention: f32,
+        seed: Option<u64>,
+        existing_cards: &[Card],
+    ) -> Result<CostAdrEvaluationPoint> {
+        self.calibrate_cost_weight_for_average_desired_retention_inner(
+            config,
+            parameters,
+            target_average_desired_retention,
+            seed,
+            Some(existing_cards),
+        )
+    }
+
+    fn calibrate_cost_weight_for_average_desired_retention_inner(
+        &self,
+        config: &SimulatorConfig,
+        parameters: &Parameters,
+        target_average_desired_retention: f32,
+        seed: Option<u64>,
+        existing_cards: Option<&[Card]>,
+    ) -> Result<CostAdrEvaluationPoint> {
         self.validate()?;
         if !target_average_desired_retention.is_finite() {
             return Err(FSRSError::InvalidInput);
@@ -374,6 +473,7 @@ impl CostAdrPolicy {
             self,
             self.cost_weight_min,
             seed,
+            existing_cards,
         )?;
         let mut high = evaluate_cost_adr_rollout_for_weight(
             config,
@@ -381,6 +481,7 @@ impl CostAdrPolicy {
             self,
             self.cost_weight_max,
             seed,
+            existing_cards,
         )?;
         let mut low_avg = average_desired_retention_from_point(&low)?;
         let mut high_avg = average_desired_retention_from_point(&high)?;
@@ -414,8 +515,14 @@ impl CostAdrPolicy {
                 break;
             }
             let mid_weight = midpoint_log_cost_weight(low.goal_cost_weight, high.goal_cost_weight);
-            let mid =
-                evaluate_cost_adr_rollout_for_weight(config, parameters, self, mid_weight, seed)?;
+            let mid = evaluate_cost_adr_rollout_for_weight(
+                config,
+                parameters,
+                self,
+                mid_weight,
+                seed,
+                existing_cards,
+            )?;
             let mid_avg = average_desired_retention_from_point(&mid)?;
             best = closest_average_desired_retention_point(
                 best,
@@ -735,6 +842,7 @@ fn evaluate_cost_adr_policy(
     parameters: &Parameters,
     policy: &CostAdrPolicy,
     evaluation_config: &CostAdrEvaluationConfig,
+    existing_cards: Option<&[Card]>,
 ) -> Result<CostAdrEvaluationResult> {
     validate_evaluation_config(evaluation_config)?;
     let seed = evaluation_config.seed.unwrap_or(COST_ADR_DEFAULT_SEED);
@@ -743,6 +851,7 @@ fn evaluate_cost_adr_policy(
         parameters,
         &evaluation_config.baseline_desired_retentions,
         seed,
+        existing_cards,
     )?;
     let baseline_points = points_from_metrics(&baseline_metrics);
     let reference = reference_point(&baseline_points)?;
@@ -753,6 +862,7 @@ fn evaluate_cost_adr_policy(
         policy,
         &evaluation_config.cost_weights,
         seed,
+        existing_cards,
     )?;
     annotate_cost_adr_rollouts(
         &evaluation_config.baseline_desired_retentions,
@@ -784,6 +894,7 @@ fn evaluate_cost_adr_rollouts(
     policy: &CostAdrPolicy,
     cost_weights: &[f32],
     seed: u64,
+    existing_cards: Option<&[Card]>,
 ) -> Result<Vec<CostAdrEvaluationPoint>> {
     policy.validate()?;
     cost_weights
@@ -796,7 +907,7 @@ fn evaluate_cost_adr_rollouts(
                 policy,
                 goal_cost_weight,
                 Some(seed + index as u64),
-                None,
+                clone_existing_cards(existing_cards),
             )?;
             let metrics = metrics_from_simulation(&result.result);
             Ok(CostAdrEvaluationPoint {
@@ -816,6 +927,7 @@ fn evaluate_cost_adr_rollout_for_weight(
     policy: &CostAdrPolicy,
     goal_cost_weight: f32,
     seed: Option<u64>,
+    existing_cards: Option<&[Card]>,
 ) -> Result<CostAdrEvaluationPoint> {
     let result = simulate_with_cost_adr_policy_for_evaluation(
         config,
@@ -823,7 +935,7 @@ fn evaluate_cost_adr_rollout_for_weight(
         policy,
         goal_cost_weight,
         seed,
-        None,
+        clone_existing_cards(existing_cards),
     )?;
     Ok(CostAdrEvaluationPoint {
         goal_cost_weight,
@@ -868,28 +980,8 @@ fn annotate_cost_adr_rollouts(
     baseline_metrics: &[CostAdrMetrics],
     scheduler_metrics: &mut [CostAdrEvaluationPoint],
 ) {
-    let mut baseline_points = baseline_desired_retentions
-        .iter()
-        .copied()
-        .zip(baseline_metrics.iter().copied())
-        .map(
-            |(desired_retention, metrics)| DesiredRetentionMemoryTimePoint {
-                desired_retention,
-                memorized_average: metrics.memorized_average,
-                time_average: metrics.time_average,
-            },
-        )
-        .filter(|point| {
-            point.desired_retention.is_finite()
-                && point.memorized_average.is_finite()
-                && point.time_average.is_finite()
-        })
-        .collect::<Vec<_>>();
-    baseline_points.sort_by(|left, right| {
-        left.memorized_average
-            .partial_cmp(&right.memorized_average)
-            .unwrap_or(Ordering::Equal)
-    });
+    let baseline_points =
+        fixed_baseline_frontier_points(baseline_desired_retentions, baseline_metrics);
 
     for point in scheduler_metrics {
         let target = point.metrics.memorized_average;
@@ -1020,6 +1112,7 @@ fn evaluate_baseline_desired_retentions(
     parameters: &Parameters,
     desired_retentions: &[f32],
     seed: u64,
+    existing_cards: Option<&[Card]>,
 ) -> Result<Vec<CostAdrMetrics>> {
     desired_retentions
         .par_iter()
@@ -1030,11 +1123,31 @@ fn evaluate_baseline_desired_retentions(
                 parameters,
                 desired_retention,
                 Some(seed + index as u64),
-                None,
+                clone_existing_cards_with_desired_retention(existing_cards, desired_retention),
             )?;
             Ok(metrics_from_simulation(&result))
         })
         .collect()
+}
+
+fn clone_existing_cards(existing_cards: Option<&[Card]>) -> Option<Vec<Card>> {
+    existing_cards.map(|cards| cards.to_vec())
+}
+
+fn clone_existing_cards_with_desired_retention(
+    existing_cards: Option<&[Card]>,
+    desired_retention: f32,
+) -> Option<Vec<Card>> {
+    existing_cards.map(|cards| {
+        cards
+            .iter()
+            .cloned()
+            .map(|mut card| {
+                card.desired_retention = desired_retention;
+                card
+            })
+            .collect()
+    })
 }
 
 fn cost_adr_auc_metrics(
@@ -1196,28 +1309,8 @@ fn efficient_fixed_desired_retention_points(
     baseline_metrics: &[CostAdrMetrics],
     scheduler_points: &[CostAdrEvaluationPoint],
 ) -> Vec<CostAdrFixedTargetCalibrationPoint> {
-    let mut baseline_points = baseline_desired_retentions
-        .iter()
-        .copied()
-        .zip(baseline_metrics.iter().copied())
-        .filter(|(desired_retention, metrics)| {
-            desired_retention.is_finite()
-                && (0.0..=1.0).contains(desired_retention)
-                && metrics.memorized_average.is_finite()
-        })
-        .map(
-            |(desired_retention, metrics)| DesiredRetentionMemoryTimePoint {
-                desired_retention,
-                memorized_average: metrics.memorized_average,
-                time_average: metrics.time_average,
-            },
-        )
-        .collect::<Vec<_>>();
-    baseline_points.sort_by(|left, right| {
-        left.memorized_average
-            .partial_cmp(&right.memorized_average)
-            .unwrap_or(Ordering::Equal)
-    });
+    let baseline_points =
+        fixed_baseline_frontier_points(baseline_desired_retentions, baseline_metrics);
 
     let candidates = scheduler_points
         .iter()
@@ -1295,13 +1388,15 @@ fn train_cost_adr_single_user(
     config: &SimulatorConfig,
     parameters: &Parameters,
     training_config: &CostAdrTrainingConfig,
+    existing_cards: Option<&[Card]>,
 ) -> Result<CostAdrTrainingResult> {
     if let Err(err) = validate_training_config(training_config) {
         finish_cost_adr_training_progress(&training_config.progress);
         return Err(err);
     }
     reset_cost_adr_training_progress(training_config);
-    let result = train_cost_adr_single_user_inner(config, parameters, training_config);
+    let result =
+        train_cost_adr_single_user_inner(config, parameters, training_config, existing_cards);
     finish_cost_adr_training_progress(&training_config.progress);
     result
 }
@@ -1310,6 +1405,7 @@ fn train_cost_adr_single_user_inner(
     config: &SimulatorConfig,
     parameters: &Parameters,
     training_config: &CostAdrTrainingConfig,
+    existing_cards: Option<&[Card]>,
 ) -> Result<CostAdrTrainingResult> {
     if cost_adr_training_should_abort(&training_config.progress) {
         return Err(FSRSError::Interrupted);
@@ -1330,6 +1426,7 @@ fn train_cost_adr_single_user_inner(
         parameters,
         &training_config.baseline_desired_retentions,
         simulation_seed,
+        existing_cards,
     )?;
     let baseline_points = points_from_metrics(&baseline_metrics);
     let reference = reference_point(&baseline_points)?;
@@ -1376,6 +1473,7 @@ fn train_cost_adr_single_user_inner(
                     &policy,
                     &training_config.cost_weights,
                     simulation_seed,
+                    existing_cards,
                 )?;
                 annotate_cost_adr_rollouts(
                     &training_config.baseline_desired_retentions,
@@ -1657,6 +1755,77 @@ struct DesiredRetentionMemoryTimePoint {
     desired_retention: f32,
     memorized_average: f32,
     time_average: f32,
+}
+
+fn fixed_baseline_frontier_points(
+    baseline_desired_retentions: &[f32],
+    baseline_metrics: &[CostAdrMetrics],
+) -> Vec<DesiredRetentionMemoryTimePoint> {
+    let candidates = baseline_desired_retentions
+        .iter()
+        .copied()
+        .zip(baseline_metrics.iter().copied())
+        .map(
+            |(desired_retention, metrics)| DesiredRetentionMemoryTimePoint {
+                desired_retention,
+                memorized_average: metrics.memorized_average,
+                time_average: metrics.time_average,
+            },
+        )
+        .filter(|point| {
+            point.desired_retention.is_finite()
+                && (0.0..=1.0).contains(&point.desired_retention)
+                && point.memorized_average.is_finite()
+                && point.time_average.is_finite()
+        })
+        .collect::<Vec<_>>();
+
+    let mut frontier = Vec::new();
+    for candidate in &candidates {
+        let dominated = candidates.iter().any(|other| {
+            let no_worse = other.memorized_average >= candidate.memorized_average
+                && other.time_average <= candidate.time_average;
+            let strictly_better = other.memorized_average > candidate.memorized_average
+                || other.time_average < candidate.time_average;
+            no_worse && strictly_better
+        });
+        if !dominated {
+            frontier.push(*candidate);
+        }
+    }
+
+    frontier.sort_by(|left, right| {
+        left.memorized_average
+            .partial_cmp(&right.memorized_average)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                left.time_average
+                    .partial_cmp(&right.time_average)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| {
+                left.desired_retention
+                    .partial_cmp(&right.desired_retention)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+
+    let mut collapsed: Vec<DesiredRetentionMemoryTimePoint> = Vec::new();
+    for point in frontier {
+        if let Some(last) = collapsed.last_mut() {
+            if is_close(last.memorized_average, point.memorized_average) {
+                if point.time_average < last.time_average
+                    || (is_close(point.time_average, last.time_average)
+                        && point.desired_retention < last.desired_retention)
+                {
+                    *last = point;
+                }
+                continue;
+            }
+        }
+        collapsed.push(point);
+    }
+    collapsed
 }
 
 fn frontier_memory_time_points(metrics: &[CostAdrMetrics]) -> Vec<MemoryTimePoint> {
@@ -2068,6 +2237,18 @@ mod tests {
         }
     }
 
+    fn test_existing_card() -> Card {
+        Card {
+            difficulty: 5.0,
+            stability: 10.0,
+            last_date: 0.0,
+            due: 1.0,
+            interval: 1.0,
+            desired_retention: 0.9,
+            ..Default::default()
+        }
+    }
+
     fn test_evaluation_point(
         cost_weight: f32,
         average_desired_retention: f32,
@@ -2181,6 +2362,7 @@ mod tests {
             &policy,
             policy.cost_weight_min,
             Some(9),
+            None,
         )?;
         let high = evaluate_cost_adr_rollout_for_weight(
             &config,
@@ -2188,6 +2370,7 @@ mod tests {
             &policy,
             policy.cost_weight_max,
             Some(9),
+            None,
         )?;
         let target = (average_desired_retention_from_point(&low)?
             + average_desired_retention_from_point(&high)?)
@@ -2323,6 +2506,27 @@ mod tests {
         assert_eq!(points[0].goal_cost_weight, 64.0);
         assert_eq!(points[1].desired_retention, 0.9);
         assert_eq!(points[1].goal_cost_weight, 16.0);
+    }
+
+    #[test]
+    fn test_fixed_equivalent_uses_baseline_frontier() {
+        let baseline_desired_retentions = vec![0.8, 0.88, 0.9];
+        let baseline_metrics = vec![
+            test_metrics(100.0, 10.0),
+            test_metrics(110.0, 50.0),
+            test_metrics(120.0, 20.0),
+        ];
+        let mut scheduler_points = vec![test_evaluation_point_with_metrics(64.0, 110.0, 14.0)];
+
+        annotate_cost_adr_rollouts(
+            &baseline_desired_retentions,
+            &baseline_metrics,
+            &mut scheduler_points,
+        );
+
+        let point = scheduler_points[0];
+        assert!((point.fixed_fsrs_equivalent_desired_retention.unwrap() - 0.85).abs() < 1e-6);
+        assert!((point.same_target_time_saved_percent.unwrap() - 6.666_667).abs() < 1e-4);
     }
 
     #[test]
@@ -2691,6 +2895,101 @@ mod tests {
         let explicit_result = policy.evaluate(&config, &DEFAULT_PARAMETERS, &explicit_seed)?;
 
         assert_eq!(default_result, explicit_result);
+        Ok(())
+    }
+
+    #[test]
+    fn test_evaluate_cost_adr_policy_with_existing_cards_uses_in_flight_cards() -> Result<()> {
+        let config = SimulatorConfig {
+            deck_size: 1,
+            learn_span: 5,
+            learn_limit: 0,
+            review_limit: 200,
+            review_rating_prob: [0.0, 1.0, 0.0],
+            ..Default::default()
+        };
+        let policy = CostAdrPolicy::constant_retention(0.9)?;
+        let evaluation_config = CostAdrEvaluationConfig {
+            cost_weights: vec![0.0],
+            baseline_desired_retentions: vec![0.9],
+            seed: Some(11),
+        };
+        let synthetic = policy.evaluate(&config, &DEFAULT_PARAMETERS, &evaluation_config)?;
+        let existing_cards = vec![test_existing_card()];
+        let with_existing = policy.evaluate_with_existing_cards(
+            &config,
+            &DEFAULT_PARAMETERS,
+            &evaluation_config,
+            &existing_cards,
+        )?;
+
+        assert_eq!(synthetic.baseline_metrics[0].total_reviews, 0);
+        assert_eq!(synthetic.scheduler_metrics[0].metrics.total_reviews, 0);
+        assert!(with_existing.baseline_metrics[0].total_reviews > 0);
+        assert!(with_existing.scheduler_metrics[0].metrics.total_reviews > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fixed_baselines_with_existing_cards_apply_each_desired_retention() -> Result<()> {
+        let config = SimulatorConfig {
+            deck_size: 1,
+            learn_span: 120,
+            learn_limit: 0,
+            review_limit: 200,
+            review_rating_prob: [0.0, 1.0, 0.0],
+            ..Default::default()
+        };
+        let policy = CostAdrPolicy::constant_retention(0.9)?;
+        let evaluation_config = CostAdrEvaluationConfig {
+            cost_weights: vec![0.0],
+            baseline_desired_retentions: vec![0.8, 0.9],
+            seed: Some(11),
+        };
+        let existing_cards = vec![test_existing_card()];
+
+        let result = policy.evaluate_with_existing_cards(
+            &config,
+            &DEFAULT_PARAMETERS,
+            &evaluation_config,
+            &existing_cards,
+        )?;
+
+        assert!(
+            result.baseline_metrics[0].total_reviews < result.baseline_metrics[1].total_reviews
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_train_cost_adr_with_existing_cards_uses_in_flight_cards() -> Result<()> {
+        let config = SimulatorConfig {
+            deck_size: 1,
+            learn_span: 5,
+            learn_limit: 0,
+            review_limit: 200,
+            review_rating_prob: [0.0, 1.0, 0.0],
+            ..Default::default()
+        };
+        let training_config = CostAdrTrainingConfig {
+            population_size: 2,
+            generations: 1,
+            sigma0: 0.5,
+            cost_weights: vec![0.0],
+            baseline_desired_retentions: vec![0.9],
+            ..Default::default()
+        };
+        let existing_cards = vec![test_existing_card()];
+
+        let result = CostAdrPolicy::train_single_user_with_existing_cards(
+            &config,
+            &DEFAULT_PARAMETERS,
+            &training_config,
+            &existing_cards,
+        )?;
+
+        assert!(result.baseline_metrics[0].total_reviews > 0);
+        assert!(result.best_cost_weight_metrics[0].metrics.total_reviews > 0);
         Ok(())
     }
 

@@ -31,6 +31,11 @@
     FSRS-7 parameters from collection data.
   - Post-review internal `MemoryState { stability, difficulty }`.
   - Runtime cost weight.
+  - Simulator shape and probabilities: deck size, learn span, daily limits,
+    rating probabilities, transition probabilities, and rating costs.
+  - Optional in-flight simulator cards when callers want ADR
+    training/evaluation to reflect the current card-state distribution instead
+    of only the synthetic new-card stream.
   - Cost ADR policy coefficients and bounds.
   - Per-rollout cached ADR cost-weight evaluator values.
   - Per-simulation cached FSRS-7 interval/runtime context when parameters use
@@ -62,6 +67,10 @@
   - Persist at least policy version, coefficients, retention bounds, cost-weight bounds/default, and training/evaluation summary.
   - Recompute runtime desired retention from the persisted policy and current internal memory state.
   - Use `CostAdrPolicy::next_states(...)` when the caller needs per-button memory state, ADR desired retention, and interval outputs for Anki scheduling.
+- Current collection runs use revlogs to train FSRS parameters and estimate the
+  simulator shape/probabilities. They do not train against the live collection's
+  current card-state, due-date, stability, or difficulty distribution unless an
+  explicit existing-card workflow is used.
 
 ## First Impact Estimate
 
@@ -96,9 +105,18 @@
 - `average_desired_retention`: arithmetic average of the ADR desired retention selected across simulated reviews.
 - `fixed_fsrs_equivalent_desired_retention` (`FSRS Eq. DR`, displayed as `FSRS6 Eq. DR` or `FSRS7 Eq. DR`): fixed-FSRS desired retention that reaches the same simulated Memorized target for the selected model, interpolated from the fixed-DR baseline frontier.
 - `same_target_time_saved_percent`: time saved by ADR compared with that fixed-FSRS equivalent desired retention at the same Memorized target.
+- Dominated fixed-DR baseline rollouts are ignored when interpolating fixed-FSRS
+  equivalents and same-target time saved. A dominated rollout is one where
+  another fixed-DR point reaches at least as much simulated Memorized with no
+  more average time, and improves one of those two metrics.
 - Default fixed-FSRS baseline retention rollouts span `0.30` to `0.95` across 16 points. This keeps Cost ADR training cost unchanged while giving `fixed_fsrs_equivalent_desired_retention` coverage for lower-retention ADR policies.
 - `cost_weight_for_average_desired_retention(target)`: inferred ADR cost weight for a target average ADR desired retention. It interpolates in `ln(1 + weight)` space when only persisted calibration points are available.
 - `calibrate_cost_weight_for_average_desired_retention(target)`: computes a simulation-backed closest ADR cost weight by bisection in `ln(1 + weight)` space. This is used after policy training to persist a denser, target-oriented calibration table instead of relying on coarse fixed weights like `0, 64, 128`.
+- `evaluate_with_existing_cards`, `train_single_user_with_existing_cards`, and
+  the `*_with_existing_cards` calibration helpers run fixed-DR baselines and ADR
+  rollouts over the same supplied in-flight cards. Use these when comparing ADR
+  against a current collection distribution rather than a synthetic future-only
+  stream.
 - Calibration first evaluates endpoint weights `0` and `1024`. If their average ADR DR span is below `0.005` retention, it persists only those endpoints because extra bisection points do not give users a meaningful target range.
 - Optional endpoint training penalties can target a broad simulated average ADR DR range. Example: `w=0 -> 0.90`, `w=1024 -> 0.50`, with `penalty=10`, subtracts `10 * ((avg_dr(w=0)-0.90)^2 + (avg_dr(w=1024)-0.50)^2)` from each candidate score.
 - ADR training treats `generations` as a maximum. The default maximum is `10`
