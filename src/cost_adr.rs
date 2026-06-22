@@ -1487,7 +1487,12 @@ fn train_cost_adr_single_user_inner(
                 let hypervolume_delta = hypervolume - baseline_hypervolume;
                 let endpoint_penalty =
                     average_desired_retention_endpoint_penalty(&points, training_config);
-                let score = hypervolume_delta - endpoint_penalty;
+                let score = cost_adr_training_score(
+                    &baseline_metrics,
+                    &candidate_metrics,
+                    hypervolume_delta,
+                    endpoint_penalty,
+                );
                 let evaluation = Ok(CandidateEvaluation {
                     coefficients,
                     rollout_points: points,
@@ -1563,6 +1568,26 @@ fn train_cost_adr_single_user_inner(
         history,
         training_seconds: started.elapsed().as_secs_f32(),
     })
+}
+
+fn cost_adr_training_score(
+    baseline_metrics: &[CostAdrMetrics],
+    candidate_metrics: &[CostAdrMetrics],
+    hypervolume_delta: f32,
+    endpoint_penalty: f32,
+) -> f32 {
+    let auc_metrics = cost_adr_auc_metrics(baseline_metrics, candidate_metrics);
+    let coverage = if auc_metrics.total_span > 0.0 {
+        (auc_metrics.covered_span / auc_metrics.total_span).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let same_target_score = auc_metrics
+        .relative_same_target_time_saved_auc_percent
+        .map(|percent| percent * coverage)
+        .filter(|score| score.is_finite());
+
+    same_target_score.unwrap_or(hypervolume_delta) - endpoint_penalty
 }
 
 fn cost_adr_policy_from_training_config(
@@ -2506,6 +2531,18 @@ mod tests {
         assert_eq!(points[0].goal_cost_weight, 64.0);
         assert_eq!(points[1].desired_retention, 0.9);
         assert_eq!(points[1].goal_cost_weight, 16.0);
+    }
+
+    #[test]
+    fn test_cost_adr_training_score_prefers_same_target_time_savings() {
+        let baseline = vec![test_metrics(100.0, 10.0), test_metrics(200.0, 20.0)];
+        let time_saving_candidate = vec![test_metrics(100.0, 9.0), test_metrics(200.0, 18.0)];
+        let slower_candidate = vec![test_metrics(100.0, 11.0), test_metrics(200.0, 22.0)];
+
+        let saving_score = cost_adr_training_score(&baseline, &time_saving_candidate, -100.0, 0.0);
+        let slower_score = cost_adr_training_score(&baseline, &slower_candidate, 100.0, 0.0);
+
+        assert!(saving_score > slower_score);
     }
 
     #[test]

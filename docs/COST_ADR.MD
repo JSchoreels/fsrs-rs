@@ -121,8 +121,11 @@
 - Optional endpoint training penalties can target a broad simulated average ADR DR range. Example: `w=0 -> 0.90`, `w=1024 -> 0.50`, with `penalty=10`, subtracts `10 * ((avg_dr(w=0)-0.90)^2 + (avg_dr(w=1024)-0.50)^2)` from each candidate score.
 - ADR training treats `generations` as a maximum. The default maximum is `10`
   generations. By default, it can stop after at least `10` generations when the
-  best optimizer score (`hypervolume_delta - endpoint_penalty`) improves by less
-  than `1%` over the last `4` generations. Set
+  best optimizer score improves by less than `1%` over the last `4`
+  generations. The optimizer score primarily uses same-target time saving AUC
+  against the fixed-DR baseline frontier, weighted by coverage of the fixed-DR
+  Memorized target span; hypervolume is only a fallback when same-target
+  coverage cannot be computed. Set
   `early_stop_patience_generations=0` to force all configured generations.
   Increase `early_stop_min_generations`, `early_stop_patience_generations`, or
   lower `early_stop_min_relative_gain` to bias toward longer/higher-quality
