@@ -36,13 +36,21 @@ impl<B: Backend> VersionOps<B> for Fsrs6Ops {
         initial_params[19] = 0.0;
     }
 
-    fn power_forgetting_curve(model: &Model<B>, t: Tensor<B, 1>, s: Tensor<B, 1>) -> Tensor<B, 1> {
+    fn power_forgetting_curve(
+        model: &Model<B>,
+        t: Tensor<B, 1>,
+        s: Tensor<B, 1>,
+        _s_fast: Tensor<B, 1>,
+        _d: Tensor<B, 1>,
+    ) -> Tensor<B, 1> {
         power_forgetting_curve(model, t, s)
     }
 
     fn next_interval(
         model: &Model<B>,
         stability: Tensor<B, 1>,
+        _stability_fast: Tensor<B, 1>,
+        _difficulty: Tensor<B, 1>,
         desired_retention: Tensor<B, 1>,
     ) -> Tensor<B, 1> {
         next_interval(model, stability, desired_retention)
@@ -54,6 +62,7 @@ impl<B: Backend> VersionOps<B> for Fsrs6Ops {
         rating: Tensor<B, 1>,
         last_s: Tensor<B, 1>,
         last_d: Tensor<B, 1>,
+        _last_s_fast: Tensor<B, 1>,
     ) -> MemoryStateTensors<B> {
         // FSRS-6 stays day-based: keep f32 transport, but round elapsed days to nearest day.
         let delta_t = round_elapsed_days(delta_t);
@@ -75,8 +84,9 @@ impl<B: Backend> VersionOps<B> for Fsrs6Ops {
         let new_d = mean_reversion(model, model.next_difficulty(last_d, rating))
             .clamp(super::D_MIN, super::D_MAX);
         MemoryStateTensors {
-            stability: new_s,
+            stability: new_s.clone(),
             difficulty: new_d,
+            stability_fast: new_s,
         }
     }
 
@@ -91,9 +101,10 @@ impl<B: Backend> VersionOps<B> for Fsrs6Ops {
 
     fn interval_at_retrievability(
         model: &Model<B>,
-        stability: f32,
+        state: MemoryState,
         target_retrievability: f32,
     ) -> f32 {
+        let stability = state.stability;
         let stability = stability.max(super::S_MIN);
         if (target_retrievability - 0.9).abs() <= f32::EPSILON {
             stability
@@ -208,6 +219,7 @@ pub(super) fn memory_state_from_sm2_fsrs6<B: Backend>(
         Ok(MemoryState {
             stability,
             difficulty: difficulty.clamp(super::D_MIN, super::D_MAX),
+            stability_fast: stability,
         })
     }
 }
@@ -297,7 +309,10 @@ mod tests {
         let model = fsrs6_model();
         let delta_t = Tensor::from_floats([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], &DEVICE);
         let stability = Tensor::from_floats([1.0, 2.0, 3.0, 4.0, 4.0, 2.0], &DEVICE);
-        let retrievability = model.power_forgetting_curve(delta_t, stability);
+        let stability_fast = stability.clone();
+        let difficulty = Tensor::from_floats([5.0; 6], &DEVICE);
+        let retrievability =
+            model.power_forgetting_curve(delta_t, stability, stability_fast, difficulty);
 
         retrievability.to_data().assert_approx_eq::<f32>(
             &TensorData::from([1.0, 0.9403443, 0.9253786, 0.9185229, 0.9, 0.8261359]),

@@ -65,19 +65,16 @@ const FSRS7_FORGETTING_CURVE_CANDIDATES: [[f32; 8]; 16] = [
         0.0656, 0.197, 0.5693, 0.9692, 0.3599, 0.5374, 0.2596, 0.5096,
     ],
 ];
-const GOLDEN_SECTION_LOWER_FRACTION: f64 = 0.381_966_011_250_105_1;
-const GOLDEN_SECTION_UPPER_FRACTION: f64 = 0.618_033_988_749_894_9;
-
 fn default_forgetting_curve_params() -> [f32; 8] {
     [
+        DEFAULT_PARAMETERS[23],
+        DEFAULT_PARAMETERS[24],
+        DEFAULT_PARAMETERS[25],
+        DEFAULT_PARAMETERS[26],
         DEFAULT_PARAMETERS[27],
         DEFAULT_PARAMETERS[28],
         DEFAULT_PARAMETERS[29],
         DEFAULT_PARAMETERS[30],
-        DEFAULT_PARAMETERS[31],
-        DEFAULT_PARAMETERS[32],
-        DEFAULT_PARAMETERS[33],
-        DEFAULT_PARAMETERS[34],
     ]
 }
 
@@ -157,8 +154,9 @@ fn loss_with_curve(
     count: &Array1<f64>,
     init_s0: f64,
     default_s0: f64,
-    params: &ForgettingCurveParams,
+    params: &[f32; 8],
 ) -> f64 {
+    let params = ForgettingCurveParams::new(params);
     let weight1 = params.base_weight1 * init_s0.powf(-params.swp1);
     let weight2 = params.base_weight2 * init_s0.powf(params.swp2);
     let weight_sum = weight1 + weight2;
@@ -183,7 +181,6 @@ fn search_parameters_for_curve(
     average_recall: f32,
     curve_params: &[f32; 8],
 ) -> (HashMap<u32, f32>, HashMap<u32, u32>, f64) {
-    let curve_params = ForgettingCurveParams::new(curve_params);
     let mut optimal_stabilities = HashMap::new();
     let mut rating_count = HashMap::new();
     let mut total_loss = 0.0;
@@ -201,30 +198,19 @@ fn search_parameters_for_curve(
         let mut low = S_MIN as f64;
         let mut high = INIT_S_MAX as f64;
         let mut optimal_s = default_s0;
-        let mut width = high - low;
-        let mut mid1 = low + width * GOLDEN_SECTION_LOWER_FRACTION;
-        let mut mid2 = low + width * GOLDEN_SECTION_UPPER_FRACTION;
-        let mut loss1 = loss_with_curve(&delta_t, &recall, &count, mid1, default_s0, &curve_params);
-        let mut loss2 = loss_with_curve(&delta_t, &recall, &count, mid2, default_s0, &curve_params);
 
         let mut iter = 0;
         while high - low > epsilon && iter < 1000 {
             iter += 1;
+            let mid1 = low + (high - low) / 3.0;
+            let mid2 = high - (high - low) / 3.0;
+            let loss1 = loss_with_curve(&delta_t, &recall, &count, mid1, default_s0, curve_params);
+            let loss2 = loss_with_curve(&delta_t, &recall, &count, mid2, default_s0, curve_params);
 
             if loss1 < loss2 {
                 high = mid2;
-                mid2 = mid1;
-                loss2 = loss1;
-                width = high - low;
-                mid1 = low + width * GOLDEN_SECTION_LOWER_FRACTION;
-                loss1 = loss_with_curve(&delta_t, &recall, &count, mid1, default_s0, &curve_params);
             } else {
                 low = mid1;
-                mid1 = mid2;
-                loss1 = loss2;
-                width = high - low;
-                mid2 = low + width * GOLDEN_SECTION_UPPER_FRACTION;
-                loss2 = loss_with_curve(&delta_t, &recall, &count, mid2, default_s0, &curve_params);
             }
 
             optimal_s = (high + low) / 2.0;
@@ -236,7 +222,7 @@ fn search_parameters_for_curve(
             &count,
             optimal_s,
             default_s0,
-            &curve_params,
+            curve_params,
         );
         total_loss += best_loss;
         optimal_stabilities.insert(*first_rating, optimal_s as f32);
@@ -341,24 +327,9 @@ pub(crate) fn initialize_parameters_fsrs7(
     average_recall: f32,
 ) -> Result<InitializationResult> {
     let dataset_for_initialization = prepare_dataset_for_initialization(fsrs_items);
-    let mut best_curve = default_forgetting_curve_params();
-    let mut best_stability = HashMap::new();
-    let mut best_rating_count = HashMap::new();
-    let mut best_loss = f64::INFINITY;
-
-    for candidate in FSRS7_FORGETTING_CURVE_CANDIDATES {
-        let (stability, rating_count, total_loss) = search_parameters_for_curve(
-            dataset_for_initialization.clone(),
-            average_recall,
-            &candidate,
-        );
-        if !stability.is_empty() && total_loss < best_loss {
-            best_loss = total_loss;
-            best_curve = candidate;
-            best_stability = stability;
-            best_rating_count = rating_count;
-        }
-    }
+    let best_curve = default_forgetting_curve_params();
+    let (best_stability, best_rating_count, _total_loss) =
+        search_parameters_for_curve(dataset_for_initialization, average_recall, &best_curve);
 
     let initial_stability = fill_initial_stabilities_fsrs7(&best_stability)?;
     Ok((initial_stability, best_curve, best_rating_count))
@@ -367,55 +338,6 @@ pub(crate) fn initialize_parameters_fsrs7(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-
-    fn ternary_reference_bucket(
-        first_rating: FirstRating,
-        data: &[AverageRecall],
-        average_recall: f32,
-        curve_params: &ForgettingCurveParams,
-    ) -> (f32, u32, f64) {
-        let epsilon = f64::EPSILON;
-        let r_s0_default: HashMap<u32, f32> = R_S0_DEFAULT_ARRAY.iter().cloned().collect();
-        let default_s0 = r_s0_default[&first_rating] as f64;
-        let delta_t = Array1::from_iter(data.iter().map(|d| d.0));
-        let count = Array1::from_iter(data.iter().map(|d| d.2));
-        let recall = {
-            let real_recall = Array1::from_iter(data.iter().map(|d| d.1));
-            (real_recall * count.clone() + average_recall as f64) / (count.clone() + 1.0)
-        };
-        let mut low = S_MIN as f64;
-        let mut high = INIT_S_MAX as f64;
-        let mut optimal_s = default_s0;
-
-        let mut iter = 0;
-        while high - low > epsilon && iter < 1000 {
-            iter += 1;
-            let mid1 = low + (high - low) / 3.0;
-            let mid2 = high - (high - low) / 3.0;
-
-            let loss1 = loss_with_curve(&delta_t, &recall, &count, mid1, default_s0, curve_params);
-            let loss2 = loss_with_curve(&delta_t, &recall, &count, mid2, default_s0, curve_params);
-
-            if loss1 < loss2 {
-                high = mid2;
-            } else {
-                low = mid1;
-            }
-
-            optimal_s = (high + low) / 2.0;
-        }
-
-        let best_loss = loss_with_curve(
-            &delta_t,
-            &recall,
-            &count,
-            optimal_s,
-            default_s0,
-            curve_params,
-        );
-        (optimal_s as f32, count.sum() as u32, best_loss)
-    }
 
     #[test]
     fn test_smooth_initial_stabilities_fsrs7_is_monotonic() {
@@ -427,65 +349,5 @@ mod tests {
     fn test_smooth_initial_stabilities_fsrs7_clamps_bounds() {
         let actual = smooth_initial_stabilities_fsrs7([0.0, 0.00005, 0.001, 200.0]).unwrap();
         assert_eq!(actual, [0.0001, 0.0001, 0.001, 100.0]);
-    }
-
-    #[test]
-    fn test_loss_with_curve_matches_reference_value() {
-        let delta_t = Array1::from_vec(vec![1.0, 3.0, 12.0]);
-        let recall = Array1::from_vec(vec![0.8, 0.6, 0.25]);
-        let count = Array1::from_vec(vec![10.0, 5.0, 4.0]);
-        let params = FSRS7_FORGETTING_CURVE_CANDIDATES[0];
-
-        let actual = loss_with_curve(
-            &delta_t,
-            &recall,
-            &count,
-            2.5,
-            1.2,
-            &ForgettingCurveParams::new(&params),
-        );
-
-        assert!((actual - 14.793305051722285).abs() < 1e-12);
-    }
-
-    #[test]
-    fn test_golden_section_search_matches_ternary_reference() {
-        let dataset = HashMap::from([
-            (
-                1,
-                vec![(1.0, 0.35, 9.0), (4.0, 0.28, 5.0), (16.0, 0.18, 3.0)],
-            ),
-            (
-                2,
-                vec![(1.0, 0.62, 12.0), (7.0, 0.45, 6.0), (21.0, 0.30, 4.0)],
-            ),
-            (
-                3,
-                vec![(2.0, 0.78, 14.0), (10.0, 0.62, 8.0), (32.0, 0.42, 5.0)],
-            ),
-            (
-                4,
-                vec![(3.0, 0.92, 11.0), (18.0, 0.74, 7.0), (45.0, 0.56, 4.0)],
-            ),
-        ]);
-        let params = FSRS7_FORGETTING_CURVE_CANDIDATES[3];
-
-        let (actual_stability, actual_count, actual_loss) =
-            search_parameters_for_curve(dataset.clone(), 0.82, &params);
-        let curve_params = ForgettingCurveParams::new(&params);
-        let mut expected_loss = 0.0;
-
-        for (rating, data) in &dataset {
-            let (expected_stability, expected_count, expected_bucket_loss) =
-                ternary_reference_bucket(*rating, data, 0.82, &curve_params);
-            expected_loss += expected_bucket_loss;
-            assert_eq!(actual_count[rating], expected_count);
-            assert!(
-                (actual_stability[rating] - expected_stability).abs() < 1e-4,
-                "rating {rating}: actual {}, expected {expected_stability}",
-                actual_stability[rating]
-            );
-        }
-        assert!((actual_loss - expected_loss).abs() < 1e-8);
     }
 }

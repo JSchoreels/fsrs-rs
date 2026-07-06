@@ -1,4 +1,5 @@
 #![allow(clippy::single_range_in_vec_init)]
+#![allow(dead_code, unused_imports)]
 
 mod analytic_v7;
 mod batch_shuffle;

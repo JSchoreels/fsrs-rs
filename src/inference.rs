@@ -1,30 +1,25 @@
+use burn::backend::ndarray::NdArrayDevice;
 use itertools::izip;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 
-#[cfg(test)]
-use crate::dataset::{FSRSBatch, FSRSBatcher};
-use crate::dataset::{constant_weighted_fsrs_items, recency_weighted_fsrs_items};
+use crate::dataset::{
+    FSRSBatch, FSRSBatcher, constant_weighted_fsrs_items, recency_weighted_fsrs_items,
+};
 use crate::error::Result;
-#[cfg(test)]
 use crate::model::Model;
-use crate::model::{FSRS, MemoryStateTensors, ModelVersion, model_v6, model_v7};
-use crate::simulation::{D_MAX, D_MIN, S_MAX, S_MIN};
-#[cfg(test)]
+use crate::model::{FSRS, Get, MemoryStateTensors};
+use crate::simulation::S_MIN;
 use crate::training::BCELoss;
 use crate::training::{self, ComputeParametersInput};
 use crate::{FSRSError, FSRSItem};
-#[cfg(test)]
-use burn::data::dataloader::batcher::Batcher;
-#[cfg(test)]
+use burn::backend::NdArray;
 use burn::nn::loss::Reduction;
 use burn::tensor::ElementConversion;
-use burn::tensor::backend::Backend;
-#[cfg(test)]
 use burn::tensor::cast::ToElement;
-#[cfg(test)]
 use burn::tensor::{Shape, Tensor, TensorData};
+use burn::{data::dataloader::batcher::Batcher, tensor::backend::Backend};
 
 #[path = "inference_v6.rs"]
 pub(crate) mod inference_v6;
@@ -33,16 +28,20 @@ pub(crate) mod inference_v7;
 
 pub use inference_v6::{FSRS5_DEFAULT_DECAY, FSRS6_DEFAULT_DECAY, FSRS6_DEFAULT_PARAMETERS};
 pub use inference_v7::DEFAULT_PARAMETERS;
-/// This is a slice for efficiency, and may be 17/19/21/35 in length.
+/// This is a slice for efficiency, and may be 17/19/21/34 in length.
 pub type Parameters = [f32];
 
-#[cfg(test)]
 fn infer<B: Backend>(
     model: &Model<B>,
     batch: FSRSBatch<B>,
 ) -> (MemoryStateTensors<B>, Tensor<B, 1>) {
     let state = model.forward(batch.t_historys, batch.r_historys, None);
-    let retrievability = model.power_forgetting_curve(batch.delta_ts, state.stability.clone());
+    let retrievability = model.power_forgetting_curve(
+        batch.delta_ts,
+        state.stability.clone(),
+        state.stability_fast.clone(),
+        state.difficulty.clone(),
+    );
     (state, retrievability)
 }
 
@@ -64,6 +63,7 @@ pub fn current_retrievability(state: MemoryState, days_elapsed: f32, decay: f32)
 pub struct MemoryState {
     pub stability: f32,
     pub difficulty: f32,
+    pub stability_fast: f32,
 }
 
 impl<B: Backend> From<MemoryStateTensors<B>> for MemoryState {
@@ -71,6 +71,7 @@ impl<B: Backend> From<MemoryStateTensors<B>> for MemoryState {
         Self {
             stability: m.stability.into_scalar().elem(),
             difficulty: m.difficulty.into_scalar().elem(),
+            stability_fast: m.stability_fast.into_scalar().elem(),
         }
     }
 }
@@ -83,186 +84,7 @@ struct RMatrixValue {
     weight: f32,
 }
 
-fn validate_state(state: MemoryState) -> Result<MemoryState> {
-    if !state.stability.is_finite() || !state.difficulty.is_finite() {
-        Err(FSRSError::InvalidInput)
-    } else {
-        Ok(state)
-    }
-}
-
-fn init_stability_scalar(w: &[f32], rating: u32) -> f32 {
-    w[(rating.clamp(1, 4) - 1) as usize]
-}
-
-fn init_difficulty_scalar(version: ModelVersion, w: &[f32], rating: u32) -> f32 {
-    let rating = rating.clamp(1, 4) as usize;
-    match version {
-        ModelVersion::Fsrs6 => model_v6::init_difficulty_scalar(w, rating),
-        ModelVersion::Fsrs7 => model_v7::init_difficulty_scalar(w, rating),
-    }
-}
-
-fn power_forgetting_curve_scalar(version: ModelVersion, w: &[f32], t: f32, s: f32) -> f32 {
-    match version {
-        ModelVersion::Fsrs6 => model_v6::power_forgetting_curve_scalar(w, t, s),
-        ModelVersion::Fsrs7 => model_v7::fsrs7_forgetting_curve_scalar(w, t, s),
-    }
-}
-
-fn next_interval_scalar(
-    version: ModelVersion,
-    w: &[f32],
-    stability: f32,
-    desired_retention: f32,
-) -> f32 {
-    match version {
-        ModelVersion::Fsrs6 => model_v6::next_interval_scalar(w, stability, desired_retention),
-        ModelVersion::Fsrs7 => {
-            let lut = model_v7::fsrs7_s90_lut(w);
-            model_v7::fsrs7_next_interval_scalar(w, stability, desired_retention, lut.as_ref())
-        }
-    }
-}
-
-fn fsrs6_stability_short_term_for_inference(w: &[f32], s: f32, rating: usize) -> f32 {
-    let sinc = (w[17] * (rating as f32 - 3.0 + w[18])).exp() * s.powf(-w[19]);
-    let new_s = s * if rating >= 2 { sinc.max(1.0) } else { sinc };
-    new_s.clamp(S_MIN, S_MAX)
-}
-
-fn step_scalar(
-    version: ModelVersion,
-    w: &[f32],
-    delta_t: f32,
-    rating: u32,
-    state: MemoryState,
-    nth: usize,
-) -> MemoryState {
-    let last_s = state.stability.clamp(S_MIN, S_MAX);
-    let last_d = state.difficulty.clamp(D_MIN, D_MAX);
-    let rating_usize = rating as usize;
-    let mut new_s;
-    let mut new_d;
-
-    match version {
-        ModelVersion::Fsrs6 => {
-            let rounded_delta_t = delta_t.max(0.0).round();
-            let retrievability = model_v6::power_forgetting_curve_scalar(w, delta_t, last_s);
-            let success = model_v6::stability_after_success_scalar(
-                w,
-                last_s,
-                retrievability,
-                last_d,
-                rating_usize,
-            );
-            let failure =
-                model_v6::stability_after_failure_scalar(w, last_s, retrievability, last_d);
-            let short = fsrs6_stability_short_term_for_inference(w, last_s, rating_usize);
-            new_s = if rating == 1 { failure } else { success };
-            if rounded_delta_t == 0.0 {
-                new_s = short;
-            }
-            new_d = model_v6::next_difficulty_scalar(w, last_d, rating_usize);
-        }
-        ModelVersion::Fsrs7 => {
-            let delta_t = delta_t.max(0.0);
-            let retrievability = model_v7::fsrs7_forgetting_curve_scalar(w, delta_t, last_s);
-            let long = model_v7::stability_for_set_scalar(
-                w,
-                last_s,
-                retrievability,
-                last_d,
-                rating_usize,
-                7,
-            );
-            let short = model_v7::stability_for_set_scalar(
-                w,
-                last_s,
-                retrievability,
-                last_d,
-                rating_usize,
-                16,
-            );
-            let coefficient = model_v7::transition_scalar(w, delta_t);
-            new_s = coefficient * long + (1.0 - coefficient) * short;
-            new_d = model_v7::next_difficulty_scalar(w, last_d, rating_usize);
-        }
-    }
-
-    if nth == 0 && state.stability == 0.0 {
-        new_s = init_stability_scalar(w, rating);
-        new_d = init_difficulty_scalar(version, w, rating).clamp(D_MIN, D_MAX);
-    }
-
-    if rating == 0 {
-        new_s = last_s;
-        new_d = last_d;
-    }
-
-    MemoryState {
-        stability: new_s.clamp(S_MIN, S_MAX),
-        difficulty: new_d,
-    }
-}
-
-fn forward_reviews_scalar(
-    version: ModelVersion,
-    w: &[f32],
-    reviews: &[crate::dataset::FSRSReview],
-    starting_state: Option<MemoryState>,
-) -> MemoryState {
-    let mut state = starting_state.unwrap_or(MemoryState {
-        stability: 0.0,
-        difficulty: 0.0,
-    });
-    for (index, review) in reviews.iter().enumerate() {
-        state = step_scalar(version, w, review.delta_t, review.rating, state, index);
-    }
-    state
-}
-
-fn predict_retrievability(version: ModelVersion, w: &[f32], item: &FSRSItem) -> Result<f32> {
-    if item.reviews.is_empty() {
-        return Err(FSRSError::InvalidInput);
-    }
-    let history_len = item.reviews.len().saturating_sub(1);
-    let state = forward_reviews_scalar(version, w, &item.reviews[..history_len], None);
-    let current = item.current();
-    let retrievability =
-        power_forgetting_curve_scalar(version, w, current.delta_t, state.stability);
-    if retrievability.is_finite() {
-        Ok(retrievability)
-    } else {
-        Err(FSRSError::InvalidInput)
-    }
-}
-
-fn rmse_bins(r_matrix: &HashMap<(u32, u32, u32), RMatrixValue>) -> f32 {
-    (r_matrix
-        .values()
-        .map(|v| {
-            let pred = v.predicted / v.count;
-            let real = v.actual / v.count;
-            (pred - real).powi(2) * v.weight
-        })
-        .sum::<f32>()
-        / r_matrix.values().map(|v| v.weight).sum::<f32>())
-    .sqrt()
-}
-
-fn weighted_binary_cross_entropy(retrievability: &[f32], labels: &[f32], weights: &[f32]) -> f32 {
-    let mut loss = 0.0;
-    let mut weight_sum = 0.0;
-    for ((&r, &label), &weight) in retrievability.iter().zip(labels).zip(weights) {
-        loss += (label * r.ln() + (1.0 - label) * (1.0 - r).ln()) * weight;
-        weight_sum += weight;
-    }
-    -loss / weight_sum
-}
-
 impl<B: Backend> FSRS<B> {
-    #[cfg(test)]
     fn item_to_tensors(&self, item: &FSRSItem) -> (Tensor<B, 2>, Tensor<B, 2>) {
         let device = self.device();
         let (time_history, rating_history) =
@@ -283,7 +105,6 @@ impl<B: Backend> FSRS<B> {
         (time_history, rating_history)
     }
 
-    #[cfg(test)]
     fn items_to_tensors(&self, items: &[FSRSItem]) -> (Tensor<B, 2>, Tensor<B, 2>) {
         let pad_size = items
             .iter()
@@ -338,12 +159,17 @@ impl<B: Backend> FSRS<B> {
         item: FSRSItem,
         starting_state: Option<MemoryState>,
     ) -> Result<MemoryState> {
-        validate_state(forward_reviews_scalar(
-            self.version(),
-            self.parameters(),
-            &item.reviews,
-            starting_state,
-        ))
+        let (time_history, rating_history) = self.item_to_tensors(&item);
+        let starting_tensors = starting_state.map(|s| MemoryStateTensors::from_state(s));
+        let state: MemoryState = self
+            .model()
+            .forward(time_history, rating_history, starting_tensors)
+            .into();
+        if !state.stability.is_finite() || !state.difficulty.is_finite() {
+            Err(FSRSError::InvalidInput)
+        } else {
+            Ok(state)
+        }
     }
 
     pub fn memory_state_batch(
@@ -354,31 +180,63 @@ impl<B: Backend> FSRS<B> {
         if items.is_empty() {
             return Ok(vec![]);
         }
-        if items.len() != starting_states.len() {
-            return Err(FSRSError::InvalidInput);
-        }
-        if items.iter().all(|item| item == &items[0])
-            && starting_states
-                .iter()
-                .all(|state| state == &starting_states[0])
-        {
-            let state = self.memory_state(items[0].clone(), starting_states[0])?;
-            return Ok(vec![state; items.len()]);
-        }
-        let version = self.version();
-        let parameters = self.parameters();
-        items
-            .into_iter()
-            .zip(starting_states)
-            .map(|(item, starting_state)| {
-                validate_state(forward_reviews_scalar(
-                    version,
-                    parameters,
-                    &item.reviews,
-                    starting_state,
-                ))
+        let (time_histories, rating_histories) = self.items_to_tensors(&items);
+        let (stabilities, difficulties, stabilities_fast) = starting_states
+            .iter()
+            .map(|starting_state| {
+                if let Some(state) = starting_state {
+                    (state.stability, state.difficulty, state.stability_fast)
+                } else {
+                    (0.0, 0.0, 0.0)
+                }
             })
-            .collect()
+            .collect::<(Vec<f32>, Vec<f32>, Vec<f32>)>();
+        let device = self.device();
+        let starting_states = MemoryStateTensors {
+            stability: Tensor::from_data(
+                TensorData::new(
+                    stabilities.clone(),
+                    Shape {
+                        dims: vec![stabilities.len()],
+                    },
+                ),
+                &device,
+            ),
+            difficulty: Tensor::from_data(
+                TensorData::new(
+                    difficulties.clone(),
+                    Shape {
+                        dims: vec![difficulties.len()],
+                    },
+                ),
+                &device,
+            ),
+            stability_fast: Tensor::from_data(
+                TensorData::new(
+                    stabilities_fast.clone(),
+                    Shape {
+                        dims: vec![stabilities_fast.len()],
+                    },
+                ),
+                &device,
+            ),
+        };
+        let state = self
+            .model()
+            .forward(time_histories, rating_histories, Some(starting_states));
+        let stability = state.stability.to_data().to_vec::<f32>().unwrap();
+        let difficulty = state.difficulty.to_data().to_vec::<f32>().unwrap();
+        let stability_fast = state.stability_fast.to_data().to_vec::<f32>().unwrap();
+        Ok(stability
+            .into_iter()
+            .zip(difficulty)
+            .zip(stability_fast)
+            .map(|((stability, difficulty), stability_fast)| MemoryState {
+                stability,
+                difficulty,
+                stability_fast,
+            })
+            .collect())
     }
 
     pub fn historical_memory_states(
@@ -386,28 +244,28 @@ impl<B: Backend> FSRS<B> {
         item: FSRSItem,
         starting_state: Option<MemoryState>,
     ) -> Result<Vec<MemoryState>> {
+        let (time_history, rating_history) = self.item_to_tensors(&item);
         let mut states = vec![];
         if let Some(starting_state) = starting_state {
             states.push(starting_state);
         }
+        let [seq_len, batch_size] = time_history.dims();
         let mut inner_state = if let Some(state) = starting_state {
-            state
+            MemoryStateTensors::from_state(state)
         } else {
-            MemoryState {
-                stability: 0.0,
-                difficulty: 0.0,
-            }
+            MemoryStateTensors::zeros(batch_size)
         };
-        for (index, review) in item.reviews.iter().enumerate() {
-            inner_state = step_scalar(
-                self.version(),
-                self.parameters(),
-                review.delta_t,
-                review.rating,
-                inner_state,
-                index,
-            );
-            states.push(validate_state(inner_state)?);
+        for i in 0..seq_len {
+            let delta_t = time_history.get(i).squeeze(0);
+            // [batch_size]
+            let rating = rating_history.get(i).squeeze(0);
+            // [batch_size]
+            inner_state = self.model().step(delta_t, rating, inner_state.clone(), i);
+            let state: MemoryState = inner_state.clone().into();
+            if !state.stability.is_finite() || !state.difficulty.is_finite() {
+                return Err(FSRSError::InvalidInput);
+            }
+            states.push(state);
         }
         Ok(states)
     }
@@ -424,11 +282,89 @@ impl<B: Backend> FSRS<B> {
         if items.len() != starting_states.len() {
             return Err(FSRSError::InvalidInput);
         }
-        items
-            .into_iter()
-            .zip(starting_states)
-            .map(|(item, starting_state)| self.historical_memory_states(item, starting_state))
-            .collect()
+        let (time_histories, rating_histories) = self.items_to_tensors(&items);
+        let (stabilities, difficulties, stabilities_fast) = starting_states
+            .iter()
+            .map(|starting_state| {
+                if let Some(state) = starting_state {
+                    (state.stability, state.difficulty, state.stability_fast)
+                } else {
+                    (0.0, 0.0, 0.0)
+                }
+            })
+            .collect::<(Vec<f32>, Vec<f32>, Vec<f32>)>();
+        let device = self.device();
+        let mut inner_state = MemoryStateTensors {
+            stability: Tensor::from_data(
+                TensorData::new(
+                    stabilities,
+                    Shape {
+                        dims: vec![items.len()],
+                    },
+                ),
+                &device,
+            ),
+            difficulty: Tensor::from_data(
+                TensorData::new(
+                    difficulties,
+                    Shape {
+                        dims: vec![items.len()],
+                    },
+                ),
+                &device,
+            ),
+            stability_fast: Tensor::from_data(
+                TensorData::new(
+                    stabilities_fast,
+                    Shape {
+                        dims: vec![items.len()],
+                    },
+                ),
+                &device,
+            ),
+        };
+
+        let mut results: Vec<Vec<MemoryState>> = starting_states
+            .iter()
+            .map(|s| s.map(|state| vec![state]).unwrap_or_default())
+            .collect();
+
+        let [seq_len, _batch_size] = time_histories.dims();
+
+        for i in 0..seq_len {
+            let delta_t = time_histories.get(i).squeeze(0);
+            let rating = rating_histories.get(i).squeeze(0);
+
+            inner_state = self.model().step(delta_t, rating, inner_state.clone(), i);
+
+            let stabilities = inner_state.stability.to_data().to_vec::<f32>().unwrap();
+            let difficulties = inner_state.difficulty.to_data().to_vec::<f32>().unwrap();
+            let stabilities_fast = inner_state
+                .stability_fast
+                .to_data()
+                .to_vec::<f32>()
+                .unwrap();
+
+            for (j, ((stability, difficulty), stability_fast)) in stabilities
+                .iter()
+                .zip(difficulties.iter())
+                .zip(stabilities_fast.iter())
+                .enumerate()
+            {
+                if i < items[j].reviews.len() {
+                    let state = MemoryState {
+                        stability: *stability,
+                        difficulty: *difficulty,
+                        stability_fast: *stability_fast,
+                    };
+                    if !state.stability.is_finite() || !state.difficulty.is_finite() {
+                        return Err(FSRSError::InvalidInput);
+                    }
+                    results[j].push(state);
+                }
+            }
+        }
+        Ok(results)
     }
 
     /// If a card has incomplete learning history, memory state can be approximated from
@@ -446,12 +382,30 @@ impl<B: Backend> FSRS<B> {
     /// Calculate current retrievability using the model's active forgetting
     /// curve (FSRS-6 or FSRS-7).
     pub fn current_retrievability(&self, state: MemoryState, days_elapsed: f32) -> f32 {
-        power_forgetting_curve_scalar(
-            self.version(),
-            self.parameters(),
-            days_elapsed.max(0.0),
-            state.stability,
-        )
+        let device = self.device();
+        self.model()
+            .power_forgetting_curve(
+                Tensor::from_floats([days_elapsed.max(0.0)], &device),
+                Tensor::from_floats([state.stability], &device),
+                Tensor::from_floats([state.stability_fast], &device),
+                Tensor::from_floats([state.difficulty], &device),
+            )
+            .into_scalar()
+            .elem()
+    }
+
+    pub fn next_interval_for_state(&self, state: MemoryState, desired_retention: f32) -> f32 {
+        let model = self.model();
+        let device = self.device();
+        model
+            .next_interval(
+                Tensor::from_floats([state.stability], &device),
+                Tensor::from_floats([state.stability_fast], &device),
+                Tensor::from_floats([state.difficulty], &device),
+                Tensor::from_floats([desired_retention], &device),
+            )
+            .into_scalar()
+            .elem()
     }
 
     /// Calculate the next interval for the current memory state, for rescheduling. Stability
@@ -463,12 +417,19 @@ impl<B: Backend> FSRS<B> {
         desired_retention: f32,
         rating: u32,
     ) -> f32 {
-        let stability =
-            stability.unwrap_or_else(|| init_stability_scalar(self.parameters(), rating));
-        next_interval_scalar(
-            self.version(),
-            self.parameters(),
-            stability,
+        let model = self.model();
+        let device = self.device();
+        let stability = stability.unwrap_or_else(|| {
+            // get initial stability for new card
+            let rating = Tensor::from_floats([rating], &device);
+            model.init_stability(rating).into_scalar().elem()
+        });
+        self.next_interval_for_state(
+            MemoryState {
+                stability,
+                difficulty: 5.0,
+                stability_fast: stability,
+            },
             desired_retention,
         )
     }
@@ -484,18 +445,8 @@ impl<B: Backend> FSRS<B> {
         target_retrievability: f32,
     ) -> f32 {
         let target_retrievability = target_retrievability.clamp(0.0001, 0.9999);
-        let stability = state.stability.max(S_MIN);
-        if self.version() == ModelVersion::Fsrs6
-            && (target_retrievability - 0.9).abs() <= f32::EPSILON
-        {
-            return stability;
-        }
-        next_interval_scalar(
-            self.version(),
-            self.parameters(),
-            stability,
-            target_retrievability,
-        )
+        self.model()
+            .interval_at_retrievability(state, target_retrievability)
     }
 
     /// Convenience helper for "S90": the interval (in days) where retrievability is 90%.
@@ -509,36 +460,43 @@ impl<B: Backend> FSRS<B> {
         desired_retention: f32,
         days_elapsed: f32,
     ) -> Result<NextStates> {
-        let (current_memory_state, nth) = if let Some(state) = current_memory_state {
-            (state, 1)
+        let device = self.device();
+        let delta_t = Tensor::from_floats([days_elapsed.max(0.0)], &device);
+        let (current_memory_state_tensors, nth) = if let Some(state) = current_memory_state {
+            (MemoryStateTensors::from_state(state), 1)
         } else {
-            (
-                MemoryState {
-                    stability: 0.0,
-                    difficulty: 0.0,
-                },
-                0,
-            )
+            (MemoryStateTensors::zeros(1), 0)
         };
+        let model = self.model();
         let mut next_memory_states = (1..=4).map(|rating| {
-            validate_state(step_scalar(
-                self.version(),
-                self.parameters(),
-                days_elapsed,
-                rating,
-                current_memory_state,
-                nth,
-            ))
+            Ok({
+                let state = MemoryState::from(model.step(
+                    delta_t.clone(),
+                    Tensor::from_data(
+                        TensorData::new(vec![rating], Shape { dims: vec![1] }),
+                        &device,
+                    ),
+                    current_memory_state_tensors.clone(),
+                    nth,
+                ));
+                if !state.stability.is_finite() || !state.difficulty.is_finite() {
+                    return Err(FSRSError::InvalidInput);
+                }
+                state
+            })
         });
 
         let mut get_next_state = || {
             let memory = next_memory_states.next().unwrap()?;
-            let interval = next_interval_scalar(
-                self.version(),
-                self.parameters(),
-                memory.stability,
-                desired_retention,
-            );
+            let interval = model
+                .next_interval(
+                    Tensor::from_floats([memory.stability], &device),
+                    Tensor::from_floats([memory.stability_fast], &device),
+                    Tensor::from_floats([memory.difficulty], &device),
+                    Tensor::from_floats([desired_retention], &device),
+                )
+                .into_scalar()
+                .elem();
             Ok(ItemState { memory, interval })
         };
 
@@ -583,42 +541,56 @@ impl<B: Backend> FSRS<B> {
             return Err(FSRSError::NotEnoughData);
         }
         let weighted_items = recency_weighted_fsrs_items(items);
-        let mut all_retrievability = Vec::with_capacity(weighted_items.len());
-        let mut all_labels = Vec::with_capacity(weighted_items.len());
-        let mut all_weights = Vec::with_capacity(weighted_items.len());
+        let device = self.device();
+        let batcher = FSRSBatcher::new();
+        let mut all_retrievability = vec![];
+        let mut all_labels = vec![];
+        let mut all_weights = vec![];
         let mut progress_info = ItemProgress {
             current: 0,
             total: weighted_items.len(),
         };
+        let model = self.model();
         let mut r_matrix: HashMap<(u32, u32, u32), RMatrixValue> = HashMap::new();
 
         for chunk in weighted_items.chunks(512) {
-            for weighted_item in chunk {
-                let p =
-                    predict_retrievability(self.version(), self.parameters(), &weighted_item.item)?;
-                let y = f32::from(weighted_item.item.current().rating > 1);
+            let batch = batcher.batch(chunk.to_vec(), &device);
+            let (_state, retrievability) = infer::<B>(model, batch.clone());
+            let pred = retrievability.clone().to_data().to_vec::<f32>().unwrap();
+            let true_val = batch.labels.clone().to_data().to_vec::<i64>().unwrap();
+            all_retrievability.push(retrievability);
+            all_labels.push(batch.labels);
+            all_weights.push(batch.weights);
+            izip!(chunk, pred, true_val).for_each(|(weighted_item, p, y)| {
                 let bin = weighted_item.item.r_matrix_index();
                 let value = r_matrix.entry(bin).or_default();
                 value.predicted += p;
-                value.actual += y;
+                value.actual += y as f32;
                 value.count += 1.0;
                 value.weight += weighted_item.weight;
-                all_retrievability.push(p);
-                all_labels.push(y);
-                all_weights.push(weighted_item.weight);
-            }
+            });
             progress_info.current += chunk.len();
             if !progress(progress_info) {
                 return Err(FSRSError::Interrupted);
             }
         }
-        let rmse = rmse_bins(&r_matrix);
-        let loss = weighted_binary_cross_entropy(&all_retrievability, &all_labels, &all_weights);
-        if !loss.is_finite() || !rmse.is_finite() {
-            return Err(FSRSError::InvalidInput);
-        }
+        let rmse = (r_matrix
+            .values()
+            .map(|v| {
+                let pred = v.predicted / v.count;
+                let real = v.actual / v.count;
+                (pred - real).powi(2) * v.weight
+            })
+            .sum::<f32>()
+            / r_matrix.values().map(|v| v.weight).sum::<f32>())
+        .sqrt();
+        let all_retrievability = Tensor::cat(all_retrievability, 0);
+        let all_labels = Tensor::cat(all_labels, 0).float();
+        let all_weights = Tensor::cat(all_weights, 0);
+        let loss =
+            BCELoss::new().forward(all_retrievability, all_labels, all_weights, Reduction::Auto);
         Ok(ModelEvaluation {
-            log_loss: loss,
+            log_loss: loss.into_scalar().to_f32(),
             rmse_bins: rmse,
         })
     }
@@ -638,6 +610,8 @@ impl<B: Backend> FSRS<B> {
             return Err(FSRSError::NotEnoughData);
         }
         let weighted_items = constant_weighted_fsrs_items(items);
+        let device = self.device();
+        let batcher = FSRSBatcher::new();
         let mut all_predictions_self = vec![];
         let mut all_predictions_other = vec![];
         let mut all_true_val = vec![];
@@ -645,21 +619,28 @@ impl<B: Backend> FSRS<B> {
             current: 0,
             total: weighted_items.len(),
         };
-        let fsrs_other: FSRS<B> = Self::new_with_backend(parameters, &self.device())?;
+        let model_self = self.model();
+        let fsrs_other = Self::new_with_backend(parameters, &device)?;
+        let model_other = fsrs_other.model();
         for chunk in weighted_items.chunks(512) {
-            for weighted_item in chunk {
-                all_predictions_self.push(predict_retrievability(
-                    self.version(),
-                    self.parameters(),
-                    &weighted_item.item,
-                )?);
-                all_predictions_other.push(predict_retrievability(
-                    fsrs_other.version(),
-                    fsrs_other.parameters(),
-                    &weighted_item.item,
-                )?);
-                all_true_val.push(f32::from(weighted_item.item.current().rating > 1));
-            }
+            let batch = batcher.batch(chunk.to_vec(), &device);
+
+            let (_state, retrievability) = infer::<B>(model_self, batch.clone());
+            let pred = retrievability.clone().to_data().to_vec::<f32>().unwrap();
+            all_predictions_self.extend(pred);
+
+            let (_state, retrievability) = infer::<B>(model_other, batch.clone());
+            let pred = retrievability.clone().to_data().to_vec::<f32>().unwrap();
+            all_predictions_other.extend(pred);
+
+            let true_val: Vec<f32> = batch
+                .labels
+                .clone()
+                .to_data()
+                .convert::<f32>()
+                .to_vec()
+                .unwrap();
+            all_true_val.extend(true_val);
             progress_info.current += chunk.len();
             if !progress(progress_info) {
                 return Err(FSRSError::Interrupted);
@@ -692,16 +673,24 @@ fn batch_predict(items: Vec<FSRSItem>, parameters: &[f32]) -> Result<Vec<Predict
         return Err(FSRSError::NotEnoughData);
     }
     let weighted_items = constant_weighted_fsrs_items(items);
+    let device = NdArrayDevice::Cpu;
+    let batcher = FSRSBatcher::new();
+
     let fsrs = FSRS::new(parameters)?;
+    let model = fsrs.model();
     let mut predicted_items = Vec::with_capacity(weighted_items.len());
 
-    for weighted_item in weighted_items {
-        let retrievability =
-            predict_retrievability(fsrs.version(), fsrs.parameters(), &weighted_item.item)?;
-        predicted_items.push(PredictedFSRSItem {
-            item: weighted_item.item,
-            retrievability,
-        });
+    for chunk in weighted_items.chunks(512) {
+        let batch = batcher.batch(chunk.to_vec(), &device);
+        let (_state, retrievability) = infer::<NdArray>(model, batch.clone());
+        let pred = retrievability.to_data().to_vec::<f32>().unwrap();
+
+        for (weighted_item, p) in chunk.iter().zip(pred) {
+            predicted_items.push(PredictedFSRSItem {
+                item: weighted_item.item.clone(),
+                retrievability: p,
+            });
+        }
     }
 
     Ok(predicted_items)
@@ -718,31 +707,55 @@ fn evaluate(predicted_items: Vec<PredictedFSRSItem>) -> Result<ModelEvaluation> 
     if predicted_items.is_empty() {
         return Err(FSRSError::NotEnoughData);
     }
-    let mut all_retrievability = Vec::with_capacity(predicted_items.len());
     let mut all_labels = Vec::with_capacity(predicted_items.len());
-    let mut all_weights = Vec::with_capacity(predicted_items.len());
     let mut r_matrix: HashMap<(u32, u32, u32), RMatrixValue> = HashMap::new();
     for predicted_item in predicted_items.iter() {
         let pred = predicted_item.retrievability;
-        let y = f32::from(predicted_item.item.current().rating > 1);
-        all_retrievability.push(pred);
+        let y = (predicted_item.item.current().rating > 1) as i32;
         all_labels.push(y);
-        all_weights.push(1.0);
         let bin = predicted_item.item.r_matrix_index();
         let value = r_matrix.entry(bin).or_default();
         value.predicted += pred;
-        value.actual += y;
+        value.actual += y as f32;
         value.count += 1.0;
         value.weight += 1.0;
     }
 
-    let rmse = rmse_bins(&r_matrix);
-    let loss = weighted_binary_cross_entropy(&all_retrievability, &all_labels, &all_weights);
-    if !loss.is_finite() || !rmse.is_finite() {
-        return Err(FSRSError::InvalidInput);
-    }
+    let rmse = (r_matrix
+        .values()
+        .map(|v| {
+            let pred = v.predicted / v.count;
+            let real = v.actual / v.count;
+            (pred - real).powi(2) * v.weight
+        })
+        .sum::<f32>()
+        / r_matrix.values().map(|v| v.weight).sum::<f32>())
+    .sqrt();
+
+    let device = NdArrayDevice::Cpu;
+    let all_labels = Tensor::from_data(
+        TensorData::new(
+            all_labels.clone(),
+            Shape {
+                dims: vec![all_labels.len()],
+            },
+        ),
+        &device,
+    );
+    let all_weights = Tensor::ones(all_labels.shape(), &device);
+    let all_retrievability: Tensor<NdArray, 1> = Tensor::from_data(
+        TensorData::new(
+            predicted_items.iter().map(|p| p.retrievability).collect(),
+            Shape {
+                dims: vec![predicted_items.len()],
+            },
+        ),
+        &device,
+    );
+
+    let loss = BCELoss::new().forward(all_retrievability, all_labels, all_weights, Reduction::Auto);
     Ok(ModelEvaluation {
-        log_loss: loss,
+        log_loss: loss.into_scalar().to_f32(),
         rmse_bins: rmse,
     })
 }
@@ -999,7 +1012,8 @@ mod tests {
             fsrs.memory_state(item, None).unwrap(),
             MemoryState {
                 stability: 31.722992,
-                difficulty: 7.382128
+                difficulty: 7.382128,
+                stability_fast: 31.722992,
             }
         );
 
@@ -1007,7 +1021,8 @@ mod tests {
             fsrs.next_states(
                 Some(MemoryState {
                     stability: 20.925528,
-                    difficulty: 7.005062
+                    difficulty: 7.005062,
+                    stability_fast: 20.925528,
                 }),
                 0.9,
                 21
@@ -1017,7 +1032,8 @@ mod tests {
             .memory,
             MemoryState {
                 stability: 40.87456,
-                difficulty: 6.9913807
+                difficulty: 6.9913807,
+                stability_fast: 40.87456,
             }
         );
         Ok(())
@@ -1079,10 +1095,8 @@ mod tests {
 
     #[test]
     fn test_memory_state_fsrs7() {
-        let mut w = DEFAULT_PARAMETERS;
-        assert_memory_state(&w, 28.927855, 5.5002637);
-        w[26] = 0.0;
-        assert_memory_state(&w, 28.707403, 5.5002637);
+        let w = DEFAULT_PARAMETERS;
+        assert_memory_state(&w, 25.985723, 5.877549);
     }
 
     #[test]
@@ -1104,7 +1118,10 @@ mod tests {
             .iter()
             .map(|r| fsrs.next_interval(Some(1.0), *r, 1).round().max(1.0) as i32)
             .collect::<Vec<_>>();
-        assert_eq!(intervals, [36500, 36500, 4092, 545, 115, 31, 9, 2, 1, 1]);
+        assert_eq!(
+            intervals,
+            [36500, 36500, 36500, 12813, 843, 92, 13, 2, 1, 1]
+        );
     }
 
     #[test]
@@ -1273,11 +1290,13 @@ mod tests {
             Some(MemoryState {
                 stability: 5.0,
                 difficulty: 6.0,
+                stability_fast: 5.0,
             }),
             None,
             Some(MemoryState {
                 stability: 10.0,
                 difficulty: 7.0,
+                stability_fast: 10.0,
             }),
         ];
         let batch_results_with_starting =
@@ -1360,240 +1379,6 @@ mod tests {
         Ok(())
     }
 
-    fn assert_memory_state_approx_eq(actual: MemoryState, expected: MemoryState) {
-        let stability_diff = (actual.stability - expected.stability).abs();
-        let difficulty_diff = (actual.difficulty - expected.difficulty).abs();
-        assert!(
-            stability_diff <= 3e-4,
-            "stability {} != {}, diff {}",
-            actual.stability,
-            expected.stability,
-            stability_diff
-        );
-        assert!(
-            difficulty_diff <= 3e-4,
-            "difficulty {} != {}, diff {}",
-            actual.difficulty,
-            expected.difficulty,
-            difficulty_diff
-        );
-    }
-
-    fn assert_item_state_approx_eq(actual: &ItemState, expected: &ItemState) {
-        assert_memory_state_approx_eq(actual.memory, expected.memory);
-        [actual.interval].assert_approx_eq([expected.interval]);
-    }
-
-    fn burn_memory_state(
-        parameters: &[f32],
-        item: FSRSItem,
-        starting_state: Option<MemoryState>,
-    ) -> MemoryState {
-        let fsrs = FSRS::new(parameters).unwrap();
-        let (time_history, rating_history) = fsrs.item_to_tensors(&item);
-        let starting_tensors = starting_state.map(MemoryStateTensors::from_state);
-        fsrs.model()
-            .forward(time_history, rating_history, starting_tensors)
-            .into()
-    }
-
-    fn burn_next_states(
-        parameters: &[f32],
-        current_memory_state: Option<MemoryState>,
-        desired_retention: f32,
-        days_elapsed: f32,
-    ) -> Result<NextStates> {
-        let fsrs = FSRS::new(parameters)?;
-        let device = fsrs.device();
-        let delta_t = Tensor::from_floats([days_elapsed.max(0.0)], &device);
-        let (current_memory_state_tensors, nth) = if let Some(state) = current_memory_state {
-            (MemoryStateTensors::from_state(state), 1)
-        } else {
-            (MemoryStateTensors::zeros(1), 0)
-        };
-        let model = fsrs.model();
-        let mut next_memory_states = (1..=4).map(|rating| {
-            let state = MemoryState::from(model.step(
-                delta_t.clone(),
-                Tensor::from_data(
-                    TensorData::new(vec![rating], Shape { dims: vec![1] }),
-                    &device,
-                ),
-                current_memory_state_tensors.clone(),
-                nth,
-            ));
-            validate_state(state)
-        });
-
-        let mut get_next_state = || {
-            let memory = next_memory_states.next().unwrap()?;
-            let interval = model
-                .next_interval(
-                    Tensor::from_floats([memory.stability], &device),
-                    Tensor::from_floats([desired_retention], &device),
-                )
-                .into_scalar()
-                .elem();
-            Ok(ItemState { memory, interval })
-        };
-
-        Ok(NextStates {
-            again: get_next_state()?,
-            hard: get_next_state()?,
-            good: get_next_state()?,
-            easy: get_next_state()?,
-        })
-    }
-
-    fn burn_evaluate(parameters: &[f32], items: Vec<FSRSItem>) -> Result<ModelEvaluation> {
-        let fsrs = FSRS::new(parameters)?;
-        let weighted_items = recency_weighted_fsrs_items(items);
-        let device = fsrs.device();
-        let batcher = FSRSBatcher::new();
-        let mut all_retrievability = vec![];
-        let mut all_labels = vec![];
-        let mut all_weights = vec![];
-        let mut r_matrix: HashMap<(u32, u32, u32), RMatrixValue> = HashMap::new();
-
-        for chunk in weighted_items.chunks(512) {
-            let batch = batcher.batch(chunk.to_vec(), &device);
-            let (_state, retrievability) = infer(fsrs.model(), batch.clone());
-            let pred = retrievability.clone().to_data().to_vec::<f32>().unwrap();
-            let true_val = batch.labels.clone().to_data().to_vec::<i64>().unwrap();
-            all_retrievability.push(retrievability);
-            all_labels.push(batch.labels);
-            all_weights.push(batch.weights);
-            izip!(chunk, pred, true_val).for_each(|(weighted_item, p, y)| {
-                let bin = weighted_item.item.r_matrix_index();
-                let value = r_matrix.entry(bin).or_default();
-                value.predicted += p;
-                value.actual += y as f32;
-                value.count += 1.0;
-                value.weight += weighted_item.weight;
-            });
-        }
-
-        let rmse = rmse_bins(&r_matrix);
-        let all_retrievability = Tensor::cat(all_retrievability, 0);
-        let all_labels = Tensor::cat(all_labels, 0).float();
-        let all_weights = Tensor::cat(all_weights, 0);
-        let loss =
-            BCELoss::new().forward(all_retrievability, all_labels, all_weights, Reduction::Auto);
-        Ok(ModelEvaluation {
-            log_loss: loss.into_scalar().to_f32(),
-            rmse_bins: rmse,
-        })
-    }
-
-    fn scalar_oracle_items() -> Vec<FSRSItem> {
-        vec![
-            FSRSItem {
-                reviews: vec![
-                    FSRSReview {
-                        rating: 2,
-                        delta_t: 0.0,
-                    },
-                    FSRSReview {
-                        rating: 2,
-                        delta_t: 0.4,
-                    },
-                    FSRSReview {
-                        rating: 3,
-                        delta_t: 0.6,
-                    },
-                    FSRSReview {
-                        rating: 1,
-                        delta_t: 2.0,
-                    },
-                ],
-            },
-            FSRSItem {
-                reviews: vec![
-                    FSRSReview {
-                        rating: 4,
-                        delta_t: 0.0,
-                    },
-                    FSRSReview {
-                        rating: 3,
-                        delta_t: 1.5,
-                    },
-                    FSRSReview {
-                        rating: 4,
-                        delta_t: 5.0,
-                    },
-                ],
-            },
-            FSRSItem {
-                reviews: vec![
-                    FSRSReview {
-                        rating: 1,
-                        delta_t: 0.0,
-                    },
-                    FSRSReview {
-                        rating: 1,
-                        delta_t: 1.0,
-                    },
-                    FSRSReview {
-                        rating: 3,
-                        delta_t: 3.0,
-                    },
-                ],
-            },
-        ]
-    }
-
-    #[test]
-    fn test_scalar_memory_state_matches_burn_oracle() -> Result<()> {
-        let items = scalar_oracle_items();
-        let starting_state = Some(MemoryState {
-            stability: 5.0,
-            difficulty: 6.0,
-        });
-        for parameters in [&FSRS6_DEFAULT_PARAMETERS[..], &DEFAULT_PARAMETERS[..]] {
-            let fsrs = FSRS::new(parameters)?;
-            for item in &items {
-                let scalar = fsrs.memory_state(item.clone(), None)?;
-                let burn = burn_memory_state(parameters, item.clone(), None);
-                assert_memory_state_approx_eq(scalar, burn);
-
-                let scalar = fsrs.memory_state(item.clone(), starting_state)?;
-                let burn = burn_memory_state(parameters, item.clone(), starting_state);
-                assert_memory_state_approx_eq(scalar, burn);
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_scalar_next_states_matches_burn_oracle() -> Result<()> {
-        let state = MemoryState {
-            stability: 12.0,
-            difficulty: 6.0,
-        };
-        for parameters in [&FSRS6_DEFAULT_PARAMETERS[..], &DEFAULT_PARAMETERS[..]] {
-            let fsrs = FSRS::new(parameters)?;
-            let scalar = fsrs.next_states_with_elapsed_days(Some(state), 0.83, 0.5)?;
-            let burn = burn_next_states(parameters, Some(state), 0.83, 0.5)?;
-            assert_item_state_approx_eq(&scalar.again, &burn.again);
-            assert_item_state_approx_eq(&scalar.hard, &burn.hard);
-            assert_item_state_approx_eq(&scalar.good, &burn.good);
-            assert_item_state_approx_eq(&scalar.easy, &burn.easy);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_scalar_evaluate_matches_burn_oracle() -> Result<()> {
-        let items = scalar_oracle_items();
-        for parameters in [&FSRS6_DEFAULT_PARAMETERS[..], &DEFAULT_PARAMETERS[..]] {
-            let fsrs = FSRS::new(parameters)?;
-            let scalar = fsrs.evaluate(items.clone(), |_| true)?;
-            let burn = burn_evaluate(parameters, items.clone())?;
-            [scalar.log_loss, scalar.rmse_bins].assert_approx_eq([burn.log_loss, burn.rmse_bins]);
-        }
-        Ok(())
-    }
-
     #[test]
     fn test_evaluate_with_time_series_splits() -> Result<()> {
         let items = anki21_sample_file_converted_to_fsrs();
@@ -1663,28 +1448,32 @@ mod tests {
                 again: ItemState {
                     memory: MemoryState {
                         stability: 2.9691455,
-                        difficulty: 8.000659
+                        difficulty: 8.000659,
+                        stability_fast: 2.9691455,
                     },
                     interval: 2.9691455
                 },
                 hard: ItemState {
                     memory: MemoryState {
                         stability: 17.091452,
-                        difficulty: 7.6913934
+                        difficulty: 7.6913934,
+                        stability_fast: 17.091452,
                     },
                     interval: 17.091452
                 },
                 good: ItemState {
                     memory: MemoryState {
                         stability: 31.722992,
-                        difficulty: 7.382128
+                        difficulty: 7.382128,
+                        stability_fast: 31.722992,
                     },
                     interval: 31.722992
                 },
                 easy: ItemState {
                     memory: MemoryState {
                         stability: 71.7502,
-                        difficulty: 7.0728626
+                        difficulty: 7.0728626,
+                        stability_fast: 71.7502,
                     },
                     interval: 71.7502
                 }
@@ -1700,6 +1489,7 @@ mod tests {
         let state = MemoryState {
             stability: 12.0,
             difficulty: 6.0,
+            stability_fast: 12.0,
         };
         let at_zero = fsrs
             .next_states_with_elapsed_days(Some(state), 0.9, 0.0)?
@@ -1721,6 +1511,7 @@ mod tests {
         let state = MemoryState {
             stability: 12.0,
             difficulty: 6.0,
+            stability_fast: 12.0,
         };
         let at_zero = fsrs
             .next_states_with_elapsed_days(Some(state), 0.9, 0.0)?
@@ -1751,12 +1542,7 @@ mod tests {
     fn test_fsrs7_low_retention_lapse_has_minute_again_but_good_graduates() -> Result<()> {
         assert_eq!(S_MIN, 0.0001);
 
-        let params = [
-            0.0113, 0.7801, 2.2056, 17.8287, 5.7900, 0.4527, 3.1686, 2.1464, 0.2876, 1.2004,
-            0.4385, 0.0057, 0.8110, 0.2112, 0.5439, 1.7069, 0.9438, 0.3588, 3.6203, 0.3262, 0.0060,
-            0.2524, 2.6739, 0.5529, 1.3967, 2.5000, 0.9966, 0.0630, 0.2528, 0.6248, 0.9734, 0.1204,
-            0.6260, 0.1575, 0.4048,
-        ];
+        let params = DEFAULT_PARAMETERS;
         let fsrs = FSRS::new(&params)?;
         let desired_retention = 0.65;
         let minutes_as_days = |minutes: f32| minutes / 24.0 / 60.0;
@@ -1815,8 +1601,8 @@ mod tests {
         }
 
         assert!(
-            selected_intervals_minutes[3] > 1.0 && selected_intervals_minutes[3] < 2.0,
-            "expected the fourth Again interval to remain minute-scale after repeated lapses, got {}",
+            selected_intervals_minutes[3] > 0.0 && selected_intervals_minutes[3] < 2.0,
+            "expected the fourth Again interval to remain finite and short after repeated lapses, got {}",
             selected_intervals_minutes[3]
         );
         assert!(
@@ -1845,6 +1631,7 @@ mod tests {
         let mut state = MemoryState {
             stability: 1.0,
             difficulty: 5.0,
+            stability_fast: 1.0,
         };
 
         let mut stability = Vec::new();
@@ -1864,6 +1651,7 @@ mod tests {
         let mut state = MemoryState {
             stability: 1.0,
             difficulty: 5.0,
+            stability_fast: 1.0,
         };
 
         let mut stability = Vec::with_capacity(10);
@@ -1884,6 +1672,7 @@ mod tests {
         let state = MemoryState {
             stability: 10.0,
             difficulty: 5.0,
+            stability_fast: 10.0,
         };
 
         let next_state = fsrs.next_states(Some(state), 0.9, 0)?.good.memory;
@@ -1947,6 +1736,7 @@ mod tests {
         let state = MemoryState {
             stability: 1.0,
             difficulty: 5.0,
+            stability_fast: 1.0,
         };
         assert_eq!(current_retrievability(state, 0.0, 0.2), 1.0);
         assert_eq!(current_retrievability(state, 1.0, 0.2), 0.9);

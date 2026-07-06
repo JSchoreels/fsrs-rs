@@ -419,6 +419,7 @@ fn main() -> fsrs::Result<()> {
     let fsrs = FSRS::new(&DEFAULT_PARAMETERS)?;
     let previous_state = Some(MemoryState {
         stability: 7.0,
+        stability_fast: 7.0,
         difficulty: 5.0,
     });
     let next_states =

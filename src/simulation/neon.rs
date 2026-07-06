@@ -31,12 +31,13 @@ pub(super) fn add_fsrs7_forgetting_curve_range(
     stability: f32,
 ) {
     let s = stability.max(S_MIN);
-    let decay1 = -w[27];
-    let decay2 = -w[28];
-    let factor1 = w[29].powf(1.0 / decay1) - 1.0;
-    let factor2 = w[30].powf(1.0 / decay2) - 1.0;
-    let weight1 = w[31] * s.powf(-w[33]);
-    let weight2 = w[32] * s.powf(w[34]);
+    let decay1_mag = (w[23] * s.powf(w[33] - 0.3)).clamp(0.01, 0.95);
+    let decay1 = -decay1_mag;
+    let decay2 = -w[24].clamp(0.01, 0.95);
+    let factor1 = ((w[25].ln() / decay1).min(60.0)).exp() - 1.0;
+    let factor2 = w[26].powf(1.0 / decay2) - 1.0;
+    let weight1 = w[27] * s.powf(-w[29]);
+    let weight2 = w[28] * s.powf(w[30]);
 
     let mut index = 0;
     while index + 4 <= days.len() {

@@ -7,7 +7,9 @@ use fsrs::{
 use chrono::prelude::*;
 use chrono_tz::Tz;
 use itertools::Itertools;
-use rusqlite::{Connection, Result as SqlResult, Row, types::FromSqlError as SqlFromSqlError};
+use rusqlite::{
+    Connection, OpenFlags, Result as SqlResult, Row, types::FromSqlError as SqlFromSqlError,
+};
 use std::hint::black_box;
 
 // Inlined RevlogReviewKind enum from convertor_tests.rs
@@ -200,8 +202,16 @@ fn anki_to_fsrs_with_card_ids(revlogs: Vec<RevlogEntry>) -> (Vec<FSRSItem>, Vec<
         .unzip()
 }
 
+fn benchmark_collection_path() -> String {
+    std::env::var("FSRS_BENCH_COLLECTION")
+        .unwrap_or_else(|_| "tests/data/collection.anki21".to_string())
+}
+
 fn read_collection_inline() -> SqlResult<Vec<RevlogEntry>> {
-    let db = Connection::open("tests/data/collection.anki21")?;
+    let db = Connection::open_with_flags(
+        benchmark_collection_path(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
     let filter_out_suspended_cards = false;
     let filter_out_flags: [i32; 0] = [];
     let flags_str = if !filter_out_flags.is_empty() {

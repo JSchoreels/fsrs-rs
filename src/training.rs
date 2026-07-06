@@ -45,12 +45,11 @@ type B = NdArray<f32>;
 
 const L2_PENALTY_WEIGHT: f64 = training_v7::PENALTY_W_L2;
 const PENALTY_GRAD_LEN: usize = training_v7::GRAD_LEN;
-const ADAM_BETA_1: f32 = 0.8;
-const ADAM_BETA_2: f32 = 0.85;
+const ADAM_BETA_1: f32 = 0.70;
+const ADAM_BETA_2: f32 = 0.98;
 const ADAM_EPSILON: f32 = 1e-8;
 const WINDOWED_FSRS7_LEARNING_RATE: f64 = 0.07;
 const WINDOWED_FSRS7_NUM_EPOCHS: usize = 17;
-const WINDOWED_FSRS7_VALIDATION_INTERVAL: usize = 8;
 
 fn training_adam_config() -> AdamConfig {
     AdamConfig::new()
@@ -70,18 +69,12 @@ fn schedule_penalty_fn(version: ModelVersion) -> SchedulePenaltyFn {
 }
 
 fn validation_schedule_penalty_value(
-    version: ModelVersion,
-    w: &[f32],
-    batch_size: usize,
-    enable_sched_penalties: bool,
+    _version: ModelVersion,
+    _w: &[f32],
+    _batch_size: usize,
+    _enable_sched_penalties: bool,
 ) -> f64 {
-    match version {
-        ModelVersion::Fsrs6 => 0.0,
-        ModelVersion::Fsrs7 if enable_sched_penalties => {
-            training_v7::schedule_penalty_value(w, batch_size)
-        }
-        ModelVersion::Fsrs7 => 0.0,
-    }
+    0.0
 }
 
 fn l2_penalty_fn(version: ModelVersion) -> L2PenaltyFn {
@@ -134,7 +127,12 @@ impl<B: Backend> Model<B> {
         // info!("r_historys: {}", &r_historys);
         let state = self.forward(t_historys, r_historys, None);
         let retrievability = self
-            .power_forgetting_curve(delta_ts, state.stability)
+            .power_forgetting_curve(
+                delta_ts,
+                state.stability,
+                state.stability_fast,
+                state.difficulty,
+            )
             .clamp(0.0001_f32, 0.9999_f32);
         BCELoss::new().forward(retrievability, labels.float(), weights, reduce)
     }
@@ -173,10 +171,9 @@ impl<B: AutodiffBackend> Model<B> {
     fn freeze_short_term_stability(&self, mut grad: B::Gradients) -> B::Gradients {
         let grad_tensor = self.w.grad(&grad).unwrap();
         let device = grad_tensor.device();
-        let updated_grad_tensor = if grad_tensor.dims()[0] >= 35 {
-            grad_tensor.slice_assign([16..27], Tensor::zeros([11], &device))
-        } else {
-            grad_tensor.slice_assign([17..20], Tensor::zeros([3], &device))
+        let updated_grad_tensor = match ModelVersion::from_param_count(grad_tensor.dims()[0]) {
+            ModelVersion::Fsrs7 => grad_tensor,
+            ModelVersion::Fsrs6 => grad_tensor.slice_assign([17..20], Tensor::zeros([3], &device)),
         };
 
         self.w.grad_remove(&mut grad);
@@ -279,15 +276,15 @@ impl MetricsRenderer for ProgressCollector {
 pub(crate) struct TrainingConfig {
     pub model: ModelConfig,
     pub optimizer: AdamConfig,
-    #[config(default = true)]
+    #[config(default = false)]
     pub enable_sched_penalties: bool,
-    #[config(default = 8)]
+    #[config(default = 9)]
     pub num_epochs: usize,
-    #[config(default = 1024)]
+    #[config(default = 512)]
     pub batch_size: usize,
     #[config(default = 2023)]
     pub seed: u64,
-    #[config(default = 2e-2)]
+    #[config(default = 0.0118)]
     pub learning_rate: f64,
     #[config(default = 1024)]
     pub max_seq_len: usize,
@@ -351,7 +348,7 @@ impl Default for ComputeParametersInput {
             card_ids: None,
             progress: None,
             enable_short_term: true,
-            enable_sched_penalties: true,
+            enable_sched_penalties: false,
             model_version: ComputeParametersVersion::default(),
             num_relearning_steps: None,
         }
@@ -369,8 +366,8 @@ fn apply_windowed_fsrs7_training_tuning(
     }
 }
 
-fn should_validate_epoch(epoch: usize, total_epochs: usize, use_windowed: bool) -> bool {
-    !use_windowed || epoch == total_epochs || epoch % WINDOWED_FSRS7_VALIDATION_INTERVAL == 0
+fn should_validate_epoch(_epoch: usize, _total_epochs: usize, use_windowed: bool) -> bool {
+    !use_windowed
 }
 
 fn normalize_for_model_version(
@@ -561,7 +558,7 @@ pub fn compute_parameters(
                     })?;
             let mut initialized_parameters = DEFAULT_PARAMETERS.to_vec();
             initialized_parameters[0..4].copy_from_slice(&initial_stability);
-            initialized_parameters[27..35].copy_from_slice(&initial_forgetting_curve);
+            initialized_parameters[23..31].copy_from_slice(&initial_forgetting_curve);
             (initialized_parameters, None)
         }
     };
@@ -670,7 +667,7 @@ pub fn benchmark(
                 initialize_parameters_fsrs7(dataset_for_initialization, average_recall).unwrap();
             let mut initialized_parameters = DEFAULT_PARAMETERS.to_vec();
             initialized_parameters[0..4].copy_from_slice(&initial_stability);
-            initialized_parameters[27..35].copy_from_slice(&initial_forgetting_curve);
+            initialized_parameters[23..31].copy_from_slice(&initial_forgetting_curve);
             initialized_parameters
         }
     };
@@ -725,7 +722,7 @@ impl WindowedFSRSBatch {
         self.prediction_count
     }
 
-    fn analytic_bce_grad(&self, w: &[f32]) -> [f32; 35] {
+    fn analytic_bce_grad(&self, w: &[f32]) -> [f32; 34] {
         crate::analytic_v7::windowed_grad(
             w,
             &self.t_historys,
@@ -770,7 +767,12 @@ impl<B: Backend> Model<B> {
             let rating = r_historys.get(i).squeeze(0);
             if i > 0 {
                 let retrievability = self
-                    .power_forgetting_curve(delta_t.clone(), state.stability.clone())
+                    .power_forgetting_curve(
+                        delta_t.clone(),
+                        state.stability.clone(),
+                        state.stability_fast.clone(),
+                        state.difficulty.clone(),
+                    )
                     .clamp(0.0001_f32, 0.9999_f32);
                 let labels = labels.get(i).squeeze(0);
                 let weights = weights.get(i).squeeze(0);
@@ -822,7 +824,7 @@ fn build_windowed_batches(items: &[WeightedFSRSItem], batch_size: usize) -> Vec<
 fn build_windowed_batch(cards: &[Vec<&WeightedFSRSItem>]) -> WindowedFSRSBatch {
     let prediction_count = cards.iter().map(Vec::len).sum();
     let real_card_count = cards.len();
-    let batch_size = real_card_count.div_ceil(4) * 4;
+    let batch_size = real_card_count.div_ceil(8) * 8;
     let seq_len = cards
         .iter()
         .filter_map(|prefixes| prefixes.last())
@@ -938,9 +940,10 @@ fn zero_frozen_host_grad(grad: &mut [f32], model_config: &ModelConfig) {
         }
     }
     if model_config.freeze_short_term_stability {
-        let range = if grad.len() >= 35 { 16..27 } else { 17..20 };
-        for value in grad[range].iter_mut() {
-            *value = 0.0;
+        if ModelVersion::from_param_count(grad.len()) == ModelVersion::Fsrs6 {
+            for value in grad[17..20].iter_mut() {
+                *value = 0.0;
+            }
         }
     }
 }
@@ -1201,13 +1204,16 @@ fn train<B: AutodiffBackend>(
         }
     }
 
-    info!("best_loss: {:?}", best_loss);
-
     if interrupter.should_stop() {
         return Err(FSRSError::Interrupted);
     }
 
-    Ok(best_model)
+    if use_windowed {
+        Ok(model)
+    } else {
+        info!("best_loss: {:?}", best_loss);
+        Ok(best_model)
+    }
 }
 
 struct NoProgress {}
@@ -1231,7 +1237,7 @@ mod tests {
 
     use super::*;
     use crate::convertor_tests::anki21_sample_file_converted_to_fsrs;
-    use crate::convertor_tests::try_data_from_csv;
+    use crate::convertor_tests::data_from_csv;
     use crate::dataset::{FSRSBatch, FSRSBatcher};
     use crate::model::{FSRS, parameters_to_model};
     use crate::test_helpers::TestHelper;
@@ -1303,13 +1309,13 @@ mod tests {
     }
 
     #[test]
-    fn test_windowed_fsrs7_validation_cadence_keeps_final_epoch() {
+    fn test_windowed_fsrs7_skips_validation() {
         assert!(should_validate_epoch(1, 8, false));
+        assert!(should_validate_epoch(8, 8, false));
         assert!(!should_validate_epoch(1, 17, true));
         assert!(!should_validate_epoch(2, 17, true));
-        assert!(!should_validate_epoch(4, 17, true));
-        assert!(should_validate_epoch(8, 17, true));
-        assert!(should_validate_epoch(17, 17, true));
+        assert!(!should_validate_epoch(8, 17, true));
+        assert!(!should_validate_epoch(17, 17, true));
     }
 
     #[test]
@@ -1436,7 +1442,7 @@ mod tests {
         let device = NdArrayDevice::Cpu;
         let prefix_batch = FSRSBatcher::<B>::new().batch(weighted_items.clone(), &device);
         let windowed_batch = build_windowed_batches(&weighted_items, 512).pop().unwrap();
-        assert_eq!(windowed_batch.batch_size, 4);
+        assert_eq!(windowed_batch.batch_size, 8);
         assert_eq!(windowed_batch.real_batch_size(), weighted_items.len());
         let (analytic_loss_value, analytic_grad) = crate::analytic_v7::windowed_loss_and_grad(
             &DEFAULT_PARAMETERS,
@@ -1646,14 +1652,13 @@ mod tests {
             freeze_short_term_stability: true,
             ..ModelConfig::default()
         };
-        let mut grad = vec![1.0f32; 35];
+        let mut grad = vec![1.0f32; 34];
         zero_frozen_host_grad(&mut grad, &config);
 
         assert!(grad[..4].iter().all(|value| *value == 0.0));
-        assert!(grad[16..27].iter().all(|value| *value == 0.0));
+        assert!(grad[4..].iter().all(|value| *value == 1.0));
         assert_eq!(grad[4], 1.0);
-        assert_eq!(grad[15], 1.0);
-        assert_eq!(grad[27], 1.0);
+        assert_eq!(grad[33], 1.0);
     }
 
     #[test]
@@ -1726,7 +1731,7 @@ mod tests {
         });
 
         assert!(parameters.is_ok());
-        assert_eq!(parameters.unwrap().len(), 35);
+        assert_eq!(parameters.unwrap().len(), 34);
     }
 
     #[test]
@@ -1757,7 +1762,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(parameters.len(), 35);
+        assert_eq!(parameters.len(), 34);
         assert!(parameters.iter().all(|parameter| parameter.is_finite()));
     }
 
@@ -2050,11 +2055,7 @@ mod tests {
                 .unwrap();
         }
         let mut datasets = vec![anki21_sample_file_converted_to_fsrs()];
-        if let Some(items) = try_data_from_csv() {
-            datasets.push(items);
-        } else {
-            eprintln!("Skipping optional tests/data/revlog.csv fixture");
-        }
+        datasets.push(data_from_csv());
 
         for items in datasets {
             for model_version in [
@@ -2087,7 +2088,7 @@ mod tests {
                     dbg!(&parameters);
                     match model_version {
                         ComputeParametersVersion::Fsrs6 => assert_eq!(parameters.len(), 21),
-                        ComputeParametersVersion::Fsrs7 => assert_eq!(parameters.len(), 35),
+                        ComputeParametersVersion::Fsrs7 => assert_eq!(parameters.len(), 34),
                     }
 
                     // evaluate

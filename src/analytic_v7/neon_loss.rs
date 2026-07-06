@@ -1,769 +1,780 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use super::{D_MAX, D_MIN, PARAM_LEN, S_MAX, S_MIN, windowed_loss_scalar};
+// ARM64 NEON reverse-mode (BPTT) gradient for the dual-trace FSRS-7 model.
+//
+// This is a lane-parallel (4 cards at a time) mirror of the scalar reverse-mode
+// in `super::reverse`, which is itself validated to ~1e-9 against the
+// forward-mode dual (and the dual against Burn autodiff). Remainder columns
+// that don't fill a group of 4 fall back to the scalar reverse path.
+
+use super::{D_MAX, D_MIN, PARAM_LEN, S_MAX, S_MIN};
 use crate::neon_math::F32x4;
 use std::arch::aarch64::{uint32x4_t, vandq_u32};
 
 #[inline(always)]
-fn mask_and(lhs: uint32x4_t, rhs: uint32x4_t) -> uint32x4_t {
-    unsafe { vandq_u32(lhs, rhs) }
+fn mask_and(a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+    unsafe { vandq_u32(a, b) }
 }
 
 #[inline(always)]
-fn four_non_positive(values: &[f32], index: usize) -> bool {
-    values[index] <= 0.0
-        && values[index + 1] <= 0.0
-        && values[index + 2] <= 0.0
-        && values[index + 3] <= 0.0
+fn open_mask(x: F32x4, lo: f32, hi: f32) -> uint32x4_t {
+    mask_and(x.cmp_gt(F32x4::splat(lo)), x.cmp_lt(F32x4::splat(hi)))
+}
+
+#[inline(always)]
+fn splat(v: f32) -> F32x4 {
+    F32x4::splat(v)
 }
 
 struct Params {
-    decay1: f32,
-    decay2: f32,
-    factor1: f32,
+    lnw25: f32,
+    dec2: f32,
+    inv_dec2: f32,
+    lnw26: f32,
+    p26: f32,
     factor2: f32,
-    p29: f32,
-    p30: f32,
-    ln_w29: f32,
-    ln_w30: f32,
-    init_difficulty_easy: f32,
+    open2: bool,
     exp3w5: f32,
-    long_success_prefactor: f32,
-    short_success_prefactor: f32,
+    prefac_slow: f32,
+    prefac_fast: f32,
 }
 
 impl Params {
     fn new(w: &[f32]) -> Self {
-        let decay1 = -w[27];
-        let decay2 = -w[28];
-        let ln_w29 = w[29].ln();
-        let ln_w30 = w[30].ln();
-        let p29 = (ln_w29 / decay1).exp();
-        let p30 = (ln_w30 / decay2).exp();
-        let exp3w5 = (w[5] * 3.0).exp();
+        let dec2_mag = (w[24]).clamp(0.01, 0.95);
+        let open2 = w[24] > 0.01 && w[24] < 0.95;
+        let dec2 = -dec2_mag;
+        let inv_dec2 = 1.0 / dec2;
+        let lnw26 = w[26].ln();
+        let p26 = (lnw26 * inv_dec2).exp();
         Self {
-            decay1,
-            decay2,
-            factor1: p29 - 1.0,
-            factor2: p30 - 1.0,
-            p29,
-            p30,
-            ln_w29,
-            ln_w30,
-            init_difficulty_easy: w[4] - exp3w5 + 1.0,
-            exp3w5,
-            long_success_prefactor: (w[7] - 1.5).exp(),
-            short_success_prefactor: (w[16] - 1.5).exp(),
+            lnw25: w[25].ln(),
+            dec2,
+            inv_dec2,
+            lnw26,
+            p26,
+            factor2: p26 - 1.0,
+            open2,
+            exp3w5: (w[5] * 3.0).exp(),
+            prefac_slow: (w[7] - 1.5).exp(),
+            prefac_fast: (w[15] - 1.5).exp(),
         }
     }
 
     #[inline(always)]
-    fn success_prefactor(&self, start: usize) -> f32 {
+    fn prefac(&self, start: usize) -> f32 {
         if start == 7 {
-            self.long_success_prefactor
+            self.prefac_slow
         } else {
-            self.short_success_prefactor
+            self.prefac_fast
         }
     }
 }
 
 #[inline(always)]
 fn init_stability(w: &[f32], rating: F32x4) -> F32x4 {
-    let one = F32x4::splat(1.0);
-    let two = F32x4::splat(2.0);
-    let three = F32x4::splat(3.0);
     let rating = rating.clamp(1.0, 4.0);
     F32x4::blend(
-        rating.cmp_eq(one),
-        F32x4::splat(w[0]),
+        rating.cmp_eq(splat(1.0)),
+        splat(w[0]),
         F32x4::blend(
-            rating.cmp_eq(two),
-            F32x4::splat(w[1]),
-            F32x4::blend(rating.cmp_eq(three), F32x4::splat(w[2]), F32x4::splat(w[3])),
+            rating.cmp_eq(splat(2.0)),
+            splat(w[1]),
+            F32x4::blend(rating.cmp_eq(splat(3.0)), splat(w[2]), splat(w[3])),
         ),
     )
 }
 
-#[inline(always)]
-fn init_difficulty(w: &[f32], rating: F32x4) -> F32x4 {
-    let rating = rating.clamp(1.0, 4.0);
-    (F32x4::splat(w[4]) - (F32x4::splat(w[5]) * (rating - F32x4::splat(1.0))).exp()
-        + F32x4::splat(1.0))
-    .clamp(D_MIN as f32, D_MAX as f32)
-}
+// --- curve (dual-trace retrievability, or fast-only recall) ---
 
-#[inline(always)]
-fn forgetting_curve(w: &[f32], params: &Params, t: F32x4, s: F32x4) -> F32x4 {
-    forgetting_curve_with_ln(w, params, t, s, s.ln())
-}
-
-#[inline(always)]
-fn forgetting_curve_with_ln(w: &[f32], params: &Params, t: F32x4, s: F32x4, ln_s: F32x4) -> F32x4 {
-    let t_over_s = t.max(F32x4::splat(0.0)) / s;
-    let r1 = ((F32x4::splat(1.0) + t_over_s * F32x4::splat(params.factor1)).ln()
-        * F32x4::splat(params.decay1))
-    .exp();
-    let r2 = ((F32x4::splat(1.0) + t_over_s * F32x4::splat(params.factor2)).ln()
-        * F32x4::splat(params.decay2))
-    .exp();
-    let weight1 = F32x4::splat(w[31]) * (ln_s * F32x4::splat(-w[33])).exp();
-    let weight2 = F32x4::splat(w[32]) * (ln_s * F32x4::splat(w[34])).exp();
-    (weight1 * r1 + weight2 * r2) / (weight1 + weight2)
-}
-
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn stability_for_set_with_logs(
-    w: &[f32],
-    params: &Params,
-    s: F32x4,
-    r: F32x4,
-    d: F32x4,
-    rating: F32x4,
-    start: usize,
-    ln_s: F32x4,
-    ln_d: F32x4,
-    ln_s1: F32x4,
-) -> F32x4 {
-    let one = F32x4::splat(1.0);
-    let hard_penalty = F32x4::blend(
-        rating.cmp_eq(F32x4::splat(2.0)),
-        F32x4::splat(w[start + 7]),
-        one,
-    );
-    let easy_bonus = F32x4::blend(
-        rating.cmp_eq(F32x4::splat(4.0)),
-        F32x4::splat(w[start + 8]),
-        one,
-    );
-    let new_s_fail = F32x4::splat(w[start + 3])
-        * (ln_d * F32x4::splat(-w[start + 4])).exp()
-        * ((ln_s1 * F32x4::splat(w[start + 5])).exp() - one)
-        * ((one - r) * F32x4::splat(w[start + 6])).exp();
-    let pls = s.min(new_s_fail);
-    let sinc = F32x4::splat(params.success_prefactor(start))
-        * (F32x4::splat(11.0) - d)
-        * (ln_s * F32x4::splat(-w[start + 1])).exp()
-        * (((one - r) * F32x4::splat(w[start + 2])).exp() - one)
-        * hard_penalty
-        * easy_bonus
-        + one;
-    let success = s * sinc;
-    F32x4::blend(rating.cmp_gt(one), pls.max(success), pls)
-}
-
-#[inline(always)]
-fn next_difficulty(w: &[f32], params: &Params, d: F32x4, rating: F32x4) -> F32x4 {
-    let delta_d = F32x4::splat(-w[6]) * (rating - F32x4::splat(3.0));
-    let new_d = d + (F32x4::splat(10.0) - d) * delta_d / F32x4::splat(9.0);
-    (F32x4::splat(params.init_difficulty_easy) * F32x4::splat(0.01) + new_d * F32x4::splat(0.99))
-        .clamp(D_MIN as f32, D_MAX as f32)
-}
-
-#[inline(always)]
-fn step(
-    w: &[f32],
-    params: &Params,
-    delta_t: F32x4,
-    rating: F32x4,
-    s: F32x4,
-    d: F32x4,
-    nth: usize,
-    same_day: bool,
-) -> (F32x4, F32x4) {
-    let last_s = s.clamp(S_MIN as f32, S_MAX as f32);
-    let last_d = d.clamp(D_MIN as f32, D_MAX as f32);
-    let (next_s, next_d) = if nth == 0 {
-        (
-            init_stability(w, rating).clamp(S_MIN as f32, S_MAX as f32),
-            init_difficulty(w, rating),
-        )
-    } else {
-        let delta_t = delta_t.max(F32x4::splat(0.0));
-        let ln_s = last_s.ln();
-        let r = if same_day {
-            F32x4::splat(1.0)
-        } else {
-            forgetting_curve_with_ln(w, params, delta_t, last_s, ln_s)
-        };
-        let ln_d = last_d.ln();
-        let ln_s1 = (last_s + F32x4::splat(1.0)).ln();
-        let long =
-            stability_for_set_with_logs(w, params, last_s, r, last_d, rating, 7, ln_s, ln_d, ln_s1);
-        let short = stability_for_set_with_logs(
-            w, params, last_s, r, last_d, rating, 16, ln_s, ln_d, ln_s1,
-        );
-        let coefficient =
-            F32x4::splat(1.0) - F32x4::splat(w[26]) * (F32x4::splat(-w[25]) * delta_t).exp();
-        (
-            (coefficient * long + (F32x4::splat(1.0) - coefficient) * short)
-                .clamp(S_MIN as f32, S_MAX as f32),
-            next_difficulty(w, params, last_d, rating),
-        )
-    };
-    let padding = rating.cmp_eq(F32x4::splat(0.0));
-    (
-        F32x4::blend(padding, last_s, next_s),
-        F32x4::blend(padding, last_d, next_d),
-    )
-}
-
-#[inline(always)]
-fn bce_loss(r: F32x4, label: F32x4, weight: F32x4) -> F32x4 {
-    let probability = F32x4::splat(1.0) - (label - r).abs();
-    -weight * probability.ln()
-}
-
-struct Curve4 {
-    same_day: bool,
+struct Curve {
     out: F32x4,
-    t_over_s: F32x4,
+    fast_only: bool,
+    s: F32x4,
+    sf: F32x4,
+    d: F32x4,
+    t: F32x4,
+    open_s: uint32x4_t,
+    open_sf: uint32x4_t,
+    open_d: uint32x4_t,
+    lnsf: F32x4,
+    sf_pow: F32x4,
+    open1: uint32x4_t,
+    dec1: F32x4,
+    openq: uint32x4_t,
+    e1: F32x4,
+    factor1: F32x4,
+    tos_f: F32x4,
     b1: F32x4,
-    b2: F32x4,
+    lnb1: F32x4,
     r1: F32x4,
+    // slow-only fields
+    d_ts: F32x4,
+    tos: F32x4,
+    b2: F32x4,
+    lnb2: F32x4,
     r2: F32x4,
-    ln_b1: F32x4,
-    ln_b2: F32x4,
-    p33: F32x4,
-    p34: F32x4,
+    p29: F32x4,
     weight1: F32x4,
+    lns: F32x4,
+    p30: F32x4,
+    d_wexp: F32x4,
     weight2: F32x4,
     wsum: F32x4,
     ret: F32x4,
-    ln_s: F32x4,
 }
 
 #[inline(always)]
-fn curve4_same_day() -> Curve4 {
-    let zero = F32x4::splat(0.0);
-    let one = F32x4::splat(1.0);
-    Curve4 {
-        same_day: true,
-        out: one,
-        t_over_s: zero,
-        b1: one,
-        b2: one,
-        r1: one,
-        r2: one,
-        ln_b1: zero,
-        ln_b2: zero,
-        p33: one,
-        p34: one,
-        weight1: zero,
-        weight2: zero,
-        wsum: one,
-        ret: one,
-        ln_s: zero,
+fn curve_fwd(
+    w: &[f32],
+    params: &Params,
+    t_in: F32x4,
+    s_in: F32x4,
+    sf_in: F32x4,
+    d_in: F32x4,
+    fast_only: bool,
+) -> Curve {
+    let one = splat(1.0);
+    let t = t_in.max(splat(0.0));
+    let s = s_in.clamp(S_MIN as f32, S_MAX as f32);
+    let sf = sf_in.clamp(S_MIN as f32, S_MAX as f32);
+    let d = d_in.clamp(D_MIN as f32, D_MAX as f32);
+    let open_s = open_mask(s_in, S_MIN as f32, S_MAX as f32);
+    let open_sf = open_mask(sf_in, S_MIN as f32, S_MAX as f32);
+    let open_d = open_mask(d_in, D_MIN as f32, D_MAX as f32);
+
+    // fast component
+    let lnsf = sf.ln();
+    let sf_pow = ((splat(w[33]) - splat(0.3)) * lnsf).exp();
+    let dec1_raw = splat(w[23]) * sf_pow;
+    let dec1_mag = dec1_raw.clamp(0.01, 0.95);
+    let open1 = open_mask(dec1_raw, 0.01, 0.95);
+    let dec1 = splat(0.0) - dec1_mag;
+    let q1 = splat(params.lnw25) / dec1;
+    let openq = q1.cmp_lt(splat(60.0));
+    let q1c = q1.min(splat(60.0));
+    let e1 = q1c.exp();
+    let factor1 = e1 - one;
+    let tos_f = t / sf;
+    let b1 = tos_f * factor1 + one;
+    let lnb1 = b1.ln();
+    let r1 = (dec1 * lnb1).exp();
+
+    if fast_only {
+        return Curve {
+            out: r1,
+            fast_only: true,
+            s,
+            sf,
+            d,
+            t,
+            open_s,
+            open_sf,
+            open_d,
+            lnsf,
+            sf_pow,
+            open1,
+            dec1,
+            openq,
+            e1,
+            factor1,
+            tos_f,
+            b1,
+            lnb1,
+            r1,
+            d_ts: splat(0.0),
+            tos: splat(0.0),
+            b2: splat(0.0),
+            lnb2: splat(0.0),
+            r2: splat(0.0),
+            p29: splat(0.0),
+            weight1: splat(0.0),
+            lns: splat(0.0),
+            p30: splat(0.0),
+            d_wexp: splat(0.0),
+            weight2: splat(0.0),
+            wsum: splat(1.0),
+            ret: splat(0.0),
+        };
     }
-}
 
-#[inline(always)]
-fn curve4_fwd(w: &[f32], params: &Params, t: F32x4, s: F32x4) -> Curve4 {
-    curve4_fwd_with_ln(w, params, t, s, s.ln_fast())
-}
+    // slow component
+    let dec2 = splat(params.dec2);
+    let factor2 = splat(params.factor2);
+    let d_ts = ((d - splat(5.0)) * splat(w[32] - 0.3)).exp();
+    let tos = t / s;
+    let b2 = tos * factor2 * d_ts + one;
+    let lnb2 = b2.ln();
+    let r2 = (dec2 * lnb2).exp();
 
-#[inline(always)]
-fn curve4_fwd_with_ln(w: &[f32], params: &Params, t: F32x4, s: F32x4, ln_s: F32x4) -> Curve4 {
-    let one = F32x4::splat(1.0);
-    let t_over_s = t.max(F32x4::splat(0.0)) / s;
-    let b1 = one + t_over_s * F32x4::splat(params.factor1);
-    let ln_b1 = b1.ln_fast();
-    let r1 = (ln_b1 * F32x4::splat(params.decay1)).exp_fast();
-    let b2 = one + t_over_s * F32x4::splat(params.factor2);
-    let ln_b2 = b2.ln_fast();
-    let r2 = (ln_b2 * F32x4::splat(params.decay2)).exp_fast();
-    let p33 = (ln_s * F32x4::splat(-w[33])).exp_fast();
-    let p34 = (ln_s * F32x4::splat(w[34])).exp_fast();
-    let weight1 = F32x4::splat(w[31]) * p33;
-    let weight2 = F32x4::splat(w[32]) * p34;
+    let p29 = (splat(-w[29]) * lnsf).exp();
+    let weight1 = splat(w[27]) * p29;
+    let lns = s.ln();
+    let p30 = (splat(w[30]) * lns).exp();
+    let d_wexp = ((d - splat(5.0)) * splat(w[31] - 0.5)).exp();
+    let weight2 = splat(w[28]) * p30 * d_wexp;
     let wsum = weight1 + weight2;
     let num = weight1 * r1 + weight2 * r2;
     let ret = num / wsum;
-    Curve4 {
-        same_day: false,
-        out: ret,
-        t_over_s,
+    let out = ret * splat(1.0 - 2e-5) + splat(1e-5);
+
+    Curve {
+        out,
+        fast_only: false,
+        s,
+        sf,
+        d,
+        t,
+        open_s,
+        open_sf,
+        open_d,
+        lnsf,
+        sf_pow,
+        open1,
+        dec1,
+        openq,
+        e1,
+        factor1,
+        tos_f,
         b1,
-        b2,
+        lnb1,
         r1,
+        d_ts,
+        tos,
+        b2,
+        lnb2,
         r2,
-        ln_b1,
-        ln_b2,
-        p33,
-        p34,
+        p29,
         weight1,
+        lns,
+        p30,
+        d_wexp,
         weight2,
         wsum,
         ret,
-        ln_s,
     }
 }
 
+/// Returns (g_s, g_sf, g_d) routed through the input clamps.
 #[inline(always)]
-fn curve4_bwd(
+fn curve_bwd(
     w: &[f32],
     params: &Params,
-    cache: &Curve4,
-    t: F32x4,
-    s: F32x4,
+    c: &Curve,
     g_out: F32x4,
+    g_r1_extra: F32x4,
     grad: &mut [F32x4; PARAM_LEN],
-) -> F32x4 {
-    if cache.same_day {
-        return F32x4::splat(0.0);
-    }
+) -> (F32x4, F32x4, F32x4) {
+    let zero = splat(0.0);
+    let mut g_s = zero;
+    let mut g_sf = zero;
+    let mut g_d = zero;
+    let mut g_lnsf = zero;
 
-    let zero = F32x4::splat(0.0);
-    let g_num = g_out / cache.wsum;
-    let g_wsum = (zero - g_out) * cache.ret / cache.wsum;
-    let g_weight1 = g_num * cache.r1 + g_wsum;
-    let g_weight2 = g_num * cache.r2 + g_wsum;
-    let g_r1 = g_num * cache.weight1;
-    let g_r2 = g_num * cache.weight2;
+    let g_r1 = if c.fast_only {
+        g_out + g_r1_extra
+    } else {
+        let g_ret = g_out * splat(1.0 - 2e-5);
+        let g_num = g_ret / c.wsum;
+        let g_wsum = (zero - g_ret) * c.ret / c.wsum;
+        let g_weight1 = g_num * c.r1 + g_wsum;
+        let g_weight2 = g_num * c.r2 + g_wsum;
+        let g_r1 = g_num * c.weight1 + g_r1_extra;
+        let g_r2 = g_num * c.weight2;
 
-    grad[31] = grad[31] + g_weight1 * cache.p33;
-    let g_p33 = g_weight1 * F32x4::splat(w[31]);
-    let mut g_s = g_p33 * cache.p33 * F32x4::splat(-w[33]) / s;
-    grad[33] = grad[33] + g_p33 * (zero - cache.p33 * cache.ln_s);
+        // weight2 = w28 * p30 * d_wexp
+        grad[28] = grad[28] + g_weight2 * c.p30 * c.d_wexp;
+        let g_p30 = g_weight2 * splat(w[28]) * c.d_wexp;
+        let g_d_wexp = g_weight2 * splat(w[28]) * c.p30;
+        grad[30] = grad[30] + g_p30 * c.p30 * c.lns;
+        g_s = g_s + g_p30 * c.p30 * splat(w[30]) / c.s;
+        let g_dw_arg = g_d_wexp * c.d_wexp;
+        grad[31] = grad[31] + g_dw_arg * (c.d - splat(5.0));
+        g_d = g_d + g_dw_arg * splat(w[31] - 0.5);
 
-    grad[32] = grad[32] + g_weight2 * cache.p34;
-    let g_p34 = g_weight2 * F32x4::splat(w[32]);
-    g_s = g_s + g_p34 * cache.p34 * F32x4::splat(w[34]) / s;
-    grad[34] = grad[34] + g_p34 * cache.p34 * cache.ln_s;
+        // weight1 = w27 * p29
+        grad[27] = grad[27] + g_weight1 * c.p29;
+        let g_p29 = g_weight1 * splat(w[27]);
+        grad[29] = grad[29] + g_p29 * c.p29 * (zero - c.lnsf);
+        g_lnsf = g_lnsf + g_p29 * c.p29 * splat(-w[29]);
 
-    let g_ln_b1 = g_r1 * cache.r1 * F32x4::splat(params.decay1);
-    let mut g_decay1 = g_r1 * cache.r1 * cache.ln_b1;
-    let g_b1 = g_ln_b1 / cache.b1;
-    let g_t_over_s1 = g_b1 * F32x4::splat(params.factor1);
-    let g_factor1 = g_b1 * cache.t_over_s;
-    grad[29] = grad[29] + g_factor1 * F32x4::splat(params.p29 / (params.decay1 * w[29]));
-    let g_inv1 = g_factor1 * F32x4::splat(params.p29 * params.ln_w29);
-    g_decay1 = g_decay1 + g_inv1 * (zero - F32x4::splat(1.0 / (params.decay1 * params.decay1)));
-    grad[27] = grad[27] - g_decay1;
+        // r2 = exp(dec2*lnb2)
+        let g_lnb2 = g_r2 * c.r2 * splat(params.dec2);
+        let g_b2 = g_lnb2 / c.b2;
+        let g_tos = g_b2 * splat(params.factor2) * c.d_ts;
+        let g_factor2 = g_b2 * c.tos * c.d_ts;
+        let g_d_ts = g_b2 * c.tos * splat(params.factor2);
+        let g_dts_arg = g_d_ts * c.d_ts;
+        grad[32] = grad[32] + g_dts_arg * (c.d - splat(5.0));
+        g_d = g_d + g_dts_arg * splat(w[32] - 0.3);
+        g_s = g_s + g_tos * (zero - c.t / (c.s * c.s));
+        // factor2 = p26 - 1 ; p26 = exp(lnw26*inv_dec2) ; both dec2 & the p26 chain feed w24, w26
+        let mut g_dec2 = g_r2 * c.r2 * c.lnb2;
+        let g_p26 = g_factor2;
+        grad[26] = grad[26] + g_p26 * splat(params.p26 * params.inv_dec2 / w[26]);
+        g_dec2 = g_dec2
+            + g_p26 * splat(params.p26 * params.lnw26 * (-1.0 / (params.dec2 * params.dec2)));
+        if params.open2 {
+            grad[24] = grad[24] + (zero - g_dec2);
+        }
+        g_r1
+    };
 
-    let g_ln_b2 = g_r2 * cache.r2 * F32x4::splat(params.decay2);
-    let mut g_decay2 = g_r2 * cache.r2 * cache.ln_b2;
-    let g_b2 = g_ln_b2 / cache.b2;
-    let g_t_over_s2 = g_b2 * F32x4::splat(params.factor2);
-    let g_factor2 = g_b2 * cache.t_over_s;
-    grad[30] = grad[30] + g_factor2 * F32x4::splat(params.p30 / (params.decay2 * w[30]));
-    let g_inv2 = g_factor2 * F32x4::splat(params.p30 * params.ln_w30);
-    g_decay2 = g_decay2 + g_inv2 * (zero - F32x4::splat(1.0 / (params.decay2 * params.decay2)));
-    grad[28] = grad[28] - g_decay2;
+    // r1 = exp(dec1*lnb1)
+    let mut g_dec1 = g_r1 * c.r1 * c.lnb1;
+    let g_lnb1 = g_r1 * c.r1 * c.dec1;
+    let g_b1 = g_lnb1 / c.b1;
+    let g_tos_f = g_b1 * c.factor1;
+    let g_factor1 = g_b1 * c.tos_f;
+    g_sf = g_sf + g_tos_f * (zero - c.t / (c.sf * c.sf));
+    // factor1 = e1 - 1 ; e1 = exp(q1c) ; q1c = min(q1,60) ; q1 = lnw25/dec1
+    let g_e1 = g_factor1;
+    let g_q1c = g_e1 * c.e1;
+    let g_q1 = F32x4::blend(c.openq, g_q1c, zero);
+    grad[25] = grad[25] + g_q1 * (splat(1.0) / c.dec1) / splat(w[25]);
+    g_dec1 = g_dec1 + g_q1 * (zero - splat(params.lnw25) / (c.dec1 * c.dec1));
+    // dec1 = -clamp(w23*sf_pow)
+    let g_dec1_mag = zero - g_dec1;
+    let g_dec1_raw = F32x4::blend(c.open1, g_dec1_mag, zero);
+    grad[23] = grad[23] + g_dec1_raw * c.sf_pow;
+    let g_sf_pow = g_dec1_raw * splat(w[23]);
+    grad[33] = grad[33] + g_sf_pow * c.sf_pow * c.lnsf;
+    g_lnsf = g_lnsf + g_sf_pow * c.sf_pow * splat(w[33] - 0.3);
+    g_sf = g_sf + g_lnsf / c.sf;
 
-    let t = t.max(zero);
-    g_s + (g_t_over_s1 + g_t_over_s2) * (zero - t / (s * s))
+    (
+        F32x4::blend(c.open_s, g_s, zero),
+        F32x4::blend(c.open_sf, g_sf, zero),
+        F32x4::blend(c.open_d, g_d, zero),
+    )
 }
 
-struct Stab4 {
-    out: F32x4,
-    nsf_fail: F32x4,
-    pls: F32x4,
-    sinc: F32x4,
-    success: F32x4,
-    aa: F32x4,
-    bb: F32x4,
-    cc: F32x4,
-    expr: F32x4,
-    pr: F32x4,
-    qbase: F32x4,
+// --- stability_for_set ---
+
+struct Stab {
+    start: usize,
+    last_s: F32x4,
+    last_d: F32x4,
+    r: F32x4,
+    rating: F32x4,
     hard: F32x4,
     easy: F32x4,
-    ln_s: F32x4,
-    ln_d: F32x4,
-    ln_s1: F32x4,
+    lns1: F32x4,
+    q: F32x4,
+    er: F32x4,
+    new_s_fail: F32x4,
+    pls: F32x4,
+    lns: F32x4,
+    cc: F32x4,
+    bb: F32x4,
+    er2: F32x4,
+    em1: F32x4,
+    prefac: f32,
+    sinc: F32x4,
+    success: F32x4,
+    out: F32x4,
 }
 
 #[inline(always)]
-fn stab4_fwd_with_logs(
+fn stab_fwd(
     w: &[f32],
     params: &Params,
-    s: F32x4,
+    last_s: F32x4,
+    last_d: F32x4,
     r: F32x4,
-    d: F32x4,
     rating: F32x4,
     start: usize,
-    ln_s: F32x4,
-    ln_d: F32x4,
-    ln_s1: F32x4,
-) -> Stab4 {
-    let one = F32x4::splat(1.0);
-    let hard = F32x4::blend(
-        rating.cmp_eq(F32x4::splat(2.0)),
-        F32x4::splat(w[start + 7]),
-        one,
-    );
-    let easy = F32x4::blend(
-        rating.cmp_eq(F32x4::splat(4.0)),
-        F32x4::splat(w[start + 8]),
-        one,
-    );
-    let pr =
-        (ln_d * F32x4::splat(-w[start + 4]) + (one - r) * F32x4::splat(w[start + 6])).exp_fast();
-    let qbase = (ln_s1 * F32x4::splat(w[start + 5])).exp_fast();
-    let nsf_fail = F32x4::splat(w[start + 3]) * pr * (qbase - one);
-    let pls = s.min(nsf_fail);
-    let aa = F32x4::splat(params.success_prefactor(start));
-    let bb = F32x4::splat(11.0) - d;
-    let cc = (ln_s * F32x4::splat(-w[start + 1])).exp_fast();
-    let expr = ((one - r) * F32x4::splat(w[start + 2])).exp_fast();
-    let sinc = aa * bb * cc * (expr - one) * hard * easy + one;
-    let success = s * sinc;
+) -> Stab {
+    let one = splat(1.0);
+    let hard = F32x4::blend(rating.cmp_eq(splat(2.0)), splat(w[start + 6]), one);
+    let easy = F32x4::blend(rating.cmp_eq(splat(4.0)), splat(w[start + 7]), one);
+    let lns1 = (last_s + one).ln();
+    let q = (splat(w[start + 4]) * lns1).exp();
+    let er = ((one - r) * splat(w[start + 5])).exp();
+    let new_s_fail = splat(w[start + 3]) * (q - one) * er;
+    let pls = last_s.min(new_s_fail);
+    // success branch (computed for all lanes; blended by rating>1 at the end)
+    let lns = last_s.ln();
+    let cc = (splat(-w[start + 1]) * lns).exp();
+    let bb = splat(11.0) - last_d;
+    let er2 = ((one - r) * splat(w[start + 2])).exp();
+    let em1 = er2 - one;
+    let prefac = params.prefac(start);
+    let sinc = splat(prefac) * bb * cc * em1 * hard * easy + one;
+    let success = last_s * sinc;
     let out = F32x4::blend(rating.cmp_gt(one), pls.max(success), pls);
-    Stab4 {
-        out,
-        nsf_fail,
-        pls,
-        sinc,
-        success,
-        aa,
-        bb,
-        cc,
-        expr,
-        pr,
-        qbase,
+    Stab {
+        start,
+        last_s,
+        last_d,
+        r,
+        rating,
         hard,
         easy,
-        ln_s,
-        ln_d,
-        ln_s1,
+        lns1,
+        q,
+        er,
+        new_s_fail,
+        pls,
+        lns,
+        cc,
+        bb,
+        er2,
+        em1,
+        prefac,
+        sinc,
+        success,
+        out,
     }
 }
 
+/// Returns (g_last_s, g_last_d, g_r).
 #[inline(always)]
-fn stab4_bwd(
+fn stab_bwd(
     w: &[f32],
-    cache: &Stab4,
-    s: F32x4,
-    r: F32x4,
-    d: F32x4,
-    rating: F32x4,
-    start: usize,
+    c: &Stab,
     g_out: F32x4,
     grad: &mut [F32x4; PARAM_LEN],
 ) -> (F32x4, F32x4, F32x4) {
-    let zero = F32x4::splat(0.0);
-    let one = F32x4::splat(1.0);
-    let gt1 = rating.cmp_gt(one);
-    let g_nss = F32x4::blend(gt1, g_out, zero);
+    let zero = splat(0.0);
+    let one = splat(1.0);
+    let start = c.start;
+    let gt1 = c.rating.cmp_gt(one);
+    // out = rating>1 ? max(pls, success) : pls
+    let g_max = F32x4::blend(gt1, g_out, zero);
     let g_pls_direct = F32x4::blend(gt1, zero, g_out);
-    let pls_wins = cache.pls.cmp_gt(cache.success);
-    let g_pls_from_nss = F32x4::blend(pls_wins, g_nss, zero);
-    let g_success = F32x4::blend(pls_wins, zero, g_nss);
-    let mut g_s = g_success * cache.sinc;
-    let g_sinc = g_success * s;
-    let g_pls = g_pls_direct + g_pls_from_nss;
-    let s_wins = s.cmp_lt(cache.nsf_fail);
-    g_s = g_s + F32x4::blend(s_wins, g_pls, zero);
-    let g_nsf_fail = F32x4::blend(s_wins, zero, g_pls);
+    // max(pls, success): success wins when pls<success
+    let succ_wins = c.pls.cmp_lt(c.success);
+    let g_success = F32x4::blend(succ_wins, g_max, zero);
+    let g_pls_from_max = F32x4::blend(succ_wins, zero, g_max);
+    let g_pls = g_pls_direct + g_pls_from_max;
 
-    let em1 = cache.expr - one;
+    let mut g_s = zero;
+    let mut g_d = zero;
+    let mut g_r = zero;
+
+    // success = last_s * sinc
+    g_s = g_s + g_success * c.sinc;
+    let g_sinc = g_success * c.last_s;
+    // sinc = prefac*bb*cc*em1*hard*easy + 1
     let g_prod = g_sinc;
-    let prod = cache.aa * cache.bb * cache.cc * em1 * cache.hard * cache.easy;
-    grad[start] = grad[start] + g_prod * prod;
-    let g_bb = g_prod * (cache.aa * cache.cc * em1 * cache.hard * cache.easy);
-    let g_cc = g_prod * (cache.aa * cache.bb * em1 * cache.hard * cache.easy);
-    let g_em1 = g_prod * (cache.aa * cache.bb * cache.cc * cache.hard * cache.easy);
+    let pf = splat(c.prefac);
+    grad[start] = grad[start] + g_prod * (c.bb * c.cc * c.em1 * c.hard * c.easy) * pf;
+    let g_bb = g_prod * (pf * c.cc * c.em1 * c.hard * c.easy);
+    let g_cc = g_prod * (pf * c.bb * c.em1 * c.hard * c.easy);
+    let g_em1 = g_prod * (pf * c.bb * c.cc * c.hard * c.easy);
+    grad[start + 6] = grad[start + 6]
+        + F32x4::blend(
+            c.rating.cmp_eq(splat(2.0)),
+            g_prod * (pf * c.bb * c.cc * c.em1 * c.easy),
+            zero,
+        );
     grad[start + 7] = grad[start + 7]
         + F32x4::blend(
-            rating.cmp_eq(F32x4::splat(2.0)),
-            g_prod * (cache.aa * cache.bb * cache.cc * em1 * cache.easy),
+            c.rating.cmp_eq(splat(4.0)),
+            g_prod * (pf * c.bb * c.cc * c.em1 * c.hard),
             zero,
         );
-    grad[start + 8] = grad[start + 8]
-        + F32x4::blend(
-            rating.cmp_eq(F32x4::splat(4.0)),
-            g_prod * (cache.aa * cache.bb * cache.cc * em1 * cache.hard),
-            zero,
-        );
+    // bb = 11 - last_d
+    g_d = g_d + (zero - g_bb);
+    // cc = exp(-w[start+1]*lns)
+    let g_cc_arg = g_cc * c.cc;
+    grad[start + 1] = grad[start + 1] + g_cc_arg * (zero - c.lns);
+    g_s = g_s + g_cc_arg * splat(-w[start + 1]) / c.last_s;
+    // em1 = er2-1 ; er2 = exp((1-r)*w[start+2])
+    let g_er2_arg = g_em1 * c.er2;
+    grad[start + 2] = grad[start + 2] + g_er2_arg * (one - c.r);
+    g_r = g_r + g_er2_arg * splat(-w[start + 2]);
 
-    let mut g_d = zero - g_bb;
-    g_s = g_s + g_cc * F32x4::splat(-w[start + 1]) * cache.cc / s;
-    grad[start + 1] = grad[start + 1] + g_cc * (zero - cache.cc * cache.ln_s);
-    let mut g_r = g_em1 * cache.expr * F32x4::splat(-w[start + 2]);
-    grad[start + 2] = grad[start + 2] + g_em1 * cache.expr * (one - r);
-
-    let q = cache.qbase - one;
-    grad[start + 3] = grad[start + 3] + g_nsf_fail * cache.pr * q;
-    let g_pr = g_nsf_fail * F32x4::splat(w[start + 3]) * q;
-    let g_q = g_nsf_fail * F32x4::splat(w[start + 3]) * cache.pr;
-    let g_pr_inner = g_pr * cache.pr;
-    g_d = g_d + g_pr_inner * F32x4::splat(-w[start + 4]) / d;
-    grad[start + 4] = grad[start + 4] + g_pr_inner * (zero - cache.ln_d);
-    g_s = g_s + g_q * F32x4::splat(w[start + 5]) * cache.qbase / (s + one);
-    grad[start + 5] = grad[start + 5] + g_q * cache.qbase * cache.ln_s1;
-    g_r = g_r + g_pr_inner * F32x4::splat(-w[start + 6]);
-    grad[start + 6] = grad[start + 6] + g_pr_inner * (one - r);
+    // pls = min(last_s, new_s_fail): new_s_fail wins when last_s>new_s_fail
+    let nf_wins = c.last_s.cmp_gt(c.new_s_fail);
+    g_s = g_s + F32x4::blend(nf_wins, zero, g_pls);
+    let g_new_s_fail = F32x4::blend(nf_wins, g_pls, zero);
+    // new_s_fail = w[start+3]*(q-1)*er
+    grad[start + 3] = grad[start + 3] + g_new_s_fail * (c.q - one) * c.er;
+    let g_q = g_new_s_fail * splat(w[start + 3]) * c.er;
+    let g_er = g_new_s_fail * splat(w[start + 3]) * (c.q - one);
+    // q = exp(w[start+4]*lns1)
+    let g_q_arg = g_q * c.q;
+    grad[start + 4] = grad[start + 4] + g_q_arg * c.lns1;
+    g_s = g_s + g_q_arg * splat(w[start + 4]) / (c.last_s + one);
+    // er = exp((1-r)*w[start+5])
+    let g_er_arg = g_er * c.er;
+    grad[start + 5] = grad[start + 5] + g_er_arg * (one - c.r);
+    g_r = g_r + g_er_arg * splat(-w[start + 5]);
 
     (g_s, g_d, g_r)
 }
 
-#[inline(always)]
-fn next_difficulty4_fwd(
-    w: &[f32],
-    params: &Params,
-    d: F32x4,
+// --- next_difficulty ---
+
+struct NextDiff {
     rating: F32x4,
-) -> (F32x4, F32x4, F32x4) {
-    let delta_d = F32x4::splat(-w[6]) * (rating - F32x4::splat(3.0));
-    let new_d = d + (F32x4::splat(10.0) - d) * delta_d / F32x4::splat(9.0);
-    let out_pre =
-        F32x4::splat(params.init_difficulty_easy) * F32x4::splat(0.01) + new_d * F32x4::splat(0.99);
-    (out_pre.clamp(D_MIN as f32, D_MAX as f32), out_pre, delta_d)
+    last_d: F32x4,
+    open: uint32x4_t,
+    delta_d0: F32x4,
+    surprise: F32x4,
+    delta_d: F32x4,
 }
 
 #[inline(always)]
-fn next_difficulty4_bwd(
+fn nextdiff_fwd(w: &[f32], params: &Params, last_d: F32x4, r: F32x4, rating: F32x4) -> NextDiff {
+    let is1 = rating.cmp_eq(splat(1.0));
+    let delta_d0 = splat(-w[6]) * (rating - splat(3.0));
+    let surprise = r + splat(0.1);
+    let delta_d = F32x4::blend(is1, delta_d0 * surprise, delta_d0);
+    let new_d = last_d + (splat(10.0) - last_d) * delta_d / splat(9.0);
+    let init_easy = splat(w[4]) - splat(params.exp3w5) + splat(1.0);
+    let out_pre = init_easy * splat(0.01) + new_d * splat(0.99);
+    let open = open_mask(out_pre, D_MIN as f32, D_MAX as f32);
+    NextDiff {
+        rating,
+        last_d,
+        open,
+        delta_d0,
+        surprise,
+        delta_d,
+    }
+}
+
+/// Returns (g_last_d, g_r).
+#[inline(always)]
+fn nextdiff_bwd(
     params: &Params,
-    d: F32x4,
-    rating: F32x4,
-    out_pre: F32x4,
-    delta_d: F32x4,
+    c: &NextDiff,
     g_out: F32x4,
     grad: &mut [F32x4; PARAM_LEN],
-) -> F32x4 {
-    let zero = F32x4::splat(0.0);
-    let open = mask_and(
-        out_pre.cmp_gt(F32x4::splat(D_MIN as f32)),
-        out_pre.cmp_lt(F32x4::splat(D_MAX as f32)),
-    );
-    let g_out_pre = F32x4::blend(open, g_out, zero);
-    let g_init = g_out_pre * F32x4::splat(0.01);
-    let g_new_d = g_out_pre * F32x4::splat(0.99);
+) -> (F32x4, F32x4) {
+    let zero = splat(0.0);
+    let is1 = c.rating.cmp_eq(splat(1.0));
+    let g_out_pre = F32x4::blend(c.open, g_out, zero);
+    let g_init = g_out_pre * splat(0.01);
+    let g_new_d = g_out_pre * splat(0.99);
     grad[4] = grad[4] + g_init;
-    grad[5] = grad[5] + g_init * F32x4::splat(-params.exp3w5 * 3.0);
-    let g_d = g_new_d * (F32x4::splat(1.0) - delta_d / F32x4::splat(9.0));
-    let g_delta_d = g_new_d * (F32x4::splat(10.0) - d) / F32x4::splat(9.0);
-    grad[6] = grad[6] + g_delta_d * (zero - (rating - F32x4::splat(3.0)));
-    g_d
+    grad[5] = grad[5] + g_init * splat(-params.exp3w5 * 3.0);
+    let g_last_d = g_new_d * (splat(1.0) - c.delta_d / splat(9.0));
+    let g_delta_d = g_new_d * (splat(10.0) - c.last_d) / splat(9.0);
+    // delta_d = is1 ? delta_d0*surprise : delta_d0
+    let g_delta_d0 = F32x4::blend(is1, g_delta_d * c.surprise, g_delta_d);
+    let g_r = F32x4::blend(is1, g_delta_d * c.delta_d0, zero);
+    grad[6] = grad[6] + g_delta_d0 * (zero - (c.rating - splat(3.0)));
+    (g_last_d, g_r)
 }
 
-enum Step4 {
+// --- step ---
+
+enum Step {
     First {
         rating: F32x4,
-        rc: F32x4,
-        init_s_pre: F32x4,
-        init_d_pre: F32x4,
+        open_init_s: uint32x4_t,
+        open_init_sf: uint32x4_t,
+        open_init_d: uint32x4_t,
         init_d_exp: F32x4,
     },
     Full {
-        last_s: F32x4,
-        last_d: F32x4,
         rating: F32x4,
-        dt: F32x4,
-        curve: Curve4,
-        long: Stab4,
-        short: Stab4,
-        coefficient: F32x4,
-        transition_exp: F32x4,
-        new_s_pre: F32x4,
-        nd_out_pre: F32x4,
-        nd_delta_d: F32x4,
+        open_state_s: uint32x4_t,
+        open_state_sf: uint32x4_t,
+        open_state_d: uint32x4_t,
+        curve: Curve,
+        slow: Stab,
+        fast: Stab,
+        nd: NextDiff,
+        new_s_fast_raw: F32x4,
+        relearn: F32x4,
+        open_slow: uint32x4_t,
+        open_fast: uint32x4_t,
     },
 }
 
-impl Step4 {
+impl Step {
     #[inline(always)]
     fn curve_out(&self) -> F32x4 {
         match self {
-            Self::Full { curve, .. } => curve.out,
-            Self::First { .. } => F32x4::splat(0.0),
+            Step::Full { curve, .. } => curve.out,
+            Step::First { .. } => splat(0.0),
         }
     }
 }
 
 #[inline(always)]
-fn step4_fwd(
+#[allow(clippy::too_many_arguments)]
+fn step_fwd(
     w: &[f32],
     params: &Params,
     delta_t: F32x4,
     rating: F32x4,
     s: F32x4,
+    sf: F32x4,
     d: F32x4,
     nth: usize,
-    same_day: bool,
-) -> ((F32x4, F32x4), Step4) {
+) -> ((F32x4, F32x4, F32x4), Step) {
     let last_s = s.clamp(S_MIN as f32, S_MAX as f32);
     let last_d = d.clamp(D_MIN as f32, D_MAX as f32);
+    let last_sf = sf.clamp(S_MIN as f32, S_MAX as f32);
+    let open_state_s = open_mask(s, S_MIN as f32, S_MAX as f32);
+    let open_state_sf = open_mask(sf, S_MIN as f32, S_MAX as f32);
+    let open_state_d = open_mask(d, D_MIN as f32, D_MAX as f32);
+
     if nth == 0 {
-        let one = F32x4::splat(1.0);
-        let rc = rating.clamp(1.0, 4.0);
         let init_s_pre = init_stability(w, rating);
-        let init_d_exp = (F32x4::splat(w[5]) * (rc - one)).exp_fast();
-        let init_d_pre = F32x4::splat(w[4]) - init_d_exp + one;
-        let next_s = init_s_pre.clamp(S_MIN as f32, S_MAX as f32);
-        let next_d = init_d_pre.clamp(D_MIN as f32, D_MAX as f32);
-        let padding = rating.cmp_eq(F32x4::splat(0.0));
+        let init_s = init_s_pre.clamp(S_MIN as f32, S_MAX as f32);
+        let open_init_s = open_mask(init_s_pre, S_MIN as f32, S_MAX as f32);
+        let init_sf_pre = init_s_pre * splat(0.8);
+        let init_sf = init_sf_pre.clamp(S_MIN as f32, S_MAX as f32);
+        let open_init_sf = open_mask(init_sf_pre, S_MIN as f32, S_MAX as f32);
+        let rc = rating.clamp(1.0, 4.0);
+        let init_d_exp = (splat(w[5]) * (rc - splat(1.0))).exp();
+        let init_d_pre = splat(w[4]) - init_d_exp + splat(1.0);
+        let init_d = init_d_pre.clamp(D_MIN as f32, D_MAX as f32);
+        let open_init_d = open_mask(init_d_pre, D_MIN as f32, D_MAX as f32);
+        let padding = rating.cmp_eq(splat(0.0));
         return (
             (
-                F32x4::blend(padding, last_s, next_s),
-                F32x4::blend(padding, last_d, next_d),
+                F32x4::blend(padding, last_s, init_s),
+                F32x4::blend(padding, last_sf, init_sf),
+                F32x4::blend(padding, last_d, init_d),
             ),
-            Step4::First {
+            Step::First {
                 rating,
-                rc,
-                init_s_pre,
-                init_d_pre,
+                open_init_s,
+                open_init_sf,
+                open_init_d,
                 init_d_exp,
             },
         );
     }
 
-    let dt = delta_t.max(F32x4::splat(0.0));
-    let ln_s = last_s.ln_fast();
-    let ln_d = last_d.ln_fast();
-    let ln_s1 = (last_s + F32x4::splat(1.0)).ln_fast();
-    let curve = if same_day {
-        curve4_same_day()
-    } else {
-        curve4_fwd_with_ln(w, params, dt, last_s, ln_s)
+    let dt = delta_t.max(splat(0.0));
+    let curve = curve_fwd(w, params, dt, last_s, last_sf, last_d, false);
+    let r = curve.out;
+    let slow = stab_fwd(w, params, last_s, last_d, r, rating, 7);
+    let new_s_slow = slow.out;
+    let r_fast = curve.r1;
+    let fast = stab_fwd(w, params, last_sf, last_d, r_fast, rating, 15);
+    let new_s_fast_raw = fast.out;
+    let relearn = new_s_slow * splat(0.8);
+    let is1 = rating.cmp_eq(splat(1.0));
+    let relearned = F32x4::blend(is1, new_s_fast_raw.min(relearn), new_s_fast_raw);
+    let nd = nextdiff_fwd(w, params, last_d, r, rating);
+    let new_d_pre = {
+        let init_easy = splat(w[4]) - splat(params.exp3w5) + splat(1.0);
+        let delta_d = F32x4::blend(is1, nd.delta_d0 * nd.surprise, nd.delta_d0);
+        let new_d = last_d + (splat(10.0) - last_d) * delta_d / splat(9.0);
+        init_easy * splat(0.01) + new_d * splat(0.99)
     };
-    let long = stab4_fwd_with_logs(
-        w, params, last_s, curve.out, last_d, rating, 7, ln_s, ln_d, ln_s1,
-    );
-    let short = stab4_fwd_with_logs(
-        w, params, last_s, curve.out, last_d, rating, 16, ln_s, ln_d, ln_s1,
-    );
-    let transition_exp = (F32x4::splat(-w[25]) * dt).exp_fast();
-    let coefficient = F32x4::splat(1.0) - F32x4::splat(w[26]) * transition_exp;
-    let new_s_pre = coefficient * long.out + (F32x4::splat(1.0) - coefficient) * short.out;
-    let (next_d, nd_out_pre, nd_delta_d) = next_difficulty4_fwd(w, params, last_d, rating);
-    let next_s = new_s_pre.clamp(S_MIN as f32, S_MAX as f32);
-    let padding = rating.cmp_eq(F32x4::splat(0.0));
+    let new_d = new_d_pre.clamp(D_MIN as f32, D_MAX as f32);
+    let new_s = new_s_slow.clamp(S_MIN as f32, S_MAX as f32);
+    let open_slow = open_mask(new_s_slow, S_MIN as f32, S_MAX as f32);
+    let new_sf = relearned.clamp(S_MIN as f32, S_MAX as f32);
+    let open_fast = open_mask(relearned, S_MIN as f32, S_MAX as f32);
+    let padding = rating.cmp_eq(splat(0.0));
     (
         (
-            F32x4::blend(padding, last_s, next_s),
-            F32x4::blend(padding, last_d, next_d),
+            F32x4::blend(padding, last_s, new_s),
+            F32x4::blend(padding, last_sf, new_sf),
+            F32x4::blend(padding, last_d, new_d),
         ),
-        Step4::Full {
-            last_s,
-            last_d,
+        Step::Full {
             rating,
-            dt,
+            open_state_s,
+            open_state_sf,
+            open_state_d,
             curve,
-            long,
-            short,
-            coefficient,
-            transition_exp,
-            new_s_pre,
-            nd_out_pre,
-            nd_delta_d,
+            slow,
+            fast,
+            nd,
+            new_s_fast_raw,
+            relearn,
+            open_slow,
+            open_fast,
         },
     )
 }
 
+/// Returns (g_state_s, g_state_sf, g_state_d).
 #[inline(always)]
-fn step4_bwd(
+fn step_bwd(
     w: &[f32],
     params: &Params,
-    cache: &Step4,
-    g_out: (F32x4, F32x4),
+    cache: &Step,
+    g_new: (F32x4, F32x4, F32x4),
     g_r_loss: F32x4,
     grad: &mut [F32x4; PARAM_LEN],
-) -> (F32x4, F32x4) {
-    let zero = F32x4::splat(0.0);
+) -> (F32x4, F32x4, F32x4) {
+    let zero = splat(0.0);
     match cache {
-        Step4::First {
+        Step::First {
             rating,
-            rc,
-            init_s_pre,
-            init_d_pre,
+            open_init_s,
+            open_init_sf,
+            open_init_d,
             init_d_exp,
         } => {
             let active = rating.cmp_gt(zero);
-            let g_last_s = F32x4::blend(active, zero, g_out.0);
-            let g_last_d = F32x4::blend(active, zero, g_out.1);
-            let init_s_open = mask_and(
-                init_s_pre.cmp_gt(F32x4::splat(S_MIN as f32)),
-                init_s_pre.cmp_lt(F32x4::splat(S_MAX as f32)),
-            );
-            let init_d_open = mask_and(
-                init_d_pre.cmp_gt(F32x4::splat(D_MIN as f32)),
-                init_d_pre.cmp_lt(F32x4::splat(D_MAX as f32)),
-            );
-            let g_init_s = F32x4::blend(mask_and(active, init_s_open), g_out.0, zero);
-            let g_init_d = F32x4::blend(mask_and(active, init_d_open), g_out.1, zero);
-            for rating_value in 1..=4 {
-                grad[rating_value - 1] = grad[rating_value - 1]
-                    + F32x4::blend(
-                        rating.cmp_eq(F32x4::splat(rating_value as f32)),
-                        g_init_s,
-                        zero,
-                    );
+            let g_last_s = F32x4::blend(active, zero, g_new.0);
+            let g_last_sf = F32x4::blend(active, zero, g_new.1);
+            let g_last_d = F32x4::blend(active, zero, g_new.2);
+            let g_init_s = F32x4::blend(mask_and(active, *open_init_s), g_new.0, zero);
+            let g_init_sf = F32x4::blend(mask_and(active, *open_init_sf), g_new.1, zero);
+            let g_init_s_pre = g_init_s + g_init_sf * splat(0.8);
+            let rc = rating.clamp(1.0, 4.0);
+            for k in 1..=4 {
+                grad[k - 1] =
+                    grad[k - 1] + F32x4::blend(rating.cmp_eq(splat(k as f32)), g_init_s_pre, zero);
             }
+            let g_init_d = F32x4::blend(mask_and(active, *open_init_d), g_new.2, zero);
             grad[4] = grad[4] + g_init_d;
-            grad[5] = grad[5] + g_init_d * (zero - *init_d_exp * (*rc - F32x4::splat(1.0)));
-            let _ = (g_last_s, g_last_d, g_r_loss);
-            (g_last_s, g_last_d)
+            grad[5] = grad[5] + g_init_d * (zero - *init_d_exp * (rc - splat(1.0)));
+            (g_last_s, g_last_sf, g_last_d)
         }
-        Step4::Full {
-            last_s,
-            last_d,
+        Step::Full {
             rating,
-            dt,
+            open_state_s,
+            open_state_sf,
+            open_state_d,
             curve,
-            long,
-            short,
-            coefficient,
-            transition_exp,
-            new_s_pre,
-            nd_out_pre,
-            nd_delta_d,
+            slow,
+            fast,
+            nd,
+            new_s_fast_raw,
+            relearn,
+            open_slow,
+            open_fast,
         } => {
             let active = rating.cmp_gt(zero);
-            let mut g_last_s = F32x4::blend(active, zero, g_out.0);
-            let mut g_last_d = F32x4::blend(active, zero, g_out.1);
-            let g_new_s = F32x4::blend(active, g_out.0, zero);
-            let g_new_d = F32x4::blend(active, g_out.1, zero);
-            let new_s_open = mask_and(
-                new_s_pre.cmp_gt(F32x4::splat(S_MIN as f32)),
-                new_s_pre.cmp_lt(F32x4::splat(S_MAX as f32)),
-            );
-            let g_new_s_pre = F32x4::blend(new_s_open, g_new_s, zero);
-            let g_coefficient = g_new_s_pre * (long.out - short.out);
-            let g_long = g_new_s_pre * *coefficient;
-            let g_short = g_new_s_pre * (F32x4::splat(1.0) - *coefficient);
-            grad[26] = grad[26] + g_coefficient * (zero - *transition_exp);
-            let g_transition_exp = g_coefficient * F32x4::splat(-w[26]);
-            grad[25] = grad[25] + g_transition_exp * *transition_exp * (zero - *dt);
+            let g_last_s_direct = F32x4::blend(active, zero, g_new.0);
+            let g_last_sf_direct = F32x4::blend(active, zero, g_new.1);
+            let g_last_d_direct = F32x4::blend(active, zero, g_new.2);
+            let g_new_s = F32x4::blend(active, g_new.0, zero);
+            let g_new_sf = F32x4::blend(active, g_new.1, zero);
+            let g_new_d = F32x4::blend(active, g_new.2, zero);
 
-            let (g_s_long, g_d_long, g_r_long) = stab4_bwd(
-                w, long, *last_s, curve.out, *last_d, *rating, 7, g_long, grad,
-            );
-            let (g_s_short, g_d_short, g_r_short) = stab4_bwd(
-                w, short, *last_s, curve.out, *last_d, *rating, 16, g_short, grad,
-            );
-            let g_d_next = next_difficulty4_bwd(
-                params,
-                *last_d,
-                *rating,
-                *nd_out_pre,
-                *nd_delta_d,
-                g_new_d,
-                grad,
-            );
-            let g_s_curve = curve4_bwd(
-                w,
-                params,
-                curve,
-                *dt,
-                *last_s,
-                g_r_long + g_r_short + g_r_loss,
-                grad,
-            );
-            g_last_s = g_last_s + g_s_long + g_s_short + g_s_curve;
-            g_last_d = g_last_d + g_d_long + g_d_short + g_d_next;
-            let s_open = mask_and(
-                last_s.cmp_gt(F32x4::splat(S_MIN as f32)),
-                last_s.cmp_lt(F32x4::splat(S_MAX as f32)),
-            );
-            let d_open = mask_and(
-                last_d.cmp_gt(F32x4::splat(D_MIN as f32)),
-                last_d.cmp_lt(F32x4::splat(D_MAX as f32)),
-            );
+            let g_new_s_slow_out = F32x4::blend(*open_slow, g_new_s, zero);
+            let g_new_s_fast_post = F32x4::blend(*open_fast, g_new_sf, zero);
+
+            // relearn: new_sf_pre = rating==1 ? min(new_s_fast_raw, relearn) : new_s_fast_raw
+            let is1 = rating.cmp_eq(splat(1.0));
+            let relearn_wins = new_s_fast_raw.cmp_gt(*relearn); // min picks relearn when raw>relearn
+            let g_fast_raw_if1 = F32x4::blend(relearn_wins, zero, g_new_s_fast_post);
+            let g_relearn_if1 = F32x4::blend(relearn_wins, g_new_s_fast_post, zero);
+            let g_new_s_fast_raw = F32x4::blend(is1, g_fast_raw_if1, g_new_s_fast_post);
+            let g_relearn = F32x4::blend(is1, g_relearn_if1, zero);
+            let g_new_s_slow = g_new_s_slow_out + g_relearn * splat(0.8);
+
+            let (g_ls1, g_ld1, g_r1) = stab_bwd(w, slow, g_new_s_slow, grad);
+            let (g_lsf1, g_ld2, g_rfast) = stab_bwd(w, fast, g_new_s_fast_raw, grad);
+            let (g_ld3, g_r2) = nextdiff_bwd(params, nd, g_new_d, grad);
+            let (g_ls2, g_lsf2, g_ld4) =
+                curve_bwd(w, params, curve, g_r1 + g_r2 + g_r_loss, g_rfast, grad);
+
+            let g_last_s = g_last_s_direct + g_ls1 + g_ls2;
+            let g_last_sf = g_last_sf_direct + g_lsf1 + g_lsf2;
+            let g_last_d = g_last_d_direct + g_ld1 + g_ld2 + g_ld3 + g_ld4;
             (
-                F32x4::blend(s_open, g_last_s, zero),
-                F32x4::blend(d_open, g_last_d, zero),
+                F32x4::blend(*open_state_s, g_last_s, zero),
+                F32x4::blend(*open_state_sf, g_last_sf, zero),
+                F32x4::blend(*open_state_d, g_last_d, zero),
             )
         }
     }
@@ -771,53 +782,21 @@ fn step4_bwd(
 
 #[inline(always)]
 fn bce_retrievability_grad(r_raw: F32x4, label: F32x4, weight: F32x4) -> F32x4 {
-    let zero = F32x4::splat(0.0);
-    let one = F32x4::splat(1.0);
+    let zero = splat(0.0);
+    let one = splat(1.0);
     let r = r_raw.clamp(0.0001, 0.9999);
-    let label_is_one = label.cmp_gt(F32x4::splat(0.5));
+    let label_is_one = label.cmp_gt(splat(0.5));
     let grad = F32x4::blend(label_is_one, zero - weight / r, weight / (one - r));
-    let open = mask_and(
-        r_raw.cmp_gt(F32x4::splat(0.0001)),
-        r_raw.cmp_lt(F32x4::splat(0.9999)),
-    );
+    let open = open_mask(r_raw, 0.0001, 0.9999);
     F32x4::blend(open, grad, zero)
 }
 
-fn add_scalar_column_grad(
-    w: &[f32],
-    t_historys: &[f32],
-    r_historys: &[f32],
-    labels: &[f32],
-    weights: &[f32],
-    seq_len: usize,
-    batch_size: usize,
-    column: usize,
-    grad: &mut [f64; PARAM_LEN],
-) {
-    let w = super::dual_params(w);
-    let mut state = super::MemoryStateDual {
-        stability: super::Dual35::constant(0.0),
-        difficulty: super::Dual35::constant(0.0),
-    };
-    for row in 0..seq_len {
-        let index = row * batch_size + column;
-        let delta_t = t_historys[index] as f64;
-        let rating = r_historys[index] as usize;
-        if rating == 0 {
-            break;
-        }
-        let weight = weights[index] as f64;
-        if row > 0 && weight != 0.0 {
-            let r = super::forgetting_curve(&w, delta_t, state.stability);
-            let item_loss = super::bce_loss(r, labels[index] as f64, weight);
-            for (dst, src) in grad.iter_mut().zip(item_loss.grad) {
-                *dst += src;
-            }
-        }
-        if row + 1 < seq_len && r_historys[(row + 1) * batch_size + column] != 0.0 {
-            state = super::step(&w, delta_t, rating, state, row);
-        }
-    }
+#[inline(always)]
+fn bce_loss_value(r_raw: F32x4, label: F32x4, weight: F32x4) -> F32x4 {
+    let one = splat(1.0);
+    let r = r_raw.clamp(0.0001, 0.9999);
+    let probability = one - (label - r).abs();
+    splat(0.0) - weight * probability.ln()
 }
 
 #[inline(always)]
@@ -852,89 +831,56 @@ pub(super) fn windowed_loss(
     seq_len: usize,
     batch_size: usize,
 ) -> f64 {
-    let group_count = batch_size / 4;
-    if group_count == 0 {
-        return windowed_loss_scalar(
+    if batch_size % 4 != 0 {
+        return super::windowed_loss_scalar(
             w, t_historys, r_historys, labels, weights, seq_len, batch_size,
         );
     }
 
     let params = Params::new(w);
-    let mut loss = 0.0;
+    let mut loss = 0.0f64;
+    let group_count = batch_size / 4;
+
     for group in 0..group_count {
         let column = group * 4;
         let active_seq_len = group_active_seq_len(r_historys, seq_len, batch_size, column);
-        let mut s = F32x4::splat(0.0);
-        let mut d = F32x4::splat(0.0);
+        if active_seq_len < 2 {
+            continue;
+        }
+
+        let mut s = splat(0.0);
+        let mut sf = splat(0.0);
+        let mut d = splat(0.0);
         for row in 0..active_seq_len {
             let index = row * batch_size + column;
-            let delta_t = F32x4::load(t_historys, index);
-            let rating = F32x4::load(r_historys, index);
             if row > 0 {
-                let r = if four_non_positive(t_historys, index) {
-                    F32x4::splat(1.0)
-                } else {
-                    forgetting_curve(w, &params, delta_t, s.clamp(S_MIN as f32, S_MAX as f32))
-                }
-                .clamp(0.0001, 0.9999);
-                loss += bce_loss(r, F32x4::load(labels, index), F32x4::load(weights, index)).sum()
-                    as f64;
+                let curve = curve_fwd(w, &params, F32x4::load(t_historys, index), s, sf, d, false);
+                loss += bce_loss_value(
+                    curve.out,
+                    F32x4::load(labels, index),
+                    F32x4::load(weights, index),
+                )
+                .sum() as f64;
             }
             if row + 1 < active_seq_len {
-                (s, d) = step(
+                let (next, _) = step_fwd(
                     w,
                     &params,
-                    delta_t,
-                    rating,
+                    F32x4::load(t_historys, index),
+                    F32x4::load(r_historys, index),
                     s,
+                    sf,
                     d,
                     row,
-                    four_non_positive(t_historys, index),
                 );
-            }
-        }
-    }
-
-    let scalar_params = super::ScalarParams::new(w);
-    for column in (group_count * 4)..batch_size {
-        let mut state = super::MemoryStateScalar {
-            stability: 0.0,
-            difficulty: 0.0,
-        };
-        for row in 0..seq_len {
-            let index = row * batch_size + column;
-            let delta_t = t_historys[index] as f64;
-            let rating = r_historys[index] as usize;
-            if rating == 0 {
-                break;
-            }
-            let weight = weights[index] as f64;
-            if row > 0 && weight != 0.0 {
-                let r = super::forgetting_curve_scalar(w, &scalar_params, delta_t, state.stability);
-                loss += super::bce_loss_scalar(r, labels[index] as f64, weight);
-            }
-            if row + 1 < seq_len && r_historys[(row + 1) * batch_size + column] != 0.0 {
-                state = super::step_scalar(w, &scalar_params, delta_t, rating, state, row);
+                s = next.0;
+                sf = next.1;
+                d = next.2;
             }
         }
     }
 
     loss
-}
-
-#[cfg(test)]
-pub(super) fn windowed_loss_for_test(
-    w: &[f32],
-    t_historys: &[f32],
-    r_historys: &[f32],
-    labels: &[f32],
-    weights: &[f32],
-    seq_len: usize,
-    batch_size: usize,
-) -> f64 {
-    windowed_loss(
-        w, t_historys, r_historys, labels, weights, seq_len, batch_size,
-    )
 }
 
 pub(super) fn windowed_grad(
@@ -951,7 +897,7 @@ pub(super) fn windowed_grad(
     let group_count = batch_size / 4;
 
     if seq_len >= 2 {
-        let mut caches = Vec::with_capacity(seq_len.saturating_sub(1));
+        let mut caches: Vec<Step> = Vec::with_capacity(seq_len);
         for group in 0..group_count {
             let column = group * 4;
             let active_seq_len = group_active_seq_len(r_historys, seq_len, batch_size, column);
@@ -959,57 +905,55 @@ pub(super) fn windowed_grad(
                 continue;
             }
             caches.clear();
-            let mut s = F32x4::splat(0.0);
-            let mut d = F32x4::splat(0.0);
+            let mut s = splat(0.0);
+            let mut sf = splat(0.0);
+            let mut d = splat(0.0);
             for row in 0..active_seq_len - 1 {
                 let index = row * batch_size + column;
-                let (next_state, cache) = step4_fwd(
+                let (next, cache) = step_fwd(
                     w,
                     &params,
                     F32x4::load(t_historys, index),
                     F32x4::load(r_historys, index),
                     s,
+                    sf,
                     d,
                     row,
-                    four_non_positive(t_historys, index),
                 );
-                s = next_state.0;
-                d = next_state.1;
+                s = next.0;
+                sf = next.1;
+                d = next.2;
                 caches.push(cache);
             }
 
             let last_index = (active_seq_len - 1) * batch_size + column;
-            let last_s = s.clamp(S_MIN as f32, S_MAX as f32);
-            let last_curve = if four_non_positive(t_historys, last_index) {
-                curve4_same_day()
-            } else {
-                curve4_fwd(w, &params, F32x4::load(t_historys, last_index), last_s)
-            };
-            let mut group_grad = [F32x4::splat(0.0); PARAM_LEN];
+            let mut group_grad = [splat(0.0); PARAM_LEN];
+            let last_curve = curve_fwd(
+                w,
+                &params,
+                F32x4::load(t_historys, last_index),
+                s,
+                sf,
+                d,
+                false,
+            );
             let g_last_r = bce_retrievability_grad(
                 last_curve.out,
                 F32x4::load(labels, last_index),
                 F32x4::load(weights, last_index),
             );
-            let g_last_s = curve4_bwd(
+            let (mut g_s, mut g_sf, mut g_d) = curve_bwd(
                 w,
                 &params,
                 &last_curve,
-                F32x4::load(t_historys, last_index),
-                last_s,
                 g_last_r,
+                splat(0.0),
                 &mut group_grad,
             );
-            let s_open = mask_and(
-                s.cmp_gt(F32x4::splat(S_MIN as f32)),
-                s.cmp_lt(F32x4::splat(S_MAX as f32)),
-            );
-            let mut g_s = F32x4::blend(s_open, g_last_s, F32x4::splat(0.0));
-            let mut g_d = F32x4::splat(0.0);
 
             for row in (0..active_seq_len - 1).rev() {
                 let g_r_loss = if row == 0 {
-                    F32x4::splat(0.0)
+                    splat(0.0)
                 } else {
                     let index = row * batch_size + column;
                     bce_retrievability_grad(
@@ -1018,16 +962,17 @@ pub(super) fn windowed_grad(
                         F32x4::load(weights, index),
                     )
                 };
-                let previous = step4_bwd(
+                let prev = step_bwd(
                     w,
                     &params,
                     &caches[row],
-                    (g_s, g_d),
+                    (g_s, g_sf, g_d),
                     g_r_loss,
                     &mut group_grad,
                 );
-                g_s = previous.0;
-                g_d = previous.1;
+                g_s = prev.0;
+                g_sf = prev.1;
+                g_d = prev.2;
             }
 
             for (dst, src) in grad.iter_mut().zip(group_grad) {
@@ -1036,17 +981,18 @@ pub(super) fn windowed_grad(
         }
     }
 
+    // remainder columns that don't fill a group of four
     for column in (group_count * 4)..batch_size {
-        add_scalar_column_grad(
+        super::reverse::column_grad(
             w, t_historys, r_historys, labels, weights, seq_len, batch_size, column, &mut grad,
         );
     }
 
-    let mut grad_f32 = [0.0; PARAM_LEN];
-    for (dst, src) in grad_f32.iter_mut().zip(grad) {
+    let mut out = [0.0f32; PARAM_LEN];
+    for (dst, src) in out.iter_mut().zip(grad) {
         *dst = src as f32;
     }
-    grad_f32
+    out
 }
 
 #[cfg(test)]

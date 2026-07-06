@@ -101,23 +101,22 @@ mod tests {
 
     #[test]
     fn test_fsrs7_clipper_monotonic_bounds() {
-        let mut params = vec![1000.0; 35];
-        params[27] = -1.0;
-        params[28] = 10.0;
-        params[29] = 0.1;
-        params[30] = 2.0;
+        let mut params = vec![1000.0; 34];
+        params[23] = -1.0;
+        params[24] = 10.0;
+        params[27] = 0.1;
+        params[28] = 2.0;
         let clipped = clip_parameters(&params, 1, true);
-        assert_eq!(clipped.len(), 35);
+        assert_eq!(clipped.len(), 34);
         assert!(clipped[1] >= clipped[0]);
         assert!(clipped[2] >= clipped[1]);
         assert!(clipped[3] >= clipped[2]);
         assert!(clipped[28] >= clipped[27]);
-        assert!(clipped[30] >= clipped[29]);
     }
 
     #[test]
     fn test_clip_parameters_in_place_matches_allocating_wrapper() {
-        let params = vec![1000.0; 35];
+        let params = vec![1000.0; 34];
         let expected = clip_parameters(&params, 1, true);
         let mut actual = params;
         clip_parameters_in_place(&mut actual, 1, true);
@@ -147,12 +146,11 @@ mod tests {
             params[idx] = f32::NAN;
         }
         let clipped = clip_parameters(&params, 1, true);
-        assert_eq!(clipped.len(), 35);
+        assert_eq!(clipped.len(), 34);
         assert!(clipped.iter().all(|v| v.is_finite()));
         assert!(clipped[1] >= clipped[0]);
         assert!(clipped[2] >= clipped[1]);
         assert!(clipped[3] >= clipped[2]);
         assert!(clipped[28] >= clipped[27]);
-        assert!(clipped[30] >= clipped[29]);
     }
 }

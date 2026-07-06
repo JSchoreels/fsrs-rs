@@ -37,6 +37,7 @@ mod tests {
         let state = MemoryState {
             stability: 10.0,
             difficulty: 5.0,
+            stability_fast: 10.0,
         };
         let expected = current_retrievability(state, 3.0, FSRS6_DEFAULT_DECAY);
         let actual = fsrs.current_retrievability(state, 3.0);
@@ -49,6 +50,7 @@ mod tests {
         let state = MemoryState {
             stability: 12.345,
             difficulty: 5.0,
+            stability_fast: 12.345,
         };
 
         assert_eq!(fsrs.s90(state), state.stability);
