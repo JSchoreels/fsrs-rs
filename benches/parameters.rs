@@ -211,12 +211,8 @@ fn load_and_prepare_data_with_card_ids() -> (Vec<FSRSItem>, Vec<i64>) {
     [pretrain_set, train_set].concat().into_iter().unzip()
 }
 
-fn load_and_prepare_data() -> Vec<FSRSItem> {
-    load_and_prepare_data_with_card_ids().0
-}
-
 fn benchmark_evaluate(c: &mut Criterion) {
-    let items = load_and_prepare_data();
+    let (items, card_ids) = load_and_prepare_data_with_card_ids();
     // Evaluate uses the FSRS instance's existing parameters.
     let fsrs = FSRS::default();
 
@@ -226,6 +222,17 @@ fn benchmark_evaluate(c: &mut Criterion) {
     group.bench_function("evaluate", |b| {
         b.iter(|| {
             fsrs.evaluate(black_box(items.clone()), |_| true).unwrap();
+        })
+    });
+
+    group.bench_function("evaluate_with_card_ids", |b| {
+        b.iter(|| {
+            fsrs.evaluate_with_card_ids(
+                black_box(items.clone()),
+                black_box(card_ids.clone()),
+                |_| true,
+            )
+            .unwrap();
         })
     });
 

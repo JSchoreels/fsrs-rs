@@ -127,17 +127,28 @@ fn convert_to_fsrs_items(
 
 /// Convert a series of revlog entries sorted by card id into FSRS items.
 pub(crate) fn anki_to_fsrs(revlogs: Vec<RevlogEntry>) -> Vec<FSRSItem> {
+    anki_to_fsrs_with_card_ids(revlogs).0
+}
+
+/// Like [`anki_to_fsrs`], but also returns each item's originating card id (aligned with the
+/// items) — the `card_ids` convention used by `ComputeParametersInput` and
+/// `evaluate_with_card_ids`.
+pub(crate) fn anki_to_fsrs_with_card_ids(revlogs: Vec<RevlogEntry>) -> (Vec<FSRSItem>, Vec<i64>) {
     let mut revlogs = revlogs
         .into_iter()
         .chunk_by(|r| r.cid)
         .into_iter()
-        .filter_map(|(_cid, entries)| {
+        .filter_map(|(cid, entries)| {
             convert_to_fsrs_items(entries.collect(), 4, Tz::Asia__Shanghai)
+                .map(|items| items.into_iter().map(move |(id, item)| (id, cid, item)))
         })
         .flatten()
         .collect_vec();
-    revlogs.sort_by_cached_key(|(id, _)| *id);
-    revlogs.into_iter().map(|(_, item)| item).collect()
+    revlogs.sort_by_cached_key(|(id, _, _)| *id);
+    revlogs
+        .into_iter()
+        .map(|(_, cid, item)| (item, cid))
+        .unzip()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -182,6 +193,10 @@ pub(crate) fn data_from_csv() -> Vec<FSRSItem> {
 
 pub(crate) fn anki21_sample_file_converted_to_fsrs() -> Vec<FSRSItem> {
     anki_to_fsrs(read_collection().expect("read error"))
+}
+
+pub(crate) fn anki21_sample_file_converted_to_fsrs_with_card_ids() -> (Vec<FSRSItem>, Vec<i64>) {
+    anki_to_fsrs_with_card_ids(read_collection().expect("read error"))
 }
 
 pub(crate) fn read_collection() -> Result<Vec<RevlogEntry>> {

@@ -167,6 +167,25 @@ impl FSRS {
         step(&self.parameters, delta_t, rating as f32, state, nth)
     }
 
+    /// Memory state right after a card's FIRST review — the initialization branch of
+    /// [`Self::forward_reviews`]. Factored out so the card-walk evaluation path
+    /// ([`Self::evaluate_with_card_ids`]) uses the exact same initialization and the two can
+    /// never drift apart.
+    pub(crate) fn init_state_from_first_review(&self, review: &FSRSReview) -> MemoryState {
+        if review.rating == 0 {
+            MemoryState {
+                stability: S_MIN,
+                difficulty: D_MIN,
+            }
+        } else {
+            let rating = review.rating.clamp(1, 4);
+            MemoryState {
+                stability: self.init_stability(rating).clamp(S_MIN, S_MAX),
+                difficulty: self.init_difficulty(rating).clamp(D_MIN, D_MAX),
+            }
+        }
+    }
+
     /// If [starting_state] is provided, it will be used instead of the default initial stability/
     /// difficulty.
     pub(crate) fn forward_reviews(
@@ -185,25 +204,7 @@ impl FSRS {
                 0,
             )
         } else {
-            let rating = reviews[0].rating;
-            if rating == 0 {
-                (
-                    MemoryState {
-                        stability: S_MIN,
-                        difficulty: D_MIN,
-                    },
-                    1,
-                )
-            } else {
-                let rating = rating.clamp(1, 4);
-                (
-                    MemoryState {
-                        stability: self.init_stability(rating).clamp(S_MIN, S_MAX),
-                        difficulty: self.init_difficulty(rating).clamp(D_MIN, D_MAX),
-                    },
-                    1,
-                )
-            }
+            (self.init_state_from_first_review(&reviews[0]), 1)
         };
 
         for (index, review) in reviews.iter().enumerate().skip(start_index) {
