@@ -272,8 +272,50 @@ impl MetricsRenderer for ProgressCollector {
     fn render_valid(&mut self, _item: TrainingProgress) {}
 }
 
+/// Hyperparameters used when training FSRS parameters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrainingConfig {
+    pub num_epochs: usize,
+    pub batch_size: usize,
+    pub seed: u64,
+    pub learning_rate: f64,
+    pub max_seq_len: usize,
+    pub gamma: f64,
+}
+
+impl Default for TrainingConfig {
+    fn default() -> Self {
+        Self {
+            num_epochs: 5,
+            batch_size: 512,
+            seed: 2023,
+            learning_rate: 4e-2,
+            max_seq_len: 256,
+            gamma: 1.0,
+        }
+    }
+}
+
+fn validate_training_config(config: &TrainingConfig) -> Result<()> {
+    if config.batch_size == 0 || !config.learning_rate.is_finite() || !config.gamma.is_finite() {
+        return Err(FSRSError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn apply_training_config(config: &mut InternalTrainingConfig, custom: Option<TrainingConfig>) {
+    if let Some(custom) = custom {
+        config.num_epochs = custom.num_epochs;
+        config.batch_size = custom.batch_size;
+        config.seed = custom.seed;
+        config.learning_rate = custom.learning_rate;
+        config.max_seq_len = custom.max_seq_len;
+        config.gamma = custom.gamma;
+    }
+}
+
 #[derive(Config)]
-pub(crate) struct TrainingConfig {
+pub(crate) struct InternalTrainingConfig {
     pub model: ModelConfig,
     pub optimizer: AdamConfig,
     #[config(default = false)]
@@ -288,6 +330,8 @@ pub(crate) struct TrainingConfig {
     pub learning_rate: f64,
     #[config(default = 1024)]
     pub max_seq_len: usize,
+    #[config(default = 1.0)]
+    pub gamma: f64,
 }
 
 pub(crate) fn calculate_average_recall(items: &[FSRSItem]) -> f32 {
@@ -339,6 +383,8 @@ pub struct ComputeParametersInput {
     pub model_version: ComputeParametersVersion,
     /// Number of relearning steps
     pub num_relearning_steps: Option<usize>,
+    /// Optional hyperparameters; None preserves version-specific branch defaults.
+    pub training_config: Option<TrainingConfig>,
 }
 
 impl Default for ComputeParametersInput {
@@ -351,12 +397,13 @@ impl Default for ComputeParametersInput {
             enable_sched_penalties: false,
             model_version: ComputeParametersVersion::default(),
             num_relearning_steps: None,
+            training_config: None,
         }
     }
 }
 
 fn apply_windowed_fsrs7_training_tuning(
-    config: &mut TrainingConfig,
+    config: &mut InternalTrainingConfig,
     model_version: ComputeParametersVersion,
     has_card_ids: bool,
 ) {
@@ -497,6 +544,7 @@ pub fn compute_parameters(
         enable_sched_penalties,
         model_version,
         num_relearning_steps,
+        training_config,
         ..
     }: ComputeParametersInput,
 ) -> Result<Vec<f32>> {
@@ -511,6 +559,9 @@ pub fn compute_parameters(
         }
     };
 
+    if let Some(config) = &training_config {
+        validate_training_config(config).inspect_err(|_| finish_progress())?;
+    }
     let train_set = normalize_for_model_version(train_set, model_version);
     let (dataset_for_initialization, train_set) = if card_ids.is_some() {
         prepare_training_data_with_card_ids(attach_card_ids(train_set, card_ids)?)
@@ -566,7 +617,7 @@ pub fn compute_parameters(
         finish_progress();
         return Ok(initialized_parameters);
     }
-    let mut config = TrainingConfig::new(
+    let mut config = InternalTrainingConfig::new(
         ModelConfig {
             freeze_initial_stability: !enable_short_term,
             initial_stability: None,
@@ -578,6 +629,7 @@ pub fn compute_parameters(
     )
     .with_enable_sched_penalties(enable_sched_penalties);
     apply_windowed_fsrs7_training_tuning(&mut config, model_version, has_card_ids);
+    apply_training_config(&mut config, training_config);
     let mut weighted_train_set = recency_weighted_training_items(train_set);
     weighted_train_set.retain(|item| item.item.reviews.len() <= config.max_seq_len);
 
@@ -639,14 +691,26 @@ pub fn compute_parameters(
 pub fn benchmark(
     ComputeParametersInput {
         train_set,
+        card_ids,
         enable_short_term,
         enable_sched_penalties,
         model_version,
         num_relearning_steps,
+        training_config,
         ..
     }: ComputeParametersInput,
 ) -> Vec<f32> {
+    if let Some(config) = &training_config {
+        validate_training_config(config).expect("invalid training configuration");
+    }
     let train_set = normalize_for_model_version(train_set, model_version);
+    let has_card_ids = card_ids.is_some();
+    if card_ids
+        .as_ref()
+        .is_some_and(|ids| ids.len() != train_set.len())
+    {
+        panic!("card_ids must be aligned with train_set");
+    }
     let average_recall = calculate_average_recall(&train_set);
     let (dataset_for_initialization, _next_train_set) = train_set
         .clone()
@@ -671,7 +735,7 @@ pub fn benchmark(
             initialized_parameters
         }
     };
-    let mut config = TrainingConfig::new(
+    let mut config = InternalTrainingConfig::new(
         ModelConfig {
             freeze_initial_stability: !enable_short_term,
             initial_stability: None,
@@ -682,9 +746,12 @@ pub fn benchmark(
         training_adam_config(),
     )
     .with_enable_sched_penalties(enable_sched_penalties);
+    apply_windowed_fsrs7_training_tuning(&mut config, model_version, has_card_ids);
     // save RAM and speed up training
     config.max_seq_len = 64;
-    let mut weighted_train_set = recency_weighted_fsrs_items(train_set);
+    apply_training_config(&mut config, training_config);
+    let mut weighted_train_set =
+        recency_weighted_training_items(attach_card_ids(train_set, card_ids).unwrap());
     weighted_train_set.retain(|item| item.item.reviews.len() <= config.max_seq_len);
     let model = train::<Autodiff<B>>(weighted_train_set, &initialized_parameters, &config, None);
     let parameters: Vec<f32> = model.unwrap().w.val().to_data().to_vec::<f32>().unwrap();
@@ -975,7 +1042,7 @@ fn sync_host_parameters_to_model<B: Backend>(model: &mut Model<B>, parameters: &
 fn train<B: AutodiffBackend>(
     train_set: Vec<WeightedFSRSItem>,
     initial_parameters: &[f32],
-    config: &TrainingConfig,
+    config: &InternalTrainingConfig,
     progress: Option<ProgressCollector>,
 ) -> Result<Model<B>> {
     B::seed(config.seed);
@@ -1050,7 +1117,7 @@ fn train<B: AutodiffBackend>(
             );
             let lr = LrScheduler::step(&mut lr_scheduler);
             let progress = Progress::new(iteration, train_batch_count);
-            let l2_weight = L2_PENALTY_WEIGHT;
+            let l2_weight = L2_PENALTY_WEIGHT * config.gamma;
 
             if let Some(host_adam) = host_adam.as_mut() {
                 let item = &windowed_batches.as_ref().expect("windowed batches")[batch_index];
@@ -1163,7 +1230,7 @@ fn train<B: AutodiffBackend>(
                 || prefix_batch_real_batch_size(&valid_batches[batch_index]),
                 |batches| batches[batch_index].real_batch_size(),
             );
-            let l2_weight = L2_PENALTY_WEIGHT;
+            let l2_weight = L2_PENALTY_WEIGHT * config.gamma;
             let w_vec = host_parameters
                 .as_deref()
                 .or(model_valid_w_vec.as_deref())
@@ -1282,12 +1349,13 @@ mod tests {
 
     #[test]
     fn test_windowed_fsrs7_training_tuning_applies_only_with_card_ids() {
-        let base_config = TrainingConfig::new(ModelConfig::default(), training_adam_config());
+        let base_config =
+            InternalTrainingConfig::new(ModelConfig::default(), training_adam_config());
         let default_learning_rate = base_config.learning_rate;
         let default_num_epochs = base_config.num_epochs;
 
         let mut windowed_config =
-            TrainingConfig::new(ModelConfig::default(), training_adam_config());
+            InternalTrainingConfig::new(ModelConfig::default(), training_adam_config());
         apply_windowed_fsrs7_training_tuning(
             &mut windowed_config,
             ComputeParametersVersion::Fsrs7,
@@ -1301,7 +1369,8 @@ mod tests {
             (ComputeParametersVersion::Fsrs6, true),
             (ComputeParametersVersion::Fsrs6, false),
         ] {
-            let mut config = TrainingConfig::new(ModelConfig::default(), training_adam_config());
+            let mut config =
+                InternalTrainingConfig::new(ModelConfig::default(), training_adam_config());
             apply_windowed_fsrs7_training_tuning(&mut config, model_version, has_card_ids);
             assert_eq!(config.learning_rate, default_learning_rate);
             assert_eq!(config.num_epochs, default_num_epochs);
@@ -1671,6 +1740,7 @@ mod tests {
             enable_sched_penalties: true,
             model_version: ComputeParametersVersion::Fsrs6,
             num_relearning_steps: None,
+            training_config: None,
         })
         .unwrap();
         assert_eq!(parameters, FSRS6_DEFAULT_PARAMETERS.to_vec());
@@ -1686,6 +1756,7 @@ mod tests {
             enable_sched_penalties: true,
             model_version: ComputeParametersVersion::Fsrs7,
             num_relearning_steps: None,
+            training_config: None,
         })
         .unwrap();
         assert_eq!(parameters, DEFAULT_PARAMETERS.to_vec());
@@ -1728,6 +1799,7 @@ mod tests {
             enable_sched_penalties: true,
             model_version: ComputeParametersVersion::Fsrs7,
             num_relearning_steps: None,
+            training_config: None,
         });
 
         assert!(parameters.is_ok());
@@ -1759,6 +1831,7 @@ mod tests {
             enable_sched_penalties: false,
             model_version: ComputeParametersVersion::Fsrs7,
             num_relearning_steps: None,
+            training_config: None,
         })
         .unwrap();
 
@@ -1865,8 +1938,10 @@ mod tests {
             0.27700496,
         ]);
 
-        let config =
-            TrainingConfig::new(ModelConfig::default(), AdamConfig::new().with_epsilon(1e-8));
+        let config = InternalTrainingConfig::new(
+            ModelConfig::default(),
+            AdamConfig::new().with_epsilon(1e-8),
+        );
         let mut optim = config.optimizer.init::<B, Model<B>>();
         let lr = 0.04;
         let grads = GradientsParams::from_grads(gradients, &model);
@@ -2029,6 +2104,55 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_parameters_rejects_invalid_training_config() {
+        for training_config in [
+            TrainingConfig {
+                batch_size: 0,
+                ..Default::default()
+            },
+            TrainingConfig {
+                learning_rate: f64::NAN,
+                ..Default::default()
+            },
+            TrainingConfig {
+                gamma: f64::INFINITY,
+                ..Default::default()
+            },
+        ] {
+            let result = compute_parameters(ComputeParametersInput {
+                training_config: Some(training_config),
+                ..Default::default()
+            });
+            assert!(matches!(result, Err(FSRSError::InvalidInput)));
+        }
+    }
+
+    #[test]
+    fn test_compute_parameters_uses_custom_training_limits() {
+        let items = crate::convertor_tests::anki21_sample_file_converted_to_fsrs();
+        let retained = |max_seq_len| {
+            let progress = CombinedProgressState::new_shared();
+            let parameters = compute_parameters(ComputeParametersInput {
+                train_set: items.clone(),
+                progress: Some(progress.clone()),
+                training_config: Some(TrainingConfig {
+                    num_epochs: 0,
+                    max_seq_len,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(parameters.iter().all(|p| p.is_finite()));
+            let state = progress.lock().unwrap();
+            assert!(state.finished());
+            assert_eq!(state.splits[0].epoch_total, 0);
+            state.splits[0].items_total
+        };
+        assert!(retained(2) < retained(256));
+    }
+
+    #[test]
     fn test_training() {
         if std::env::var("SKIP_TRAINING").is_ok() {
             println!("Skipping test in CI");
@@ -2083,6 +2207,7 @@ mod tests {
                         enable_sched_penalties: true,
                         model_version,
                         num_relearning_steps: None,
+                        training_config: None,
                     })
                     .unwrap();
                     dbg!(&parameters);

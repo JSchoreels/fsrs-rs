@@ -1,43 +1,35 @@
 # Inference Data Flow
 
-This document tracks the data read and created by runtime FSRS inference paths.
+## Model and inputs
 
-## Inputs Read
+`FSRS<B>` owns the versioned Burn model and backend device. Construction
+normalizes and clips the input parameters. Inference reads chronological
+`FSRSItem.reviews` and creates transient `MemoryStateTensors` through
+`Model::forward` and `Model::step`. Public memory states contain `stability`,
+`difficulty`, and `stability_fast`.
 
-- `FSRS::new()` reads the caller-provided parameter slice and normalizes it through
-  model-version compatibility checks.
-- `FSRS` stores the clipped active parameter vector and selected model version for
-  runtime inference.
-- `memory_state()`, `memory_state_batch()`, `historical_memory_states()`, and
-  `historical_memory_state_batch()` read `FSRSItem.reviews` in chronological order.
-- `next_states()` and `next_states_with_elapsed_days()` read an optional current
-  `MemoryState`, desired retention, elapsed days, and the active parameter vector.
-- `evaluate()`, `universal_metrics()`, and `evaluate_with_time_series_splits()`
-  read FSRS items, current review ratings, current review elapsed days, and
-  recency or constant evaluation weights.
+FSRS-6 rounds elapsed days internally; FSRS-7 retains fractional elapsed days.
+Scheduling reads the complete current memory state, desired retention, and
+elapsed days. No caller-owned reviews or memory states are mutated.
 
-## Data Created
+## Evaluation
 
-- Runtime review replay creates transient `MemoryState` values from scalar FSRS
-  transitions.
-- Batch memory-state APIs create output vectors aligned with the input item order.
-- Evaluation creates transient prediction, label, weight, and R-matrix aggregate
-  buffers.
-- Time-series evaluation creates transient train/test splits and aggregates
-  predictions across completed splits.
+`evaluate()` batches prefix histories and aggregates recency-weighted binary
+cross-entropy and R-matrix RMSE. `evaluate_with_card_ids()` accepts an aligned
+card-ID vector, groups items in first-appearance order, and reuses the versioned
+model's state along each expanding-window history. Non-prefix groups replay
+items independently. Metrics are aggregated in original item order; tensor
+batch shapes and unordered RMSE summation can cause last-bit differences.
+Empty input, misaligned IDs, non-finite metrics, and cancellation are reported
+through the existing error API. No grouping state is persisted.
 
-## Data Updated
+Time-series evaluation slices card IDs alongside each training prefix and
+forwards optional training hyperparameters. Progress callbacks receive transient
+`ItemProgress` values; returning false stops evaluation before the next split.
 
-- No caller-provided review item, review, or memory-state input is mutated.
-- `FSRS` caches its normalized parameter vector at construction. Runtime inference
-  reads this cache and does not update it.
-- Progress callbacks receive transient `ItemProgress` values. Returning `false`
-  interrupts the current operation.
+## Upstream integration
 
-## Compatibility Notes
-
-- FSRS-6 runtime replay rounds elapsed days to nearest whole days inside the
-  scalar FSRS-6 transition, matching the versioned tensor model.
-- FSRS-7 runtime replay keeps fractional elapsed days.
-- Public memory state remains `{ stability, difficulty }`; no Anki-facing storage
-  shape changes are introduced by scalar inference.
+This branch retains its generic backend API and tensor inference paths. Upstream
+main's single-model scalar implementation is not substituted for the FSRS-6/7
+model dispatcher. Historical scalar-port descriptions in the speed plan are
+not a description of the current inference implementation.

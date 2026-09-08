@@ -304,3 +304,20 @@ Interpretation:
 - `Newton/Bisection` remains the historical compatibility baseline for pre-change FSRS-7 interval solving.
 
 Run caveat: the `Newton/Brent` and `Pure Newton` runs used a copied collection snapshot after the live SQLite database became locked. The snapshot had the same Yomitan revlog/card counts and the same FSRS-7 parameter vector as the live runs.
+
+
+## Seed isolation after upstream integration
+
+The optimizer base seed defaults to 42. An omitted training simulation seed is
+now derived as optimizer seed + 1,000,000; an omitted evaluation seed defaults
+to 42 + 2,000,000. Each generation advances the training simulation seed by
+10,000; all candidates within one generation use the same rollout seeds.
+Rollout index offsets and seed derivation use wrapping addition. Explicit
+simulation/evaluation seeds override their respective defaults.
+
+The Cost ADR example derives evaluation and final-report rollout seeds from
+its `--seed` value with offsets 2,000,000 and 3,000,000 respectively. This change
+intentionally changes trained policies and historical fixed-seed benchmark
+outputs. Repeated runs with the same configuration remain deterministic. Policy
+serialization, retention bounds, calibration, and early-stopping configuration
+are unchanged. Cost ADR remains available by default on this branch.

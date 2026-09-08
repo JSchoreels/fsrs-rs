@@ -27,6 +27,10 @@ const COST_ADR_DEFAULT_BASELINE_RETENTIONS: [f32; 16] = [
     0.30, 0.34, 0.38, 0.42, 0.46, 0.50, 0.54, 0.58, 0.62, 0.66, 0.70, 0.74, 0.78, 0.84, 0.89, 0.95,
 ];
 const COST_ADR_DEFAULT_SEED: u64 = 42;
+const COST_ADR_TRAIN_SIMULATION_SEED_OFFSET: u64 = 1_000_000;
+const COST_ADR_EVALUATION_SEED_OFFSET: u64 = 2_000_000;
+const COST_ADR_GENERATION_SEED_STRIDE: u64 = 10_000;
+
 const COST_ADR_DEFAULT_RETENTION_MIN: f32 = 0.30;
 const COST_ADR_DEFAULT_RETENTION_MAX: f32 = 0.995;
 const COST_ADR_DEFAULT_EARLY_STOP_PATIENCE_GENERATIONS: usize = 4;
@@ -845,7 +849,7 @@ fn evaluate_cost_adr_policy(
     existing_cards: Option<&[Card]>,
 ) -> Result<CostAdrEvaluationResult> {
     validate_evaluation_config(evaluation_config)?;
-    let seed = evaluation_config.seed.unwrap_or(COST_ADR_DEFAULT_SEED);
+    let seed = cost_adr_evaluation_seed(evaluation_config);
     let baseline_metrics = evaluate_baseline_desired_retentions(
         config,
         parameters,
@@ -906,7 +910,7 @@ fn evaluate_cost_adr_rollouts(
                 parameters,
                 policy,
                 goal_cost_weight,
-                Some(seed + index as u64),
+                Some(cost_adr_rollout_seed(seed, index)),
                 clone_existing_cards(existing_cards),
             )?;
             let metrics = metrics_from_simulation(&result.result);
@@ -1122,7 +1126,7 @@ fn evaluate_baseline_desired_retentions(
                 config,
                 parameters,
                 desired_retention,
-                Some(seed + index as u64),
+                Some(cost_adr_rollout_seed(seed, index)),
                 clone_existing_cards_with_desired_retention(existing_cards, desired_retention),
             )?;
             Ok(metrics_from_simulation(&result))
@@ -1412,10 +1416,8 @@ fn train_cost_adr_single_user_inner(
     }
 
     let started = Instant::now();
-    let seed = training_config.seed.unwrap_or(COST_ADR_DEFAULT_SEED);
-    let simulation_seed = training_config
-        .simulation_seed
-        .unwrap_or(COST_ADR_DEFAULT_SEED);
+    let seed = cost_adr_training_optimizer_seed(training_config);
+    let simulation_seed = cost_adr_training_simulation_seed(training_config, seed);
     let initial_coefficients = clamp_coefficients(
         &training_config.initial_coefficients,
         training_config.lower_bound,
@@ -1457,6 +1459,7 @@ fn train_cost_adr_single_user_inner(
             solutions[0] = initial_coefficients.clone();
         }
 
+        let generation_seed = cost_adr_generation_seed(simulation_seed, generation);
         let completed_candidates = AtomicUsize::new(generation * training_config.population_size);
         let progress = training_config.progress.clone();
         let candidate_results: Result<Vec<CandidateEvaluation>> = solutions
@@ -1472,7 +1475,7 @@ fn train_cost_adr_single_user_inner(
                     parameters,
                     &policy,
                     &training_config.cost_weights,
-                    simulation_seed,
+                    generation_seed,
                     existing_cards,
                 )?;
                 annotate_cost_adr_rollouts(
@@ -1740,6 +1743,30 @@ fn validate_evaluation_inputs(
         return Err(FSRSError::InvalidInput);
     }
     Ok(())
+}
+
+fn cost_adr_training_optimizer_seed(config: &CostAdrTrainingConfig) -> u64 {
+    config.seed.unwrap_or(COST_ADR_DEFAULT_SEED)
+}
+
+fn cost_adr_training_simulation_seed(config: &CostAdrTrainingConfig, optimizer_seed: u64) -> u64 {
+    config
+        .simulation_seed
+        .unwrap_or_else(|| optimizer_seed.wrapping_add(COST_ADR_TRAIN_SIMULATION_SEED_OFFSET))
+}
+
+fn cost_adr_evaluation_seed(config: &CostAdrEvaluationConfig) -> u64 {
+    config
+        .seed
+        .unwrap_or_else(|| COST_ADR_DEFAULT_SEED.wrapping_add(COST_ADR_EVALUATION_SEED_OFFSET))
+}
+
+fn cost_adr_generation_seed(base_seed: u64, generation: usize) -> u64 {
+    base_seed.wrapping_add((generation as u64).wrapping_mul(COST_ADR_GENERATION_SEED_STRIDE))
+}
+
+fn cost_adr_rollout_seed(base_seed: u64, index: usize) -> u64 {
+    base_seed.wrapping_add(index as u64)
 }
 
 fn metrics_from_simulation(result: &SimulationResult) -> CostAdrMetrics {
@@ -2912,6 +2939,108 @@ mod tests {
     }
 
     #[test]
+    fn test_cost_adr_default_seed_derivation_separates_train_and_evaluation() {
+        let training_config = CostAdrTrainingConfig::default();
+        let optimizer_seed = cost_adr_training_optimizer_seed(&training_config);
+        let training_simulation_seed =
+            cost_adr_training_simulation_seed(&training_config, optimizer_seed);
+        let evaluation_seed = cost_adr_evaluation_seed(&CostAdrEvaluationConfig::default());
+
+        assert_eq!(optimizer_seed, COST_ADR_DEFAULT_SEED);
+        assert_eq!(
+            training_simulation_seed,
+            COST_ADR_DEFAULT_SEED + COST_ADR_TRAIN_SIMULATION_SEED_OFFSET
+        );
+        assert_eq!(
+            evaluation_seed,
+            COST_ADR_DEFAULT_SEED + COST_ADR_EVALUATION_SEED_OFFSET
+        );
+        assert_ne!(training_simulation_seed, evaluation_seed);
+    }
+
+    #[test]
+    fn test_cost_adr_seed_offsets_wrap_at_u64_max() {
+        assert_eq!(cost_adr_rollout_seed(u64::MAX, 1), 0);
+        assert_eq!(
+            cost_adr_generation_seed(u64::MAX, 1),
+            COST_ADR_GENERATION_SEED_STRIDE - 1
+        );
+    }
+
+    #[test]
+    fn test_cost_adr_generation_seed_changes_between_generations() {
+        let base_seed = 123;
+        let generation_0_seed = cost_adr_generation_seed(base_seed, 0);
+        let generation_1_seed = cost_adr_generation_seed(base_seed, 1);
+
+        assert_eq!(generation_0_seed, base_seed);
+        assert_eq!(
+            generation_1_seed,
+            base_seed + COST_ADR_GENERATION_SEED_STRIDE
+        );
+        assert_ne!(generation_0_seed, generation_1_seed);
+        assert_eq!(
+            cost_adr_rollout_seed(generation_1_seed, 2),
+            cost_adr_rollout_seed(generation_1_seed, 2)
+        );
+    }
+
+    #[test]
+    fn test_train_cost_adr_default_seed_matches_explicit_derived_seed() -> Result<()> {
+        let config = SimulatorConfig {
+            deck_size: 80,
+            learn_span: 10,
+            learn_limit: 20,
+            review_limit: 200,
+            ..Default::default()
+        };
+        let default_training_config = CostAdrTrainingConfig {
+            population_size: 2,
+            generations: 1,
+            sigma0: 0.5,
+            cost_weights: vec![0.0],
+            baseline_desired_retentions: vec![0.9],
+            ..Default::default()
+        };
+        let explicit_training_config = CostAdrTrainingConfig {
+            seed: Some(COST_ADR_DEFAULT_SEED),
+            simulation_seed: Some(COST_ADR_DEFAULT_SEED + COST_ADR_TRAIN_SIMULATION_SEED_OFFSET),
+            ..default_training_config.clone()
+        };
+
+        let default_result = CostAdrPolicy::train_single_user(
+            &config,
+            &DEFAULT_PARAMETERS,
+            &default_training_config,
+        )?;
+        let explicit_result = CostAdrPolicy::train_single_user(
+            &config,
+            &DEFAULT_PARAMETERS,
+            &explicit_training_config,
+        )?;
+
+        assert_eq!(default_result.policy, explicit_result.policy);
+        assert_eq!(
+            default_result.baseline_metrics,
+            explicit_result.baseline_metrics
+        );
+        assert_eq!(
+            default_result.best_cost_weight_metrics,
+            explicit_result.best_cost_weight_metrics
+        );
+        assert_eq!(default_result.history, explicit_result.history);
+        assert_eq!(
+            default_result.best_auc_metrics,
+            explicit_result.best_auc_metrics
+        );
+        assert_eq!(
+            default_result.best_hypervolume_delta,
+            explicit_result.best_hypervolume_delta
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_cost_adr_none_seed_uses_default_seed() -> Result<()> {
         let config = SimulatorConfig {
             deck_size: 120,
@@ -2927,7 +3056,7 @@ mod tests {
             seed: None,
         };
         let explicit_seed = CostAdrEvaluationConfig {
-            seed: Some(COST_ADR_DEFAULT_SEED),
+            seed: Some(COST_ADR_DEFAULT_SEED + COST_ADR_EVALUATION_SEED_OFFSET),
             ..default_seed.clone()
         };
 

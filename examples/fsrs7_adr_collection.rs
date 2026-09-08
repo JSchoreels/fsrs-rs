@@ -113,6 +113,7 @@ fn main() -> fsrs::Result<()> {
         );
         let fsrs_started = Instant::now();
         let parameters = compute_parameters(ComputeParametersInput {
+            training_config: None,
             train_set: fsrs_items.clone(),
             card_ids: use_card_ids.then_some(fsrs_card_ids),
             progress: Some(CombinedProgressState::new_shared()),

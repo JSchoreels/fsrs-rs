@@ -595,6 +595,120 @@ impl<B: Backend> FSRS<B> {
         })
     }
 
+    /// Evaluate aligned card histories, reusing each card's expanding-window state.
+    /// Non-prefix groups are evaluated independently. Uses the same versioned
+    /// model and weighted loss as [`Self::evaluate`].
+    pub fn evaluate_with_card_ids<F>(
+        &self,
+        items: Vec<FSRSItem>,
+        card_ids: Vec<i64>,
+        mut progress: F,
+    ) -> Result<ModelEvaluation>
+    where
+        F: FnMut(ItemProgress) -> bool,
+    {
+        if items.is_empty() {
+            return Err(FSRSError::NotEnoughData);
+        }
+        if items.len() != card_ids.len() || items.iter().any(|item| item.reviews.is_empty()) {
+            return Err(FSRSError::InvalidInput);
+        }
+        let weighted_items = recency_weighted_fsrs_items(items);
+        let mut group_index = HashMap::new();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (index, card_id) in card_ids.into_iter().enumerate() {
+            let group = *group_index.entry(card_id).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[group].push(index);
+        }
+        let device = self.device();
+        let model = self.model();
+        let mut predictions = vec![0.0; weighted_items.len()];
+        let mut progress_info = ItemProgress {
+            current: 0,
+            total: weighted_items.len(),
+        };
+        for mut group in groups {
+            group.sort_by_key(|&index| weighted_items[index].item.reviews.len());
+            let longest = &weighted_items[*group.last().unwrap()].item.reviews;
+            let is_chain = group.iter().all(|&index| {
+                let reviews = &weighted_items[index].item.reviews;
+                longest[..reviews.len()] == reviews[..]
+            });
+            let mut state = MemoryStateTensors::zeros(1);
+            let mut applied = 0;
+            for &index in &group {
+                let reviews = &weighted_items[index].item.reviews;
+                if !is_chain {
+                    state = MemoryStateTensors::zeros(1);
+                    applied = 0;
+                }
+                while applied < reviews.len() - 1 {
+                    let review = &reviews[applied];
+                    state = model.step(
+                        Tensor::from_floats([review.delta_t], &device),
+                        Tensor::from_floats([review.rating as f32], &device),
+                        state,
+                        applied,
+                    );
+                    applied += 1;
+                }
+                predictions[index] = model
+                    .power_forgetting_curve(
+                        Tensor::from_floats([reviews.last().unwrap().delta_t], &device),
+                        state.stability.clone(),
+                        state.stability_fast.clone(),
+                        state.difficulty.clone(),
+                    )
+                    .into_scalar()
+                    .to_f32();
+            }
+            progress_info.current += group.len();
+            if !progress(progress_info) {
+                return Err(FSRSError::Interrupted);
+            }
+        }
+        let mut r_matrix: HashMap<(u32, u32, u32), RMatrixValue> = HashMap::new();
+        let mut labels = Vec::with_capacity(weighted_items.len());
+        let mut weights = Vec::with_capacity(weighted_items.len());
+        for (weighted_item, &prediction) in weighted_items.iter().zip(&predictions) {
+            let label = f32::from(weighted_item.item.current().rating > 1);
+            let value = r_matrix
+                .entry(weighted_item.item.r_matrix_index())
+                .or_default();
+            value.predicted += prediction;
+            value.actual += label;
+            value.count += 1.0;
+            value.weight += weighted_item.weight;
+            labels.push(label);
+            weights.push(weighted_item.weight);
+        }
+        let rmse = (r_matrix
+            .values()
+            .map(|v| (v.predicted / v.count - v.actual / v.count).powi(2) * v.weight)
+            .sum::<f32>()
+            / r_matrix.values().map(|v| v.weight).sum::<f32>())
+        .sqrt();
+        let loss = BCELoss::new()
+            .forward(
+                Tensor::<B, 1>::from_floats(predictions.as_slice(), &device),
+                Tensor::from_floats(labels.as_slice(), &device),
+                Tensor::from_floats(weights.as_slice(), &device),
+                Reduction::Auto,
+            )
+            .into_scalar()
+            .to_f32();
+        if !loss.is_finite() || !rmse.is_finite() {
+            return Err(FSRSError::InvalidInput);
+        }
+        Ok(ModelEvaluation {
+            log_loss: loss,
+            rmse_bins: rmse,
+        })
+    }
+
     /// Returns the universal metrics for the existing and provided parameters. If the first value
     /// is smaller than the second value, the existing parameters are better than the provided ones.
     pub fn universal_metrics<F>(
@@ -789,6 +903,7 @@ pub struct ItemProgress {
 #[derive(Debug, Clone)]
 pub struct TimeSeriesSplit {
     pub train_items: Vec<FSRSItem>,
+    pub train_card_ids: Option<Vec<i64>>,
     pub test_items: Vec<FSRSItem>,
 }
 
@@ -811,6 +926,14 @@ impl TimeSeriesSplit {
     /// # Returns
     /// A vector of TimeSeriesSplit, each containing train and validation items
     pub fn split(sorted_items: Vec<FSRSItem>, n_splits: usize) -> Vec<TimeSeriesSplit> {
+        Self::split_with_card_ids(sorted_items, None, n_splits)
+    }
+
+    fn split_with_card_ids(
+        sorted_items: Vec<FSRSItem>,
+        card_ids: Option<Vec<i64>>,
+        n_splits: usize,
+    ) -> Vec<TimeSeriesSplit> {
         if sorted_items.is_empty() || n_splits == 0 {
             return vec![];
         }
@@ -834,6 +957,7 @@ impl TimeSeriesSplit {
                 // Create the split
                 TimeSeriesSplit {
                     train_items: sorted_items[..test_start].to_vec(),
+                    train_card_ids: card_ids.as_ref().map(|ids| ids[..test_start].to_vec()),
                     test_items: sorted_items[test_start..test_end].to_vec(),
                 }
             })
@@ -862,6 +986,8 @@ fn get_bin(x: f32, bins: i32) -> i32 {
 pub fn evaluate_with_time_series_splits<F>(
     ComputeParametersInput {
         train_set,
+        card_ids,
+        training_config,
         enable_short_term,
         enable_sched_penalties,
         model_version,
@@ -877,7 +1003,16 @@ where
         return Err(FSRSError::NotEnoughData);
     }
 
-    let splits = TimeSeriesSplit::split(train_set, 5);
+    if card_ids
+        .as_ref()
+        .is_some_and(|ids| ids.len() != train_set.len())
+    {
+        return Err(FSRSError::InvalidInput);
+    }
+    let splits = TimeSeriesSplit::split_with_card_ids(train_set, card_ids, 5);
+    if splits.is_empty() {
+        return Err(FSRSError::NotEnoughData);
+    }
     let mut all_predictions = Vec::new();
     let mut progress_info = ItemProgress {
         current: 0,
@@ -888,7 +1023,8 @@ where
         // Compute parameters on training data
         let input = ComputeParametersInput {
             train_set: split.train_items.clone(),
-            card_ids: None,
+            card_ids: split.train_card_ids,
+            training_config,
             enable_short_term,
             enable_sched_penalties,
             model_version,
@@ -1181,6 +1317,82 @@ mod tests {
     }
 
     #[test]
+    fn test_evaluate_with_card_ids_matches_evaluate() -> Result<()> {
+        let (items, card_ids) =
+            crate::convertor_tests::anki21_sample_file_converted_to_fsrs_with_card_ids();
+        for fsrs in [
+            FSRS::default(),
+            FSRS::new(PARAMETERS)?,
+            FSRS::new(&DEFAULT_PARAMETERS)?,
+        ] {
+            let plain = fsrs.evaluate(items.clone(), |_| true)?;
+            let windowed =
+                fsrs.evaluate_with_card_ids(items.clone(), card_ids.clone(), |_| true)?;
+            // Tensor batch sizes can differ; compare with tight numeric tolerances.
+            assert!((plain.log_loss - windowed.log_loss).abs() < 1e-6);
+            assert!((plain.rmse_bins - windowed.rmse_bins).abs() < 1e-6);
+
+            // Groupings that are NOT expanding-window prefix chains fall back to the per-item
+            // path and must stay identical too.
+            let bogus_ids: Vec<i64> = (0..items.len() as i64).map(|i| i % 7).collect();
+            let fallback = fsrs.evaluate_with_card_ids(items.clone(), bogus_ids, |_| true)?;
+            assert!((plain.log_loss - fallback.log_loss).abs() < 1e-6);
+            assert!((plain.rmse_bins - fallback.rmse_bins).abs() < 1e-6);
+        }
+
+        // card_ids must be aligned with items.
+        assert!(
+            FSRS::default()
+                .evaluate_with_card_ids(items, vec![0], |_| true)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_time_series_card_id_alignment_and_validation() {
+        let item = FSRSItem {
+            reviews: vec![
+                FSRSReview {
+                    rating: 3,
+                    delta_t: 0.0,
+                },
+                FSRSReview {
+                    rating: 3,
+                    delta_t: 2.0,
+                },
+            ],
+        };
+        let items = vec![item; 6];
+        let splits = TimeSeriesSplit::split_with_card_ids(
+            items.clone(),
+            Some(vec![10, 11, 12, 13, 14, 15]),
+            5,
+        );
+        for (index, split) in splits.iter().enumerate() {
+            assert_eq!(
+                split.train_card_ids.as_ref().unwrap(),
+                &(10..=10 + index as i64).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                split.train_card_ids.as_ref().unwrap().len(),
+                split.train_items.len()
+            );
+        }
+        assert!(matches!(
+            evaluate_with_time_series_splits(
+                ComputeParametersInput {
+                    train_set: items,
+                    card_ids: Some(vec![]),
+                    ..Default::default()
+                },
+                |_| true
+            ),
+            Err(FSRSError::InvalidInput)
+        ));
+    }
+
+    #[test]
     fn test_time_series_split() -> Result<()> {
         let items = anki21_sample_file_converted_to_fsrs();
         let splits = TimeSeriesSplit::split(items[..6].to_vec(), 5);
@@ -1396,6 +1608,7 @@ mod tests {
             enable_sched_penalties: true,
             model_version: crate::training::ComputeParametersVersion::Fsrs7,
             num_relearning_steps: None,
+            training_config: None,
         };
 
         let metrics = evaluate_with_time_series_splits(input.clone(), |_| true).unwrap();
@@ -1411,6 +1624,7 @@ mod tests {
                 enable_sched_penalties: true,
                 model_version: crate::training::ComputeParametersVersion::Fsrs7,
                 num_relearning_steps: None,
+                training_config: None,
             },
             |_| true,
         );

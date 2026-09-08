@@ -458,7 +458,7 @@ pub(crate) fn parameters_to_model<B: Backend>(
     model
 }
 
-pub(crate) fn check_and_fill_parameters(parameters: &Parameters) -> Result<Vec<f32>, FSRSError> {
+pub fn check_and_fill_parameters(parameters: &Parameters) -> Result<Vec<f32>, FSRSError> {
     let parameters = if parameters.len() == model_v7::PARAM_LEN {
         parameters.to_vec()
     } else if let Some(parameters) = model_v6::check_and_fill_parameters_fsrs6(parameters) {

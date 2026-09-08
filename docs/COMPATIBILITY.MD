@@ -96,3 +96,21 @@ optimizer/L2 config drift.
 | 18 | 0.08 | 0.13 | 0.05 | 58.02% | Small baseline amplifies relative difference; optimizer/config drift. |
 | 19 | 0.07 | 0.07 | 0.00 | 0.00% | Matches. |
 | 20 | 0.10 | 0.10 | 0.00 | 0.00% | Matches. |
+
+
+## Upstream merge at 99386f0
+
+The upstream merge preserves this branch's FSRS-6/7 parameter shapes, fractional
+elapsed-time API, generic Burn backend API, default training behavior, and
+always-available Cost ADR exports. The upstream production-Burn removal and
+Cost ADR feature gate are not adopted. Rand remains at 0.9 with rand_distr 0.5
+to preserve this branch's seeded simulation and optimizer streams; upstream's
+0.10/0.6 migration is not adopted. Other dependency updates and the stable
+Rust toolchain are integrated.
+
+New public surfaces include training hyperparameters, card-ID evaluation,
+card-ID-aware time-series evaluation, `check_and_fill_parameters`, and simulator
+callback constructors/context. See the training, inference, and Cost ADR data
+flow documents for configuration and seed semantics. Existing explicit
+`ComputeParametersInput` struct literals must supply `training_config: None`
+or use `..Default::default()`.

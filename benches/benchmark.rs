@@ -52,6 +52,7 @@ pub(crate) fn next_states(inf: &FSRS) -> NextStates {
     inf.next_states(
         Some(MemoryState {
             stability: 51.344814,
+            stability_fast: 51.344814,
             difficulty: 7.005062,
         }),
         0.9,
@@ -87,6 +88,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("current_retrievability", |b| {
         let state = MemoryState {
             stability: 51.344814,
+            stability_fast: 51.344814,
             difficulty: 7.005062,
         };
         b.iter(|| {

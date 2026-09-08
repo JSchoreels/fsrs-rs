@@ -180,3 +180,22 @@ use host-side Adam with the same
 followed by the same version-aware clipping rules. Prefix-item training, FSRS-6
 training, and callers without card ids remain on the existing Burn tensor loss
 and optimizer path.
+
+
+## Upstream training configuration integration
+
+`ComputeParametersInput.training_config` accepts an optional public
+`TrainingConfig` with `num_epochs`, `batch_size`, `seed`, `learning_rate`,
+`max_seq_len`, and `gamma`. An explicit config overrides the internal defaults,
+including the FSRS-7 card-ID tuning. `None` preserves this branch's existing
+training behavior: prefix training uses 9 epochs, learning rate 0.0118, and
+maximum sequence length 1024; FSRS-7 card-ID training uses 17 epochs and learning
+rate 0.07. The benchmark retains its legacy maximum length 64 unless overridden.
+The public `TrainingConfig::default()` follows upstream's explicit-config values
+(5 epochs, learning rate 0.04, maximum length 256); it is deliberately distinct
+from passing `None`. Gamma scales the branch's existing L2 penalty weight.
+
+A zero batch size or non-finite learning rate/gamma is rejected before training.
+Time-series evaluation forwards both training config and sliced, aligned card
+IDs. Benchmark training also preserves supplied card IDs. These inputs and all
+optimizer state are transient; the parameter vector format is unchanged.
