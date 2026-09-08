@@ -3794,6 +3794,8 @@ mod tests {
                 due: 5.0,
                 interval: 10.0,
                 desired_retention,
+                // The simulator honors per-card parameters; match the estimator.
+                parameters: Arc::new(w.to_vec()),
                 ..Default::default()
             };
             let cost_dp = estimator.evaluate_in_flight_card_cost(&card, w);

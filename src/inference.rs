@@ -1613,7 +1613,32 @@ mod tests {
 
         let metrics = evaluate_with_time_series_splits(input.clone(), |_| true).unwrap();
 
-        [metrics.log_loss, metrics.rmse_bins].assert_approx_eq([0.19782974, 0.027770871]);
+        // Reference values for the 34-parameter FSRS-7 model on the sample collection.
+        assert_eq!(DEFAULT_PARAMETERS.len(), 34);
+        [metrics.log_loss, metrics.rmse_bins].assert_approx_eq([0.19656584, 0.026901089]);
+
+        // Check the split orchestration against explicitly constructed input-order folds.
+        let segment_size = items.len() / 6;
+        let mut predictions = Vec::new();
+        for fold in 1..=5 {
+            let test_start = fold * segment_size;
+            let test_end = if fold == 5 {
+                items.len()
+            } else {
+                test_start + segment_size
+            };
+            let parameters = training::compute_parameters(ComputeParametersInput {
+                train_set: items[..test_start].to_vec(),
+                ..input.clone()
+            })?;
+            predictions.extend(batch_predict(
+                items[test_start..test_end].to_vec(),
+                &parameters,
+            )?);
+        }
+        let reference = evaluate(predictions)?;
+        assert!((metrics.log_loss - reference.log_loss).abs() < 1e-6);
+        assert!((metrics.rmse_bins - reference.rmse_bins).abs() < 1e-6);
 
         let result = evaluate_with_time_series_splits(
             ComputeParametersInput {

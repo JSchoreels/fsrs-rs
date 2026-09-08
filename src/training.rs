@@ -2179,7 +2179,13 @@ mod tests {
                 .unwrap();
         }
         let mut datasets = vec![anki21_sample_file_converted_to_fsrs()];
-        datasets.push(data_from_csv());
+        if Path::new("tests/data/revlog.csv").exists() {
+            datasets.push(data_from_csv());
+        } else {
+            eprintln!(
+                "Optional tests/data/revlog.csv is absent; testing the collection fixture only"
+            );
+        }
 
         for items in datasets {
             for model_version in [

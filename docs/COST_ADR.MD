@@ -79,7 +79,7 @@
 - Medium risk in `src/simulation.rs` because it is shared, stateful, and already version-aware. This needs strict A/B tests.
 - Medium risk in training runtime because the search budget can grow quickly. Defaults should be explicitly chosen for a few-minute target.
 - Medium risk for Anki integration if persisted fields are not versioned from the start.
-- Low risk to FSRS-7 model math if Cost ADR only consumes post-review internal state and delegates intervals to existing `next_interval()`.
+- Low risk to FSRS-7 model math if Cost ADR only consumes post-review internal state and delegates intervals to existing `next_interval_for_state()`.
 
 ## Test Estimate
 
@@ -321,3 +321,14 @@ intentionally changes trained policies and historical fixed-seed benchmark
 outputs. Repeated runs with the same configuration remain deterministic. Policy
 serialization, retention bounds, calibration, and early-stopping configuration
 are unchanged. Cost ADR remains available by default on this branch.
+
+
+## Full-state runtime intervals
+
+`CostAdrPolicy::next_states()` evaluates retention from each post-rating internal
+stability and difficulty, then calls `FSRS::next_interval_for_state()` with that
+complete memory state. FSRS-7 interval calculation needs both difficulty and
+`stability_fast`; the stability-only `next_interval()` convenience API substitutes
+values for those fields and is unsuitable here. This fixes incorrect FSRS-7 ADR
+intervals while retaining the existing retention policy and maximum-interval
+clamp. Policy serialization and parameter formats are unchanged.

@@ -90,13 +90,40 @@ mod tests {
 
     #[test]
     fn test_parameter_clipper_works_with_num_relearning_steps() {
-        use crate::test_helpers::TestHelper;
-        let tensor = Tensor::from_floats(DEFAULT_PARAMETERS, &DEVICE);
+        let mut parameters = crate::FSRS6_DEFAULT_PARAMETERS;
+        parameters[17] = 2.0;
+        parameters[18] = 2.0;
+        let clip = |steps| {
+            let tensor = Tensor::from_floats(parameters, &DEVICE);
+            parameter_clipper(Param::from_tensor(tensor), steps, true)
+                .to_data()
+                .to_vec::<f32>()
+                .unwrap()
+        };
+        let one_step = clip(1);
+        let two_steps = clip(2);
+        let eight_steps = clip(8);
+        assert_eq!(&one_step[17..=18], &[2.0, 2.0]);
+        for index in 17..=18 {
+            assert!(0.0 < eight_steps[index] && eight_steps[index] < two_steps[index]);
+            assert!(two_steps[index] < one_step[index]);
+            // The ceiling scales with the inverse square root of the step count.
+            assert!((two_steps[index] - 2.0 * eight_steps[index]).abs() < 1e-6);
+        }
+        assert_eq!(two_steps[19], parameters[19]);
+    }
 
-        let param = parameter_clipper(Param::from_tensor(tensor), 2, true);
-        let values = &param.to_data().to_vec::<f32>().unwrap();
-
-        values[17..=19].assert_approx_eq([0.3072, 3.5875, 0.303]);
+    #[test]
+    fn test_fsrs7_clipping_is_independent_of_relearning_steps() {
+        let clip = |steps| {
+            let tensor = Tensor::from_floats(DEFAULT_PARAMETERS, &DEVICE);
+            parameter_clipper(Param::from_tensor(tensor), steps, true)
+                .to_data()
+                .to_vec::<f32>()
+                .unwrap()
+        };
+        assert_eq!(clip(1), DEFAULT_PARAMETERS.to_vec());
+        assert_eq!(clip(1), clip(8));
     }
 
     #[test]

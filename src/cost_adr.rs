@@ -289,10 +289,10 @@ impl CostAdrPolicy {
             days_elapsed,
         )?;
         Ok(CostAdrNextStates {
-            again: self.cost_adr_item_state(fsrs, states.again, goal_cost_weight, 1)?,
-            hard: self.cost_adr_item_state(fsrs, states.hard, goal_cost_weight, 2)?,
-            good: self.cost_adr_item_state(fsrs, states.good, goal_cost_weight, 3)?,
-            easy: self.cost_adr_item_state(fsrs, states.easy, goal_cost_weight, 4)?,
+            again: self.cost_adr_item_state(fsrs, states.again, goal_cost_weight)?,
+            hard: self.cost_adr_item_state(fsrs, states.hard, goal_cost_weight)?,
+            good: self.cost_adr_item_state(fsrs, states.good, goal_cost_weight)?,
+            easy: self.cost_adr_item_state(fsrs, states.easy, goal_cost_weight)?,
         })
     }
 
@@ -565,15 +565,13 @@ impl CostAdrPolicy {
         fsrs: &FSRS<B>,
         item_state: ItemState,
         goal_cost_weight: f32,
-        rating: u32,
     ) -> Result<CostAdrItemState> {
         let desired_retention = self.evaluate_retention(
             item_state.memory.stability,
             item_state.memory.difficulty,
             goal_cost_weight,
         );
-        let mut interval =
-            fsrs.next_interval(Some(item_state.memory.stability), desired_retention, rating);
+        let mut interval = fsrs.next_interval_for_state(item_state.memory, desired_retention);
         if let Some(max_interval_days) = self.max_interval_days {
             interval = interval.clamp(1.0, max_interval_days);
         }
@@ -2697,23 +2695,47 @@ mod tests {
 
     #[test]
     fn test_cost_adr_next_states_matches_constant_retention() -> Result<()> {
-        let fsrs = FSRS::new(&DEFAULT_PARAMETERS)?;
         let policy = CostAdrPolicy::constant_retention(0.9)?;
-        let previous_state = Some(MemoryState {
-            stability: 7.0,
-            difficulty: 5.0,
-            stability_fast: 7.0,
-        });
-
-        let fixed = fsrs.next_states_with_elapsed_days(previous_state, 0.9, 7.0)?;
-        let dynamic = policy.next_states(&fsrs, previous_state, 64.0, 7.0)?;
-
-        assert_eq!(fixed.again.memory, dynamic.again.memory);
-        assert_eq!(fixed.hard.memory, dynamic.hard.memory);
-        assert_eq!(fixed.good.memory, dynamic.good.memory);
-        assert_eq!(fixed.easy.memory, dynamic.easy.memory);
-        assert!((fixed.good.interval - dynamic.good.interval).abs() < 1e-3);
-        assert!((dynamic.good.desired_retention - 0.9).abs() < 1e-4);
+        for parameters in [
+            &crate::FSRS6_DEFAULT_PARAMETERS[..],
+            &DEFAULT_PARAMETERS[..],
+        ] {
+            let fsrs = FSRS::new(parameters)?;
+            for previous_state in [
+                None,
+                Some(MemoryState {
+                    stability: 7.0,
+                    difficulty: 5.0,
+                    stability_fast: 7.0,
+                }),
+                Some(MemoryState {
+                    stability: 7.0,
+                    difficulty: 3.0,
+                    stability_fast: 1.5,
+                }),
+            ] {
+                for elapsed in [0.25, 7.0] {
+                    let fixed = fsrs.next_states_with_elapsed_days(previous_state, 0.9, elapsed)?;
+                    let dynamic = policy.next_states(&fsrs, previous_state, 64.0, elapsed)?;
+                    for (fixed, dynamic) in [
+                        (fixed.again, dynamic.again),
+                        (fixed.hard, dynamic.hard),
+                        (fixed.good, dynamic.good),
+                        (fixed.easy, dynamic.easy),
+                    ] {
+                        assert_eq!(fixed.memory, dynamic.memory);
+                        assert!(
+                            (fixed.interval - dynamic.interval).abs() < 1e-3,
+                            "params={} state={previous_state:?} elapsed={elapsed}: fixed={} dynamic={}",
+                            parameters.len(),
+                            fixed.interval,
+                            dynamic.interval
+                        );
+                        assert!((dynamic.desired_retention - 0.9).abs() < 1e-4);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

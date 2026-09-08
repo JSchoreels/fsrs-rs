@@ -96,3 +96,28 @@ The original patch and untracked-file archive are retained in the verification
 directory; an adapted patch records the compatibility adjustments separately.
 
 All six release documentation tests pass with the restored working changes.
+
+
+## Follow-up: five failures resolved
+
+The five failures recorded above were diagnosed and corrected after the merge:
+
+- Cost ADR now uses the full post-rating memory state for interval calculation,
+  retaining FSRS-7 difficulty and fast stability. Constant-policy equivalence
+  covers both FSRS versions, every answer button, new/existing states, and
+  fractional elapsed time.
+- The in-flight workload fixture explicitly supplies its FSRS-6 parameters to
+  the simulated card, matching the estimator instead of using FSRS-7 defaults.
+- The broad training test skips only the optional CSV dataset when absent;
+  collection-fixture training still exercises both models and short-term modes.
+- Clipping tests now exercise FSRS-6 relearning-step bounds and separately verify
+  FSRS-7's independence from the step count, replacing a stale default snapshot.
+- The time-series reference is updated for the current 34-parameter model and
+  checked against explicitly constructed input-order folds at a tighter 1e-6
+  comparison tolerance. The fixture's numerical snapshot tolerance is unchanged.
+
+Validation: `cargo test --release --locked` passes with 178 unit tests, zero
+failures, and the existing seven ignored legacy tests; all six documentation
+tests also pass. `cargo check --all-targets --locked` passes. The earlier Clippy
+and repository-wide formatting observations were not addressed by this test-fix
+follow-up. Existing classifier work remains included and uncommitted.
