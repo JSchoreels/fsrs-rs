@@ -121,3 +121,9 @@ failures, and the existing seven ignored legacy tests; all six documentation
 tests also pass. `cargo check --all-targets --locked` passes. The earlier Clippy
 and repository-wide formatting observations were not addressed by this test-fix
 follow-up. Existing classifier work remains included and uncommitted.
+
+## CI lint follow-up
+
+After the upstream autofix commits, the remaining macOS Clippy failures were resolved by simplifying transition loops, using a mutable slice for parameter clipping, and using `is_multiple_of` for SIMD batch alignment. Narrowly scoped, documented lint exceptions retain explicit numerical kernel arguments and inline per-review caches without adding allocations or changing scheduling behavior.
+
+Verification on the isolated PR checkout (without the uncommitted classifier experiments): `cargo fmt --check` and `cargo clippy --locked -- -Dwarnings` pass; `cargo test --release --locked` passes 173 unit tests and 6 doc tests, with 7 existing tests ignored. The five additional classifier tests are only present in the main working directory.

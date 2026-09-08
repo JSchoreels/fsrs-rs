@@ -563,6 +563,8 @@ fn nextdiff_bwd(
 
 // --- step ---
 
+// Keep per-review caches inline in the training buffer to avoid an allocation per step.
+#[allow(clippy::large_enum_variant)]
 enum Step {
     First {
         rating: F32x4,
@@ -831,7 +833,7 @@ pub(super) fn windowed_loss(
     seq_len: usize,
     batch_size: usize,
 ) -> f64 {
-    if batch_size % 4 != 0 {
+    if !batch_size.is_multiple_of(4) {
         return super::windowed_loss_scalar(
             w, t_historys, r_historys, labels, weights, seq_len, batch_size,
         );

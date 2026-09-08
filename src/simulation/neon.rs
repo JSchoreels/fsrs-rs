@@ -2,6 +2,8 @@ use super::S_MIN;
 use crate::neon_math::F32x4;
 
 #[inline(always)]
+// Keep numerical inputs and precomputed intermediates explicit at this kernel boundary.
+#[allow(clippy::too_many_arguments)]
 fn fsrs7_forgetting_curve(
     t: F32x4,
     s: f32,

@@ -1016,7 +1016,7 @@ fn zero_frozen_host_grad(grad: &mut [f32], model_config: &ModelConfig) {
 }
 
 fn clip_host_parameters(
-    parameters: &mut Vec<f32>,
+    parameters: &mut [f32],
     num_relearning_steps: usize,
     enable_short_term: bool,
 ) {

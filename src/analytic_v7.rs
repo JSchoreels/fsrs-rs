@@ -1163,6 +1163,8 @@ mod reverse {
         (g_last_d, g_r)
     }
 
+    // Keep per-review caches inline in the training buffer to avoid an allocation per step.
+    #[allow(clippy::large_enum_variant)]
     enum StepCache {
         First {
             rating: usize,
@@ -1362,6 +1364,8 @@ mod reverse {
         }
     }
 
+    // Keep numerical inputs and precomputed intermediates explicit at this kernel boundary.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn column_grad(
         w: &[f32],
         t_historys: &[f32],

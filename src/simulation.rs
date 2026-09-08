@@ -995,6 +995,8 @@ fn add_forgetting_curve_range_scalar(
     }
 }
 
+// Keep numerical inputs and precomputed intermediates explicit at this kernel boundary.
+#[allow(clippy::too_many_arguments)]
 fn add_forgetting_curve_range(
     fsrs: &dyn SimulatedFsrs,
     w: &[f32],
@@ -1813,6 +1815,8 @@ pub fn simulate_cost_adr_interval_bucket_stats(
     Ok(recorder.finish())
 }
 
+// Keep the shared simulation entry point explicit about its optional callbacks and recording modes.
+#[allow(clippy::too_many_arguments)]
 fn simulate_inner(
     config: &SimulatorConfig,
     w: &Parameters,
@@ -2499,8 +2503,8 @@ fn calculate_transitions(
 
     // Apply Laplace smoothing
     for i in 0..n_states {
-        for j in 0..n_states {
-            transition_counts[i][j] += smoothing;
+        for count in &mut transition_counts[i] {
+            *count += smoothing;
         }
         initial_counts[i] += smoothing;
     }
@@ -2516,9 +2520,7 @@ fn calculate_transitions(
         } else {
             // If a state never appears, assume uniform distribution
             let uniform_prob = 1.0 / n_states as f32;
-            for j in 0..n_states {
-                transition_matrix[i][j] = uniform_prob;
-            }
+            transition_matrix[i].fill(uniform_prob);
         }
     }
 

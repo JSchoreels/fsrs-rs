@@ -159,6 +159,8 @@ struct CurveCache {
     ln_w28: f32,
 }
 
+// Keep numerical inputs and precomputed intermediates explicit at this kernel boundary.
+#[allow(clippy::too_many_arguments)]
 fn curve_fwd(
     w: &[f32],
     t: f32,
@@ -368,6 +370,8 @@ struct StabCache {
     ln_ls1: f32, // ln(last_s+1) for qbase = (last_s+1)^w[start+5]
 }
 
+// Keep numerical inputs and precomputed intermediates explicit at this kernel boundary.
+#[allow(clippy::too_many_arguments)]
 fn stab_fwd(
     w: &[f32],
     last_s: f32,
@@ -418,6 +422,8 @@ fn stab_fwd(
 }
 
 /// VJP of stability_for_set. Returns (g_last_s, g_last_d, g_r), accumulates gw[start..start+9].
+// Keep numerical inputs and precomputed intermediates explicit at this kernel boundary.
+#[allow(clippy::too_many_arguments)]
 fn stab_bwd(
     w: &[f32],
     c: &StabCache,
@@ -1358,6 +1364,8 @@ pub(crate) fn batch_loss_simd(
 // Per-timestep cache for the vectorized backward. The first review (t==0) only needs the init
 // override's data (the curve/stab/next_d it computes are dead, overridden), so it gets a small
 // `First` variant; every later step stores the full forward intermediates (`Full`).
+// Keep per-review caches inline in the training buffer to avoid an allocation per step.
+#[allow(clippy::large_enum_variant)]
 enum Step8 {
     First {
         rc: f32x8,
