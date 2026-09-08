@@ -1006,11 +1006,11 @@ fn zero_frozen_host_grad(grad: &mut [f32], model_config: &ModelConfig) {
             *value = 0.0;
         }
     }
-    if model_config.freeze_short_term_stability {
-        if ModelVersion::from_param_count(grad.len()) == ModelVersion::Fsrs6 {
-            for value in grad[17..20].iter_mut() {
-                *value = 0.0;
-            }
+    if model_config.freeze_short_term_stability
+        && ModelVersion::from_param_count(grad.len()) == ModelVersion::Fsrs6
+    {
+        for value in grad[17..20].iter_mut() {
+            *value = 0.0;
         }
     }
 }

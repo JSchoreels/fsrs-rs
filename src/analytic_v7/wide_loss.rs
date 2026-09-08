@@ -52,10 +52,10 @@ fn exp8<const FAST: bool>(x: f32x8) -> f32x8 {
     let c = |v: f32| f32x8::splat(v);
     let p = if FAST {
         // degree-2 RELATIVE-minimax of exp(r) over [-ln2/2, ln2/2]; max rel err 1.7e-3.
-        c(1.00044314196) + r * (c(1.01486094962) + r * c(0.496258591073))
+        c(1.000_443_1) + r * (c(1.014_861) + r * c(0.496_258_6))
     } else {
         // degree-3 RELATIVE-minimax (Remez); max rel err 7.5e-5 (profiling/minimax_coeffs.py).
-        c(0.999928073539) + r * (c(1.00016418577) + r * (c(0.50496326418) + r * c(0.165668423429)))
+        c(0.999_928_06) + r * (c(1.000_164_2) + r * (c(0.504_963_3) + r * c(0.165_668_43)))
     };
     let bits: i32x8 = (n.round_int() + i32x8::splat(127)) << 23;
     let two_n: f32x8 = bytemuck::cast(bits);
@@ -81,10 +81,10 @@ fn ln8<const FAST: bool>(x: f32x8) -> f32x8 {
     let c = |v: f32| f32x8::splat(v);
     let poly = if FAST {
         // degree-1-in-u (u=t^2) minimax of atanh(t)/t over u in [0,1/9]; abs ln err 2.3e-4.
-        c(2.0) * t * (c(0.999650356749) + t2 * c(0.357486937559))
+        c(2.0) * t * (c(0.999_650_36) + t2 * c(0.357_486_93))
     } else {
         // degree-2-in-u minimax; reconstructed abs ln err 4.9e-6 (profiling/minimax_coeffs.py).
-        c(2.0) * t * (c(1.0000073389) + t2 * (c(0.332179529507) + t2 * c(0.226577770996)))
+        c(2.0) * t * (c(1.000_007_4) + t2 * (c(0.332_179_52) + t2 * c(0.226_577_77)))
     };
     let e_f: f32x8 = e.round_float();
     e_f * f32x8::splat(LN2) + poly
@@ -463,7 +463,7 @@ fn stab_bwd(
     if rating == 4.0 {
         gw[start + 7] += g_prod * (aa * bb * cc * em1 * hard); // easy_bonus
     }
-    let g_last_d = g_bb * (-1.0); // bb = 11 - last_d (the ONLY D-dependence of stab now)
+    let g_last_d = -g_bb; // bb = 11 - last_d (the ONLY D-dependence of stab now)
     g_last_s += g_cc * (-(w[start + 1] as f64)) * (cc / last_s); // d(ls^-w)/dls = -w*cc/ls
     gw[start + 1] += g_cc * (-(cc * c.ln_ls as f64));
     // expr = exp((1-r)*w[start+2]) ; em1 = expr - 1
@@ -1728,7 +1728,7 @@ pub(crate) fn batch_loss_and_grad_simd(
     gw: &mut [f64],
 ) -> f64 {
     debug_assert!(
-        batch % 8 == 0,
+        batch.is_multiple_of(8),
         "batch_loss_and_grad_simd needs batch padded to a multiple of 8"
     );
     let n_groups = batch / 8;
@@ -1771,7 +1771,7 @@ pub(crate) fn card_loss_and_grad_simd(
     gw: &mut [f64],
 ) -> f64 {
     debug_assert!(
-        batch % 8 == 0,
+        batch.is_multiple_of(8),
         "card_loss_and_grad_simd needs batch padded to a multiple of 8"
     );
     debug_assert!(
@@ -1956,7 +1956,7 @@ pub(super) fn windowed_loss(
     seq_len: usize,
     batch_size: usize,
 ) -> f64 {
-    if seq_len < 2 || batch_size % 8 != 0 {
+    if seq_len < 2 || !batch_size.is_multiple_of(8) {
         return super::windowed_loss_scalar(
             w, t_historys, r_historys, labels, weights, seq_len, batch_size,
         );
@@ -1976,7 +1976,7 @@ pub(super) fn windowed_grad(
     seq_len: usize,
     batch_size: usize,
 ) -> [f32; PARAM_LEN] {
-    if seq_len < 2 || batch_size % 8 != 0 {
+    if seq_len < 2 || !batch_size.is_multiple_of(8) {
         return super::reverse::windowed_grad(
             w, t_historys, r_historys, labels, weights, seq_len, batch_size,
         );

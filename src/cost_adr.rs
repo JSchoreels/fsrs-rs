@@ -505,11 +505,8 @@ impl CostAdrPolicy {
             return Ok(high);
         }
 
-        let mut best = closest_average_desired_retention_point(
-            low.clone(),
-            high.clone(),
-            target_average_desired_retention,
-        )?;
+        let mut best =
+            closest_average_desired_retention_point(low, high, target_average_desired_retention)?;
         let decreasing = low_avg > high_avg;
 
         for _ in 0..COST_ADR_CALIBRATION_MAX_ITERATIONS {
@@ -530,7 +527,7 @@ impl CostAdrPolicy {
             let mid_avg = average_desired_retention_from_point(&mid)?;
             best = closest_average_desired_retention_point(
                 best,
-                mid.clone(),
+                mid,
                 target_average_desired_retention,
             )?;
             if is_close(mid_avg, target_average_desired_retention) {
@@ -1095,14 +1092,14 @@ fn collapse_average_desired_retention_weight_points(
 ) {
     let mut collapsed: Vec<AverageDesiredRetentionWeightPoint> = Vec::new();
     for point in points.iter().copied() {
-        if let Some(last) = collapsed.last_mut() {
-            if is_close(
+        if let Some(last) = collapsed.last_mut()
+            && is_close(
                 last.average_desired_retention,
                 point.average_desired_retention,
-            ) {
-                last.cost_weight = last.cost_weight.min(point.cost_weight);
-                continue;
-            }
+            )
+        {
+            last.cost_weight = last.cost_weight.min(point.cost_weight);
+            continue;
         }
         collapsed.push(point);
     }
@@ -1270,19 +1267,18 @@ fn average_desired_retention_endpoint_penalty(
     }
 
     let mut penalty = 0.0;
-    if let Some(target) = config.average_desired_retention_min_weight_target {
-        if let Some(point) = endpoint_average_desired_retention(points, f32::total_cmp) {
-            let diff = point - target;
-            penalty += diff * diff;
-        }
+    if let Some(target) = config.average_desired_retention_min_weight_target
+        && let Some(point) = endpoint_average_desired_retention(points, f32::total_cmp)
+    {
+        let diff = point - target;
+        penalty += diff * diff;
     }
-    if let Some(target) = config.average_desired_retention_max_weight_target {
-        if let Some(point) =
+    if let Some(target) = config.average_desired_retention_max_weight_target
+        && let Some(point) =
             endpoint_average_desired_retention(points, |left, right| right.total_cmp(left))
-        {
-            let diff = point - target;
-            penalty += diff * diff;
-        }
+    {
+        let diff = point - target;
+        penalty += diff * diff;
     }
 
     penalty * config.average_desired_retention_endpoint_penalty
@@ -1370,16 +1366,16 @@ fn efficient_fixed_desired_retention_points(
 fn collapse_fixed_target_calibration_points(points: &mut Vec<CostAdrFixedTargetCalibrationPoint>) {
     let mut collapsed: Vec<CostAdrFixedTargetCalibrationPoint> = Vec::new();
     for point in points.iter().copied() {
-        if let Some(last) = collapsed.last_mut() {
-            if is_close(last.desired_retention, point.desired_retention) {
-                if point.time_average < last.time_average
-                    || (is_close(point.time_average, last.time_average)
-                        && point.goal_cost_weight > last.goal_cost_weight)
-                {
-                    *last = point;
-                }
-                continue;
+        if let Some(last) = collapsed.last_mut()
+            && is_close(last.desired_retention, point.desired_retention)
+        {
+            if point.time_average < last.time_average
+                || (is_close(point.time_average, last.time_average)
+                    && point.goal_cost_weight > last.goal_cost_weight)
+            {
+                *last = point;
             }
+            continue;
         }
         collapsed.push(point);
     }
@@ -1862,16 +1858,16 @@ fn fixed_baseline_frontier_points(
 
     let mut collapsed: Vec<DesiredRetentionMemoryTimePoint> = Vec::new();
     for point in frontier {
-        if let Some(last) = collapsed.last_mut() {
-            if is_close(last.memorized_average, point.memorized_average) {
-                if point.time_average < last.time_average
-                    || (is_close(point.time_average, last.time_average)
-                        && point.desired_retention < last.desired_retention)
-                {
-                    *last = point;
-                }
-                continue;
+        if let Some(last) = collapsed.last_mut()
+            && is_close(last.memorized_average, point.memorized_average)
+        {
+            if point.time_average < last.time_average
+                || (is_close(point.time_average, last.time_average)
+                    && point.desired_retention < last.desired_retention)
+            {
+                *last = point;
             }
+            continue;
         }
         collapsed.push(point);
     }
@@ -1914,11 +1910,11 @@ fn frontier_memory_time_points(metrics: &[CostAdrMetrics]) -> Vec<MemoryTimePoin
 
     let mut collapsed: Vec<MemoryTimePoint> = Vec::new();
     for point in frontier {
-        if let Some(last) = collapsed.last_mut() {
-            if is_close(last.memorized_average, point.memorized_average) {
-                last.time_average = last.time_average.min(point.time_average);
-                continue;
-            }
+        if let Some(last) = collapsed.last_mut()
+            && is_close(last.memorized_average, point.memorized_average)
+        {
+            last.time_average = last.time_average.min(point.time_average);
+            continue;
         }
         collapsed.push(point);
     }
@@ -2210,9 +2206,7 @@ impl SeparableCmaEs {
             .map(|weight| weight / weight_sum)
             .collect::<Vec<_>>();
         let old_mean = self.mean.clone();
-        for value in &mut self.mean {
-            *value = 0.0;
-        }
+        &mut self.mean.fill(0.0);
         for (&candidate_index, &weight) in order.iter().take(mu).zip(weights.iter()) {
             for (dimension, value) in candidates[candidate_index].coefficients.iter().enumerate() {
                 self.mean[dimension] += weight * value;

@@ -441,13 +441,13 @@ fn fsrs7_interval_growth_penalty_dual(
     let mut best_val = f64::NEG_INFINITY;
     for _ in 0..n_reviews {
         let t = fsrs7_interval_differentiable_dual(s, target_dr, n_newton, w, w_dual);
-        if let Some(prev) = prev_interval {
-            if prev.value >= ONE_DAY as f64 {
-                let ratio = t.div(prev);
-                if ratio.value > best_val {
-                    best_val = ratio.value;
-                    best_ratio = Some(ratio);
-                }
+        if let Some(prev) = prev_interval
+            && prev.value >= ONE_DAY as f64
+        {
+            let ratio = t.div(prev);
+            if ratio.value > best_val {
+                best_val = ratio.value;
+                best_ratio = Some(ratio);
             }
         }
         prev_interval = Some(t);
@@ -722,13 +722,13 @@ fn interval_growth_penalty_dual(
     let mut best_value = f64::NEG_INFINITY;
     for _ in 0..n_reviews {
         let interval = next_interval_dual(w, w_dual, state, target_dr);
-        if let Some(prev) = prev_interval {
-            if prev.value >= ONE_DAY as f64 {
-                let ratio = interval.div(prev);
-                if ratio.value > best_value {
-                    best_value = ratio.value;
-                    best_ratio = Some(ratio);
-                }
+        if let Some(prev) = prev_interval
+            && prev.value >= ONE_DAY as f64
+        {
+            let ratio = interval.div(prev);
+            if ratio.value > best_value {
+                best_value = ratio.value;
+                best_ratio = Some(ratio);
             }
         }
         prev_interval = Some(interval);
@@ -856,10 +856,12 @@ fn interval_growth_penalty_value(w: &[f32], n_reviews: usize, target_dr: f32) ->
     let mut best_ratio = 0.0_f64;
     for _ in 0..n_reviews {
         let interval = fsrs7_next_interval_scalar_for_state(w, state, target_dr);
-        if let Some(prev) = prev_interval {
-            if prev >= ONE_DAY && interval.is_finite() && prev.is_finite() {
-                best_ratio = best_ratio.max((interval / prev) as f64);
-            }
+        if let Some(prev) = prev_interval
+            && prev >= ONE_DAY
+            && interval.is_finite()
+            && prev.is_finite()
+        {
+            best_ratio = best_ratio.max((interval / prev) as f64);
         }
         prev_interval = Some(interval);
         state = fsrs7_next_state_scalar(w, state, interval, 3);

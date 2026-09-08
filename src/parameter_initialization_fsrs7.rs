@@ -233,15 +233,14 @@ fn search_parameters_for_curve(
         if let (Some(&small_value), Some(&big_value)) = (
             optimal_stabilities.get(&small_rating),
             optimal_stabilities.get(&big_rating),
-        ) {
-            if small_value > big_value {
-                let small_count = rating_count.get(&small_rating).copied().unwrap_or(0);
-                let big_count = rating_count.get(&big_rating).copied().unwrap_or(0);
-                if small_count > big_count {
-                    optimal_stabilities.insert(big_rating, small_value);
-                } else {
-                    optimal_stabilities.insert(small_rating, big_value);
-                }
+        ) && small_value > big_value
+        {
+            let small_count = rating_count.get(&small_rating).copied().unwrap_or(0);
+            let big_count = rating_count.get(&big_rating).copied().unwrap_or(0);
+            if small_count > big_count {
+                optimal_stabilities.insert(big_rating, small_value);
+            } else {
+                optimal_stabilities.insert(small_rating, big_value);
             }
         }
     }
