@@ -2206,7 +2206,7 @@ impl SeparableCmaEs {
             .map(|weight| weight / weight_sum)
             .collect::<Vec<_>>();
         let old_mean = self.mean.clone();
-        &mut self.mean.fill(0.0);
+        self.mean.fill(0.0);
         for (&candidate_index, &weight) in order.iter().take(mu).zip(weights.iter()) {
             for (dimension, value) in candidates[candidate_index].coefficients.iter().enumerate() {
                 self.mean[dimension] += weight * value;
