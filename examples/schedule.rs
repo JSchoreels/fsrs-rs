@@ -72,6 +72,7 @@ fn schedule_existing_card() -> Result<(), Box<dyn std::error::Error>> {
         last_review: Some(Utc::now() - Duration::days(7)), // Last reviewed 7 days ago
         memory_state: Some(MemoryState {
             stability: 7.0,
+            stability_fast: 7.0,
             difficulty: 5.0,
         }),
         scheduled_days: 7,

@@ -2,7 +2,7 @@
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
 use std::hint::black_box;
-use std::iter::repeat_n;
+use std::iter::repeat;
 
 use criterion::criterion_group;
 use criterion::criterion_main;
@@ -17,9 +17,9 @@ use itertools::Itertools;
 pub(crate) fn calc_mem(inf: &FSRS, past_reviews: usize, card_cnt: usize) -> Vec<MemoryState> {
     let review = FSRSReview {
         rating: 3,
-        delta_t: 21,
+        delta_t: 21.0,
     };
-    let reviews = repeat_n(review, past_reviews + 1).collect_vec();
+    let reviews = repeat(review).take(past_reviews + 1).collect_vec();
     (0..card_cnt)
         .map(|_| {
             inf.memory_state(
@@ -34,20 +34,16 @@ pub(crate) fn calc_mem(inf: &FSRS, past_reviews: usize, card_cnt: usize) -> Vec<
 }
 
 pub(crate) fn calc_mem_batch(inf: &FSRS, past_reviews: usize, card_cnt: usize) -> Vec<MemoryState> {
-    let reviews = repeat_n(
-        FSRSReview {
-            rating: 3,
-            delta_t: 21,
-        },
-        past_reviews,
-    )
+    let reviews = repeat(FSRSReview {
+        rating: 3,
+        delta_t: 21.0,
+    })
+    .take(past_reviews)
     .collect_vec();
-    let items = repeat_n(
-        FSRSItem {
-            reviews: reviews.clone(),
-        },
-        card_cnt,
-    )
+    let items = repeat(FSRSItem {
+        reviews: reviews.clone(),
+    })
+    .take(card_cnt)
     .collect_vec();
     inf.memory_state_batch(items, vec![None; card_cnt]).unwrap()
 }
@@ -56,6 +52,7 @@ pub(crate) fn next_states(inf: &FSRS) -> NextStates {
     inf.next_states(
         Some(MemoryState {
             stability: 51.344814,
+            stability_fast: 51.344814,
             difficulty: 7.005062,
         }),
         0.9,
@@ -91,6 +88,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("current_retrievability", |b| {
         let state = MemoryState {
             stability: 51.344814,
+            stability_fast: 51.344814,
             difficulty: 7.005062,
         };
         b.iter(|| {

@@ -64,7 +64,7 @@ let mut items = Vec::new();
 let mut last = history[0].0;
 
 for (date, rating) in history {
-    let delta_t = (date - last).num_days() as u32;
+    let delta_t = (date - last).num_days() as f32;
     accumulated.push(FSRSReview { rating, delta_t });
     items.push(FSRSItem {
         reviews: accumulated.clone(),
@@ -83,16 +83,16 @@ Feed the optimizer a vector of `FSRSItem` instances built from your review histo
 
 ### Train and use a single-user Cost ADR policy
 
-`fsrs-rs` also includes a CPU/Rayon single-user optimizer for the FSRS6 Cost ADR policy. It searches a 15-parameter cost-conditioned desired-retention policy and evaluates it against a fixed 16-point desired-retention baseline portfolio. The report includes hypervolume, same-target time-saved AUC, relative same-target time-saved AUC, and memory-span coverage.
+`fsrs-rs` also includes a CPU/Rayon single-user optimizer for the FSRS-6 and FSRS-7 Cost ADR policy. It searches a 15-parameter cost-conditioned desired-retention policy and evaluates it against a fixed 16-point desired-retention baseline portfolio. The report includes hypervolume, same-target time-saved AUC, relative same-target time-saved AUC, and memory-span coverage.
 
 ```sh
-cargo run --release --features experimental_cost_adr --example cost_adr
+cargo run --release --example cost_adr
 ```
 
 The example accepts command-line overrides for quick experiments:
 
 ```sh
-cargo run --release --features experimental_cost_adr --example cost_adr -- --days 90 --deck 2000 --pop 8 --gen 5
+cargo run --release --example cost_adr -- --days 90 --deck 2000 --pop 8 --gen 5
 ```
 
 By default, the example uses the same simulation scale as `srs-simulator`: 1825 days, a 10000-card deck, 10 new cards per day, a 9999-review limit, and a 720-minute daily cost limit. Its training defaults come from `CostAdrTrainingConfig::default()`. Cost ADR derives separate training-simulation and evaluation seeds from the base seed so the default report does not reuse the same simulator rollout seeds for training and evaluation.
@@ -112,8 +112,8 @@ let interval = 10.0;
 let initial_state = fsrs.memory_state_from_sm2(ease_factor, interval, sm2_retention)?;
 
 let reviews = vec![
-    FSRSReview { rating: 3, delta_t: 5 },
-    FSRSReview { rating: 4, delta_t: 10 },
+    FSRSReview { rating: 3, delta_t: 5.0 },
+    FSRSReview { rating: 4, delta_t: 10.0 },
 ];
 
 let memory_state = fsrs.memory_state(
@@ -163,7 +163,7 @@ to `.git/hooks/pre-commit`, then `chmod +x .git/hooks/pre-commit`
 
   ~~Another reason is, it would be hard to port to other languages while using `Tensor`s.~~
 
-  Historical reason, it was using [burn](https://github.com/burn-rs/burn) in the past. Now it only uses it as test dep to verify the result. You can just use this one.
+  This branch still uses [Burn](https://github.com/burn-rs/burn) for its public backend API and tensor inference/training paths. FSRS-7 training with card IDs uses the branch’s analytic kernels. Upstream main has removed the production Burn dependency.
 
 - What about the name?
 

@@ -39,51 +39,54 @@
 //! You can find them [here](https://github.com/open-spaced-repetition/fsrs-rs/blob/main/src/lib.rs).
 
 #![allow(clippy::single_range_in_vec_init)]
-#![allow(clippy::needless_range_loop)]
-mod analytic;
-#[cfg(test)]
+#![allow(dead_code, unused_imports)]
+
+mod analytic_v7;
 mod batch_shuffle;
 #[cfg(test)]
 mod convertor_tests;
 mod cosine_annealing;
-#[cfg(feature = "experimental_cost_adr")]
 mod cost_adr;
 mod dataset;
 mod error;
 mod inference;
 mod model;
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+mod neon_math;
 mod parameter_clipper;
 mod parameter_initialization;
+mod parameter_initialization_fsrs7;
 mod simulation;
 #[cfg(test)]
 mod test_helpers;
 mod training;
 
-#[cfg(feature = "experimental_cost_adr")]
 pub use cost_adr::{
-    CostAdrEvaluationConfig, CostAdrEvaluationResult, CostAdrItemState, CostAdrNextStates,
-    CostAdrPolicy, CostAdrTrainingConfig, CostAdrTrainingResult,
+    COST_ADR_POLICY_VERSION, CostAdrBounds, CostAdrEvaluationConfig, CostAdrEvaluationPoint,
+    CostAdrEvaluationResult, CostAdrFixedTargetCalibrationPoint, CostAdrItemState, CostAdrMetrics,
+    CostAdrNextStates, CostAdrPlotPoint, CostAdrPolicy, CostAdrTrainingConfig,
+    CostAdrTrainingResult,
 };
-// Provide the basic data structures.
 pub use dataset::{FSRSItem, FSRSReview, filter_outlier};
-/// Error types and Result alias for the crate.
 pub use error::{FSRSError, Result};
 pub use inference::{
-    DEFAULT_PARAMETERS, FSRS5_DEFAULT_DECAY, FSRS6_DEFAULT_DECAY, ItemProgress, ItemState,
-    MemoryState, ModelEvaluation, NextStates, current_retrievability,
+    DEFAULT_PARAMETERS, FSRS5_DEFAULT_DECAY, FSRS6_DEFAULT_DECAY, FSRS6_DEFAULT_PARAMETERS,
+    ItemProgress, ItemState, MemoryState, ModelEvaluation, NextStates, current_retrievability,
     evaluate_with_time_series_splits,
 };
-// Provide the main model. It's the most commanly used part.
 pub use model::{FSRS, check_and_fill_parameters};
-#[cfg(feature = "experimental_cost_adr")]
 pub use simulation::simulate_with_cost_adr_policy;
-// Simulate long-term scheduling outcomes without real users.
 pub use simulation::{
-    CMRRTargetFn, Card, PostSchedulingContext, PostSchedulingFn, ReviewPriorityFn, RevlogEntry,
-    RevlogReviewKind, SimulationResult, SimulatorConfig, expected_workload,
-    expected_workload_with_existing_cards, extract_simulator_config, optimal_retention, simulate,
+    CMRRTargetFn, Card, IntervalBucketConfig, IntervalBucketStats, IntervalBucketSummary,
+    PostSchedulingContext, PostSchedulingFn, ReviewPriorityFn, ReviewRatingCostFn, RevlogEntry,
+    RevlogReviewKind, SimulationEvent, SimulationResult, SimulationSummaryResult,
+    SimulatorCardUpdateFn, SimulatorCardUpdatePhase, SimulatorConfig, SimulatorEventFn,
+    expected_workload, expected_workload_with_existing_cards, extract_simulator_config,
+    optimal_retention, simulate, simulate_cost_adr_interval_bucket_stats, simulate_summary,
+    simulate_summary_with_card_update_and_event_fn, simulate_summary_with_card_update_fn,
+    simulate_with_card_update_fn,
 };
-// Compute optimal model parameters from review history.
 pub use training::{
-    CombinedProgressState, ComputeParametersInput, TrainingConfig, benchmark, compute_parameters,
+    CombinedProgressState, ComputeParametersInput, ComputeParametersVersion, TrainingConfig,
+    benchmark, compute_parameters,
 };

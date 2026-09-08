@@ -7,10 +7,10 @@ use fsrs::{
 use chrono::prelude::*;
 use chrono_tz::Tz;
 use itertools::Itertools;
-use rusqlite::{Connection, Result as SqlResult, Row, types::FromSqlError as SqlFromSqlError};
+use rusqlite::{
+    Connection, OpenFlags, Result as SqlResult, Row, types::FromSqlError as SqlFromSqlError,
+};
 use std::hint::black_box;
-
-type FsrsItemWithCardId = (FSRSItem, i64);
 
 // Inlined RevlogReviewKind enum from convertor_tests.rs
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -101,6 +101,43 @@ fn convert_to_fsrs_items(
     mut entries: Vec<RevlogEntry>,
     next_day_starts_at: i64,
     timezone: Tz,
+) -> Option<Vec<(i64, FSRSItem)>> {
+    entries = remove_revlog_before_last_first_learn(entries);
+    if entries.is_empty() {
+        return None;
+    }
+
+    for i in 1..entries.len() {
+        let date_current = convert_to_date(entries[i].id, next_day_starts_at, timezone);
+        let date_previous = convert_to_date(entries[i - 1].id, next_day_starts_at, timezone);
+        entries[i].last_interval = (date_current - date_previous).num_days() as i32;
+    }
+
+    Some(
+        entries
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(idx, entry)| {
+                let reviews = entries
+                    .iter()
+                    .take(idx + 1)
+                    .map(|r| FSRSReview {
+                        rating: r.button_chosen as u32,
+                        delta_t: r.last_interval.max(0) as f32,
+                    })
+                    .collect();
+                (entry.id, FSRSItem { reviews })
+            })
+            .filter(|(_, item)| item.reviews.last().is_some_and(|r| r.delta_t > 0.0)) // Ensure last review has delta_t > 0
+            .collect(),
+    )
+}
+
+fn convert_to_fsrs_items_with_card_ids(
+    mut entries: Vec<RevlogEntry>,
+    next_day_starts_at: i64,
+    timezone: Tz,
 ) -> Option<Vec<(i64, i64, FSRSItem)>> {
     entries = remove_revlog_before_last_first_learn(entries);
     if entries.is_empty() {
@@ -124,17 +161,17 @@ fn convert_to_fsrs_items(
                     .take(idx + 1)
                     .map(|r| FSRSReview {
                         rating: r.button_chosen as u32,
-                        delta_t: r.last_interval.max(0) as u32,
+                        delta_t: r.last_interval.max(0) as f32,
                     })
                     .collect();
                 (entry.id, entry.cid, FSRSItem { reviews })
             })
-            .filter(|(_, _, item)| item.reviews.last().is_some_and(|r| r.delta_t > 0)) // Ensure last review has delta_t > 0
+            .filter(|(_, _, item)| item.reviews.last().is_some_and(|r| r.delta_t > 0.0))
             .collect(),
     )
 }
 
-fn anki_to_fsrs(revlogs: Vec<RevlogEntry>) -> Vec<FsrsItemWithCardId> {
+fn anki_to_fsrs(revlogs: Vec<RevlogEntry>) -> Vec<FSRSItem> {
     let mut revlogs_by_card = revlogs
         .into_iter()
         .chunk_by(|r| r.cid)
@@ -144,17 +181,39 @@ fn anki_to_fsrs(revlogs: Vec<RevlogEntry>) -> Vec<FsrsItemWithCardId> {
         })
         .flatten()
         .collect_vec();
+    revlogs_by_card.sort_by_cached_key(|(id, _)| *id);
+    revlogs_by_card.into_iter().map(|(_, item)| item).collect()
+}
+
+fn anki_to_fsrs_with_card_ids(revlogs: Vec<RevlogEntry>) -> (Vec<FSRSItem>, Vec<i64>) {
+    let mut revlogs_by_card = revlogs
+        .into_iter()
+        .chunk_by(|r| r.cid)
+        .into_iter()
+        .filter_map(|(_cid, entries)| {
+            convert_to_fsrs_items_with_card_ids(entries.collect(), 4, Tz::Asia__Shanghai)
+        })
+        .flatten()
+        .collect_vec();
     revlogs_by_card.sort_by_cached_key(|(id, _, _)| *id);
     revlogs_by_card
         .into_iter()
         .map(|(_, card_id, item)| (item, card_id))
-        .collect()
+        .unzip()
+}
+
+fn benchmark_collection_path() -> String {
+    std::env::var("FSRS_BENCH_COLLECTION")
+        .unwrap_or_else(|_| "tests/data/collection.anki21".to_string())
 }
 
 fn read_collection_inline() -> SqlResult<Vec<RevlogEntry>> {
-    let db = Connection::open("tests/data/collection.anki21")?;
+    let db = Connection::open_with_flags(
+        benchmark_collection_path(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
     let filter_out_suspended_cards = false;
-    let filter_out_flags = Vec::<i32>::new();
+    let filter_out_flags: [i32; 0] = [];
     let flags_str = if !filter_out_flags.is_empty() {
         format!(
             "AND flags NOT IN ({})",
@@ -181,18 +240,16 @@ fn read_collection_inline() -> SqlResult<Vec<RevlogEntry>> {
 }
 
 // Inlined anki21_sample_file_converted_to_fsrs
-fn anki21_sample_file_converted_to_fsrs_inline() -> Vec<FsrsItemWithCardId> {
+fn anki21_sample_file_converted_to_fsrs_inline() -> Vec<FSRSItem> {
     anki_to_fsrs(read_collection_inline().expect("read error for inlined function"))
 }
 
 // Inlined prepare_training_data (simplified version matching fsrs::dataset::prepare_training_data)
-fn prepare_training_data_inline(
-    items: Vec<FsrsItemWithCardId>,
-) -> (Vec<FsrsItemWithCardId>, Vec<FsrsItemWithCardId>) {
-    let filtered_items: Vec<FsrsItemWithCardId> = items
+fn prepare_training_data_inline(items: Vec<FSRSItem>) -> (Vec<FSRSItem>, Vec<FSRSItem>) {
+    let filtered_items: Vec<FSRSItem> = items
         .into_iter()
-        .filter(|(item, _)| {
-            !item.reviews.is_empty() && item.reviews.len() > 1 && item.reviews[0].delta_t == 0
+        .filter(|item| {
+            !item.reviews.is_empty() && item.reviews.len() > 1 && item.reviews[0].delta_t == 0.0
         })
         .collect();
 
@@ -205,14 +262,28 @@ fn prepare_training_data_inline(
     (pretrain_part.to_vec(), train_part.to_vec())
 }
 
-fn load_and_prepare_data_with_card_ids() -> (Vec<FSRSItem>, Vec<i64>) {
+fn load_and_prepare_data() -> Vec<FSRSItem> {
     let items = anki21_sample_file_converted_to_fsrs_inline();
     let (pretrain_set, train_set) = prepare_training_data_inline(items);
-    [pretrain_set, train_set].concat().into_iter().unzip()
+    [pretrain_set, train_set].concat()
+}
+
+fn load_and_prepare_data_with_card_ids() -> (Vec<FSRSItem>, Vec<i64>) {
+    let (items, card_ids) = anki_to_fsrs_with_card_ids(
+        read_collection_inline().expect("read error for inlined function"),
+    );
+    let filtered = items
+        .into_iter()
+        .zip(card_ids)
+        .filter(|(item, _)| {
+            !item.reviews.is_empty() && item.reviews.len() > 1 && item.reviews[0].delta_t == 0.0
+        })
+        .collect::<Vec<_>>();
+    filtered.into_iter().unzip()
 }
 
 fn benchmark_evaluate(c: &mut Criterion) {
-    let (items, card_ids) = load_and_prepare_data_with_card_ids();
+    let items = load_and_prepare_data();
     // Evaluate uses the FSRS instance's existing parameters.
     let fsrs = FSRS::default();
 
@@ -225,38 +296,18 @@ fn benchmark_evaluate(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("evaluate_with_card_ids", |b| {
-        b.iter(|| {
-            fsrs.evaluate_with_card_ids(
-                black_box(items.clone()),
-                black_box(card_ids.clone()),
-                |_| true,
-            )
-            .unwrap();
-        })
-    });
-
     group.finish();
 }
 
 fn benchmark_evaluate_with_time_series_splits(c: &mut Criterion) {
-    let (items, card_ids) = load_and_prepare_data_with_card_ids();
+    let items = load_and_prepare_data();
     // evaluate_with_time_series_splits computes parameters internally for each split.
     let input = ComputeParametersInput {
         train_set: items.clone(),
-        card_ids: None,
         progress: None,
         enable_short_term: true,    // Default/typical value
         num_relearning_steps: None, // Default/typical value
-        training_config: None,
-    };
-    let input_with_card_ids = ComputeParametersInput {
-        train_set: items.clone(),
-        card_ids: Some(card_ids),
-        progress: None,
-        enable_short_term: true,    // Default/typical value
-        num_relearning_steps: None, // Default/typical value
-        training_config: None,
+        ..Default::default()
     };
 
     let mut group = c.benchmark_group("parameters");
@@ -267,33 +318,18 @@ fn benchmark_evaluate_with_time_series_splits(c: &mut Criterion) {
             evaluate_with_time_series_splits(black_box(input.clone()), |_| true).unwrap();
         })
     });
-
-    group.bench_function("evaluate_with_time_series_splits_with_card_ids", |b| {
-        b.iter(|| {
-            evaluate_with_time_series_splits(black_box(input_with_card_ids.clone()), |_| true)
-                .unwrap();
-        })
-    });
     group.finish();
 }
 
 fn benchmark_compute_parameters(c: &mut Criterion) {
     let (items, card_ids) = load_and_prepare_data_with_card_ids();
-    let input_with_card_ids = ComputeParametersInput {
+    let input = ComputeParametersInput {
         train_set: items.clone(), // Using the full prepared dataset
-        card_ids: Some(card_ids.clone()),
+        card_ids: Some(card_ids),
         progress: None,
         enable_short_term: true,    // Default/typical value
         num_relearning_steps: None, // Default/typical value
-        training_config: None,
-    };
-    let input_without_card_ids = ComputeParametersInput {
-        train_set: items.clone(), // Using the full prepared dataset
-        card_ids: None,
-        progress: None,
-        enable_short_term: true,    // Default/typical value
-        num_relearning_steps: None, // Default/typical value
-        training_config: None,
+        ..Default::default()
     };
 
     let mut group = c.benchmark_group("parameters");
@@ -301,13 +337,7 @@ fn benchmark_compute_parameters(c: &mut Criterion) {
 
     group.bench_function("compute_parameters", |b| {
         b.iter(|| {
-            compute_parameters(black_box(input_with_card_ids.clone())).unwrap();
-        })
-    });
-
-    group.bench_function("compute_parameters_without_card_ids", |b| {
-        b.iter(|| {
-            compute_parameters(black_box(input_without_card_ids.clone())).unwrap();
+            compute_parameters(black_box(input.clone())).unwrap();
         })
     });
 

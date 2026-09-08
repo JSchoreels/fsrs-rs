@@ -1,11 +1,12 @@
 use crate::error::{FSRSError, Result};
 use crate::inference::{ItemState, MemoryState, Parameters};
 use crate::model::FSRS;
-use crate::simulation::{D_MAX, D_MIN, S_MAX, S_MIN};
+use crate::simulation::{D_MAX, D_MIN, S_MAX, S_MIN, simulate_with_cost_adr_policy_for_evaluation};
 use crate::training::{CombinedProgressState, ProgressState};
-use crate::{SimulationResult, SimulatorConfig, simulate, simulate_with_cost_adr_policy};
+use crate::{Card, SimulationResult, SimulatorConfig, simulate};
+use burn::tensor::backend::Backend;
 use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use rand::{Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
@@ -17,28 +18,60 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const COST_ADR_PARAMETER_COUNT: usize = 15;
+pub const COST_ADR_POLICY_VERSION: u32 = 1;
 const COST_ADR_DEFAULT_COST_WEIGHTS: [f32; 16] = [
     0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 48.0, 64.0, 96.0, 128.0, 192.0, 256.0, 384.0, 512.0,
     1024.0,
 ];
 const COST_ADR_DEFAULT_BASELINE_RETENTIONS: [f32; 16] = [
-    0.50, 0.53, 0.56, 0.59, 0.62, 0.65, 0.68, 0.71, 0.74, 0.77, 0.80, 0.83, 0.86, 0.89, 0.92, 0.95,
+    0.30, 0.34, 0.38, 0.42, 0.46, 0.50, 0.54, 0.58, 0.62, 0.66, 0.70, 0.74, 0.78, 0.84, 0.89, 0.95,
 ];
 const COST_ADR_DEFAULT_SEED: u64 = 42;
 const COST_ADR_TRAIN_SIMULATION_SEED_OFFSET: u64 = 1_000_000;
 const COST_ADR_EVALUATION_SEED_OFFSET: u64 = 2_000_000;
 const COST_ADR_GENERATION_SEED_STRIDE: u64 = 10_000;
+
+const COST_ADR_DEFAULT_RETENTION_MIN: f32 = 0.30;
+const COST_ADR_DEFAULT_RETENTION_MAX: f32 = 0.995;
+const COST_ADR_DEFAULT_EARLY_STOP_PATIENCE_GENERATIONS: usize = 4;
+const COST_ADR_DEFAULT_EARLY_STOP_MIN_GENERATIONS: usize = 10;
+const COST_ADR_DEFAULT_EARLY_STOP_MIN_RELATIVE_GAIN: f32 = 0.01;
+const COST_ADR_EARLY_STOP_SCORE_SCALE: f32 = 1.0;
+const COST_ADR_CALIBRATION_POINT_COUNT_MIN: usize = 2;
+const COST_ADR_CALIBRATION_MIN_AVERAGE_DR_SPAN: f32 = 0.005;
+const COST_ADR_CALIBRATION_WEIGHT_TOLERANCE: f32 = 1e-4;
+const COST_ADR_CALIBRATION_MAX_ITERATIONS: usize = 24;
 const COST_ADR_DEFAULT_INITIAL_COEFFICIENTS: [f32; COST_ADR_PARAMETER_COUNT] = [
     -0.202, 9.14, -0.0978, 0.226, -5.31, -7.44, 24.1, -0.375, 1.81, -22.9, -5.82, 22.3, 1.72,
     -1.99, -19.4,
 ];
 
+fn default_cost_adr_retention_min() -> f32 {
+    COST_ADR_DEFAULT_RETENTION_MIN
+}
+
+fn default_cost_adr_retention_max() -> f32 {
+    COST_ADR_DEFAULT_RETENTION_MAX
+}
+
+fn default_cost_adr_early_stop_patience_generations() -> usize {
+    COST_ADR_DEFAULT_EARLY_STOP_PATIENCE_GENERATIONS
+}
+
+fn default_cost_adr_early_stop_min_generations() -> usize {
+    COST_ADR_DEFAULT_EARLY_STOP_MIN_GENERATIONS
+}
+
+fn default_cost_adr_early_stop_min_relative_gain() -> f32 {
+    COST_ADR_DEFAULT_EARLY_STOP_MIN_RELATIVE_GAIN
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-struct CostAdrBounds {
-    s_min: f32,
-    s_max: f32,
-    d_min: f32,
-    d_max: f32,
+pub struct CostAdrBounds {
+    pub s_min: f32,
+    pub s_max: f32,
+    pub d_min: f32,
+    pub d_max: f32,
 }
 
 impl Default for CostAdrBounds {
@@ -54,13 +87,14 @@ impl Default for CostAdrBounds {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CostAdrPolicy {
+    pub policy_version: u32,
     pub coefficients: Vec<f32>,
     pub cost_weight_min: f32,
     pub cost_weight_max: f32,
     pub retention_min: f32,
     pub retention_max: f32,
     pub max_interval_days: Option<f32>,
-    bounds: CostAdrBounds,
+    pub bounds: CostAdrBounds,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -78,13 +112,46 @@ pub struct CostAdrItemState {
     pub desired_retention: f32,
 }
 
+pub(crate) struct CostAdrPolicyEvaluator<'a> {
+    policy: &'a CostAdrPolicy,
+    z: f32,
+    z2: f32,
+    log_s_min: f32,
+    log_s_span: f32,
+    difficulty_span: f32,
+    retention_span: f32,
+}
+
+impl CostAdrPolicyEvaluator<'_> {
+    pub(crate) fn evaluate_retention(&self, stability: f32, difficulty: f32) -> f32 {
+        let stability = stability.clamp(self.policy.bounds.s_min, self.policy.bounds.s_max);
+        let difficulty = difficulty.clamp(self.policy.bounds.d_min, self.policy.bounds.d_max);
+        let x_s = ((stability.ln() - self.log_s_min) / self.log_s_span).clamp(0.0, 1.0);
+        let x_d = ((difficulty - self.policy.bounds.d_min) / self.difficulty_span).clamp(0.0, 1.0);
+        let phi = [1.0, x_s, x_d, x_s * x_d, x_s * x_s];
+        let base = dot(&self.policy.coefficients[0..5], &phi);
+        let z_effect = softplus(dot(&self.policy.coefficients[5..10], &phi)) * self.z;
+        let z2_effect = softplus(dot(&self.policy.coefficients[10..15], &phi)) * self.z2;
+        self.policy.retention_min + self.retention_span * sigmoid(base - z_effect - z2_effect)
+    }
+}
+
 impl CostAdrPolicy {
     pub fn train_single_user(
         config: &SimulatorConfig,
         parameters: &Parameters,
         training_config: &CostAdrTrainingConfig,
     ) -> Result<CostAdrTrainingResult> {
-        train_cost_adr_single_user(config, parameters, training_config)
+        train_cost_adr_single_user(config, parameters, training_config, None)
+    }
+
+    pub fn train_single_user_with_existing_cards(
+        config: &SimulatorConfig,
+        parameters: &Parameters,
+        training_config: &CostAdrTrainingConfig,
+        existing_cards: &[Card],
+    ) -> Result<CostAdrTrainingResult> {
+        train_cost_adr_single_user(config, parameters, training_config, Some(existing_cards))
     }
 
     pub fn new(coefficients: Vec<f32>) -> Result<Self> {
@@ -100,6 +167,7 @@ impl CostAdrPolicy {
         max_interval_days: Option<f32>,
     ) -> Result<Self> {
         let policy = Self {
+            policy_version: COST_ADR_POLICY_VERSION,
             coefficients,
             cost_weight_min,
             cost_weight_max,
@@ -142,7 +210,12 @@ impl CostAdrPolicy {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.coefficients.len() != COST_ADR_PARAMETER_COUNT
+        if self.policy_version != COST_ADR_POLICY_VERSION
+            || self.coefficients.len() != COST_ADR_PARAMETER_COUNT
+            || !self.cost_weight_min.is_finite()
+            || !self.cost_weight_max.is_finite()
+            || !self.retention_min.is_finite()
+            || !self.retention_max.is_finite()
             || self.cost_weight_min < 0.0
             || self.cost_weight_max <= self.cost_weight_min
             || !(0.0 < self.retention_min && self.retention_min < self.retention_max)
@@ -154,7 +227,11 @@ impl CostAdrPolicy {
         {
             return Err(FSRSError::InvalidInput);
         }
-        if self.bounds.s_min <= 0.0
+        if !self.bounds.s_min.is_finite()
+            || !self.bounds.s_max.is_finite()
+            || !self.bounds.d_min.is_finite()
+            || !self.bounds.d_max.is_finite()
+            || self.bounds.s_min <= 0.0
             || self.bounds.s_max <= self.bounds.s_min
             || self.bounds.d_max <= self.bounds.d_min
         {
@@ -169,56 +246,329 @@ impl CostAdrPolicy {
         parameters: &Parameters,
         evaluation_config: &CostAdrEvaluationConfig,
     ) -> Result<CostAdrEvaluationResult> {
-        evaluate_cost_adr_policy(config, parameters, self, evaluation_config)
+        evaluate_cost_adr_policy(config, parameters, self, evaluation_config, None)
     }
 
-    /// The intervals, memory states, and cost-conditioned desired retentions for each answer
-    /// button.
-    pub fn next_states(
+    pub fn evaluate_with_existing_cards(
         &self,
-        fsrs: &FSRS,
+        config: &SimulatorConfig,
+        parameters: &Parameters,
+        evaluation_config: &CostAdrEvaluationConfig,
+        existing_cards: &[Card],
+    ) -> Result<CostAdrEvaluationResult> {
+        evaluate_cost_adr_policy(
+            config,
+            parameters,
+            self,
+            evaluation_config,
+            Some(existing_cards),
+        )
+    }
+
+    /// Return the memory states, cost-conditioned desired retentions, and intervals for each
+    /// answer button.
+    pub fn next_states<B: Backend>(
+        &self,
+        fsrs: &FSRS<B>,
         current_memory_state: Option<MemoryState>,
         goal_cost_weight: f32,
-        days_elapsed: u32,
+        days_elapsed: f32,
     ) -> Result<CostAdrNextStates> {
         self.validate()?;
-        if !goal_cost_weight.is_finite() || goal_cost_weight < 0.0 {
+        if !goal_cost_weight.is_finite()
+            || goal_cost_weight < 0.0
+            || !days_elapsed.is_finite()
+            || days_elapsed < 0.0
+        {
             return Err(FSRSError::InvalidInput);
         }
 
-        let states = fsrs.next_states(current_memory_state, self.retention_max, days_elapsed)?;
+        let states = fsrs.next_states_with_elapsed_days(
+            current_memory_state,
+            self.retention_max,
+            days_elapsed,
+        )?;
         Ok(CostAdrNextStates {
-            again: self.cost_adr_item_state(fsrs, states.again, goal_cost_weight, 1)?,
-            hard: self.cost_adr_item_state(fsrs, states.hard, goal_cost_weight, 2)?,
-            good: self.cost_adr_item_state(fsrs, states.good, goal_cost_weight, 3)?,
-            easy: self.cost_adr_item_state(fsrs, states.easy, goal_cost_weight, 4)?,
+            again: self.cost_adr_item_state(fsrs, states.again, goal_cost_weight)?,
+            hard: self.cost_adr_item_state(fsrs, states.hard, goal_cost_weight)?,
+            good: self.cost_adr_item_state(fsrs, states.good, goal_cost_weight)?,
+            easy: self.cost_adr_item_state(fsrs, states.easy, goal_cost_weight)?,
         })
     }
 
     pub fn evaluate_retention(&self, stability: f32, difficulty: f32, cost_weight: f32) -> f32 {
-        let phi = self.state_features(stability, difficulty);
-        let z = self.normalized_cost_weight(cost_weight);
-        let base = dot(&self.coefficients[0..5], &phi);
-        let z_effect = softplus(dot(&self.coefficients[5..10], &phi)) * z;
-        let z2_effect = softplus(dot(&self.coefficients[10..15], &phi)) * z * z;
-        self.retention_min
-            + (self.retention_max - self.retention_min) * sigmoid(base - z_effect - z2_effect)
+        self.evaluator_for_cost_weight(cost_weight)
+            .evaluate_retention(stability, difficulty)
     }
 
-    fn cost_adr_item_state(
+    pub fn retention_grid(
         &self,
-        fsrs: &FSRS,
+        stabilities: &[f32],
+        difficulties: &[f32],
+        cost_weights: &[f32],
+    ) -> Result<Vec<CostAdrPlotPoint>> {
+        self.validate()?;
+        if stabilities.is_empty()
+            || difficulties.is_empty()
+            || cost_weights.is_empty()
+            || stabilities.iter().any(|value| !value.is_finite())
+            || difficulties.iter().any(|value| !value.is_finite())
+            || cost_weights
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err(FSRSError::InvalidInput);
+        }
+
+        let mut points =
+            Vec::with_capacity(stabilities.len() * difficulties.len() * cost_weights.len());
+        for &stability in stabilities {
+            for &difficulty in difficulties {
+                for &cost_weight in cost_weights {
+                    points.push(CostAdrPlotPoint {
+                        stability,
+                        difficulty,
+                        cost_weight,
+                        desired_retention: self.evaluate_retention(
+                            stability,
+                            difficulty,
+                            cost_weight,
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(points)
+    }
+
+    pub fn calibrate_average_desired_retention_range(
+        &self,
+        config: &SimulatorConfig,
+        parameters: &Parameters,
+        point_count: usize,
+        seed: Option<u64>,
+    ) -> Result<Vec<CostAdrEvaluationPoint>> {
+        self.calibrate_average_desired_retention_range_inner(
+            config,
+            parameters,
+            point_count,
+            seed,
+            None,
+        )
+    }
+
+    pub fn calibrate_average_desired_retention_range_with_existing_cards(
+        &self,
+        config: &SimulatorConfig,
+        parameters: &Parameters,
+        point_count: usize,
+        seed: Option<u64>,
+        existing_cards: &[Card],
+    ) -> Result<Vec<CostAdrEvaluationPoint>> {
+        self.calibrate_average_desired_retention_range_inner(
+            config,
+            parameters,
+            point_count,
+            seed,
+            Some(existing_cards),
+        )
+    }
+
+    fn calibrate_average_desired_retention_range_inner(
+        &self,
+        config: &SimulatorConfig,
+        parameters: &Parameters,
+        point_count: usize,
+        seed: Option<u64>,
+        existing_cards: Option<&[Card]>,
+    ) -> Result<Vec<CostAdrEvaluationPoint>> {
+        if point_count < COST_ADR_CALIBRATION_POINT_COUNT_MIN {
+            return Err(FSRSError::InvalidInput);
+        }
+
+        let low = evaluate_cost_adr_rollout_for_weight(
+            config,
+            parameters,
+            self,
+            self.cost_weight_min,
+            seed,
+            existing_cards,
+        )?;
+        let high = evaluate_cost_adr_rollout_for_weight(
+            config,
+            parameters,
+            self,
+            self.cost_weight_max,
+            seed,
+            existing_cards,
+        )?;
+        let low_avg = average_desired_retention_from_point(&low)?;
+        let high_avg = average_desired_retention_from_point(&high)?;
+        if (low_avg - high_avg).abs() < COST_ADR_CALIBRATION_MIN_AVERAGE_DR_SPAN {
+            return Ok(vec![low, high]);
+        }
+
+        let mut points = Vec::with_capacity(point_count);
+        for index in 0..point_count {
+            let ratio = index as f32 / (point_count - 1) as f32;
+            let target = low_avg + (high_avg - low_avg) * ratio;
+            let point = self.calibrate_cost_weight_for_average_desired_retention_inner(
+                config,
+                parameters,
+                target,
+                seed,
+                existing_cards,
+            )?;
+            points.push(point);
+        }
+        points.sort_by(|left, right| left.goal_cost_weight.total_cmp(&right.goal_cost_weight));
+        Ok(points)
+    }
+
+    pub fn calibrate_cost_weight_for_average_desired_retention(
+        &self,
+        config: &SimulatorConfig,
+        parameters: &Parameters,
+        target_average_desired_retention: f32,
+        seed: Option<u64>,
+    ) -> Result<CostAdrEvaluationPoint> {
+        self.calibrate_cost_weight_for_average_desired_retention_inner(
+            config,
+            parameters,
+            target_average_desired_retention,
+            seed,
+            None,
+        )
+    }
+
+    pub fn calibrate_cost_weight_for_average_desired_retention_with_existing_cards(
+        &self,
+        config: &SimulatorConfig,
+        parameters: &Parameters,
+        target_average_desired_retention: f32,
+        seed: Option<u64>,
+        existing_cards: &[Card],
+    ) -> Result<CostAdrEvaluationPoint> {
+        self.calibrate_cost_weight_for_average_desired_retention_inner(
+            config,
+            parameters,
+            target_average_desired_retention,
+            seed,
+            Some(existing_cards),
+        )
+    }
+
+    fn calibrate_cost_weight_for_average_desired_retention_inner(
+        &self,
+        config: &SimulatorConfig,
+        parameters: &Parameters,
+        target_average_desired_retention: f32,
+        seed: Option<u64>,
+        existing_cards: Option<&[Card]>,
+    ) -> Result<CostAdrEvaluationPoint> {
+        self.validate()?;
+        if !target_average_desired_retention.is_finite() {
+            return Err(FSRSError::InvalidInput);
+        }
+
+        let mut low = evaluate_cost_adr_rollout_for_weight(
+            config,
+            parameters,
+            self,
+            self.cost_weight_min,
+            seed,
+            existing_cards,
+        )?;
+        let mut high = evaluate_cost_adr_rollout_for_weight(
+            config,
+            parameters,
+            self,
+            self.cost_weight_max,
+            seed,
+            existing_cards,
+        )?;
+        let mut low_avg = average_desired_retention_from_point(&low)?;
+        let mut high_avg = average_desired_retention_from_point(&high)?;
+        let min_avg = low_avg.min(high_avg);
+        let max_avg = low_avg.max(high_avg);
+        if (target_average_desired_retention < min_avg
+            && !is_close(target_average_desired_retention, min_avg))
+            || (target_average_desired_retention > max_avg
+                && !is_close(target_average_desired_retention, max_avg))
+        {
+            return Err(FSRSError::InvalidInput);
+        }
+        if is_close(target_average_desired_retention, low_avg) {
+            return Ok(low);
+        }
+        if is_close(target_average_desired_retention, high_avg) {
+            return Ok(high);
+        }
+
+        let mut best =
+            closest_average_desired_retention_point(low, high, target_average_desired_retention)?;
+        let decreasing = low_avg > high_avg;
+
+        for _ in 0..COST_ADR_CALIBRATION_MAX_ITERATIONS {
+            if (high.goal_cost_weight - low.goal_cost_weight).abs()
+                <= COST_ADR_CALIBRATION_WEIGHT_TOLERANCE
+            {
+                break;
+            }
+            let mid_weight = midpoint_log_cost_weight(low.goal_cost_weight, high.goal_cost_weight);
+            let mid = evaluate_cost_adr_rollout_for_weight(
+                config,
+                parameters,
+                self,
+                mid_weight,
+                seed,
+                existing_cards,
+            )?;
+            let mid_avg = average_desired_retention_from_point(&mid)?;
+            best = closest_average_desired_retention_point(
+                best,
+                mid,
+                target_average_desired_retention,
+            )?;
+            if is_close(mid_avg, target_average_desired_retention) {
+                break;
+            }
+
+            if decreasing {
+                if mid_avg > target_average_desired_retention {
+                    low = mid;
+                    low_avg = mid_avg;
+                } else {
+                    high = mid;
+                    high_avg = mid_avg;
+                }
+            } else if mid_avg < target_average_desired_retention {
+                low = mid;
+                low_avg = mid_avg;
+            } else {
+                high = mid;
+                high_avg = mid_avg;
+            }
+            if is_close(low_avg, high_avg) {
+                break;
+            }
+        }
+
+        Ok(best)
+    }
+
+    fn cost_adr_item_state<B: Backend>(
+        &self,
+        fsrs: &FSRS<B>,
         item_state: ItemState,
         goal_cost_weight: f32,
-        rating: u32,
     ) -> Result<CostAdrItemState> {
         let desired_retention = self.evaluate_retention(
             item_state.memory.stability,
             item_state.memory.difficulty,
             goal_cost_weight,
         );
-        let mut interval =
-            fsrs.next_interval(Some(item_state.memory.stability), desired_retention, rating);
+        let mut interval = fsrs.next_interval_for_state(item_state.memory, desired_retention);
         if let Some(max_interval_days) = self.max_interval_days {
             interval = interval.clamp(1.0, max_interval_days);
         }
@@ -233,15 +583,19 @@ impl CostAdrPolicy {
         })
     }
 
-    fn state_features(&self, stability: f32, difficulty: f32) -> [f32; 5] {
-        let stability = stability.clamp(self.bounds.s_min, self.bounds.s_max);
-        let difficulty = difficulty.clamp(self.bounds.d_min, self.bounds.d_max);
+    pub(crate) fn evaluator_for_cost_weight(&self, cost_weight: f32) -> CostAdrPolicyEvaluator<'_> {
         let log_s_min = self.bounds.s_min.ln();
         let log_s_span = self.bounds.s_max.ln() - log_s_min;
-        let x_s = ((stability.ln() - log_s_min) / log_s_span).clamp(0.0, 1.0);
-        let x_d = ((difficulty - self.bounds.d_min) / (self.bounds.d_max - self.bounds.d_min))
-            .clamp(0.0, 1.0);
-        [1.0, x_s, x_d, x_s * x_d, x_s * x_s]
+        let z = self.normalized_cost_weight(cost_weight);
+        CostAdrPolicyEvaluator {
+            policy: self,
+            z,
+            z2: z * z,
+            log_s_min,
+            log_s_span,
+            difficulty_span: self.bounds.d_max - self.bounds.d_min,
+            retention_span: self.retention_max - self.retention_min,
+        }
     }
 
     fn normalized_cost_weight(&self, cost_weight: f32) -> f32 {
@@ -250,6 +604,14 @@ impl CostAdrPolicy {
         let hi = self.cost_weight_max.ln_1p();
         ((weight.ln_1p() - lo) / (hi - lo)).clamp(0.0, 1.0)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CostAdrPlotPoint {
+    pub stability: f32,
+    pub difficulty: f32,
+    pub cost_weight: f32,
+    pub desired_retention: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -267,6 +629,16 @@ pub struct CostAdrEvaluationPoint {
     pub goal_cost_weight: f32,
     pub metrics: CostAdrMetrics,
     pub average_desired_retention: Option<f32>,
+    pub fixed_fsrs_equivalent_desired_retention: Option<f32>,
+    pub same_target_time_saved_percent: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CostAdrFixedTargetCalibrationPoint {
+    pub desired_retention: f32,
+    pub goal_cost_weight: f32,
+    pub memorized_average: f32,
+    pub time_average: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -312,18 +684,57 @@ pub struct CostAdrEvaluationResult {
     pub auc_metrics: CostAdrAucMetrics,
 }
 
+impl CostAdrEvaluationResult {
+    pub fn cost_weight_for_average_desired_retention(
+        &self,
+        target_average_desired_retention: f32,
+    ) -> Option<f32> {
+        cost_weight_for_average_desired_retention(
+            &self.scheduler_metrics,
+            target_average_desired_retention,
+        )
+    }
+
+    pub fn efficient_fixed_desired_retention_points(
+        &self,
+        baseline_desired_retentions: &[f32],
+    ) -> Vec<CostAdrFixedTargetCalibrationPoint> {
+        efficient_fixed_desired_retention_points(
+            baseline_desired_retentions,
+            &self.baseline_metrics,
+            &self.scheduler_metrics,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostAdrTrainingConfig {
     pub population_size: usize,
     pub generations: usize,
+    #[serde(default = "default_cost_adr_early_stop_patience_generations")]
+    pub early_stop_patience_generations: usize,
+    #[serde(default = "default_cost_adr_early_stop_min_generations")]
+    pub early_stop_min_generations: usize,
+    #[serde(default = "default_cost_adr_early_stop_min_relative_gain")]
+    pub early_stop_min_relative_gain: f32,
     pub sigma0: f32,
     pub seed: Option<u64>,
     pub simulation_seed: Option<u64>,
     pub lower_bound: f32,
     pub upper_bound: f32,
+    #[serde(default = "default_cost_adr_retention_min")]
+    pub retention_min: f32,
+    #[serde(default = "default_cost_adr_retention_max")]
+    pub retention_max: f32,
     pub initial_coefficients: Vec<f32>,
     pub cost_weights: Vec<f32>,
     pub baseline_desired_retentions: Vec<f32>,
+    #[serde(default)]
+    pub average_desired_retention_min_weight_target: Option<f32>,
+    #[serde(default)]
+    pub average_desired_retention_max_weight_target: Option<f32>,
+    #[serde(default)]
+    pub average_desired_retention_endpoint_penalty: f32,
     #[serde(skip)]
     pub progress: Option<Arc<Mutex<CombinedProgressState>>>,
 }
@@ -332,30 +743,49 @@ impl PartialEq for CostAdrTrainingConfig {
     fn eq(&self, other: &Self) -> bool {
         self.population_size == other.population_size
             && self.generations == other.generations
+            && self.early_stop_patience_generations == other.early_stop_patience_generations
+            && self.early_stop_min_generations == other.early_stop_min_generations
+            && self.early_stop_min_relative_gain == other.early_stop_min_relative_gain
             && self.sigma0 == other.sigma0
             && self.seed == other.seed
             && self.simulation_seed == other.simulation_seed
             && self.lower_bound == other.lower_bound
             && self.upper_bound == other.upper_bound
+            && self.retention_min == other.retention_min
+            && self.retention_max == other.retention_max
             && self.initial_coefficients == other.initial_coefficients
             && self.cost_weights == other.cost_weights
             && self.baseline_desired_retentions == other.baseline_desired_retentions
+            && self.average_desired_retention_min_weight_target
+                == other.average_desired_retention_min_weight_target
+            && self.average_desired_retention_max_weight_target
+                == other.average_desired_retention_max_weight_target
+            && self.average_desired_retention_endpoint_penalty
+                == other.average_desired_retention_endpoint_penalty
     }
 }
 
 impl Default for CostAdrTrainingConfig {
     fn default() -> Self {
         Self {
-            population_size: 16,
-            generations: 20,
+            population_size: 8,
+            generations: 10,
+            early_stop_patience_generations: default_cost_adr_early_stop_patience_generations(),
+            early_stop_min_generations: default_cost_adr_early_stop_min_generations(),
+            early_stop_min_relative_gain: default_cost_adr_early_stop_min_relative_gain(),
             sigma0: 1.0,
             seed: None,
             simulation_seed: None,
             lower_bound: -64.0,
             upper_bound: 64.0,
+            retention_min: COST_ADR_DEFAULT_RETENTION_MIN,
+            retention_max: COST_ADR_DEFAULT_RETENTION_MAX,
             initial_coefficients: COST_ADR_DEFAULT_INITIAL_COEFFICIENTS.to_vec(),
             cost_weights: COST_ADR_DEFAULT_COST_WEIGHTS.to_vec(),
             baseline_desired_retentions: COST_ADR_DEFAULT_BASELINE_RETENTIONS.to_vec(),
+            average_desired_retention_min_weight_target: None,
+            average_desired_retention_max_weight_target: None,
+            average_desired_retention_endpoint_penalty: 0.0,
             progress: None,
         }
     }
@@ -383,11 +813,35 @@ pub struct CostAdrTrainingResult {
     pub training_seconds: f32,
 }
 
+impl CostAdrTrainingResult {
+    pub fn cost_weight_for_average_desired_retention(
+        &self,
+        target_average_desired_retention: f32,
+    ) -> Option<f32> {
+        cost_weight_for_average_desired_retention(
+            &self.best_cost_weight_metrics,
+            target_average_desired_retention,
+        )
+    }
+
+    pub fn efficient_fixed_desired_retention_points(
+        &self,
+        baseline_desired_retentions: &[f32],
+    ) -> Vec<CostAdrFixedTargetCalibrationPoint> {
+        efficient_fixed_desired_retention_points(
+            baseline_desired_retentions,
+            &self.baseline_metrics,
+            &self.best_cost_weight_metrics,
+        )
+    }
+}
+
 fn evaluate_cost_adr_policy(
     config: &SimulatorConfig,
     parameters: &Parameters,
     policy: &CostAdrPolicy,
     evaluation_config: &CostAdrEvaluationConfig,
+    existing_cards: Option<&[Card]>,
 ) -> Result<CostAdrEvaluationResult> {
     validate_evaluation_config(evaluation_config)?;
     let seed = cost_adr_evaluation_seed(evaluation_config);
@@ -396,17 +850,24 @@ fn evaluate_cost_adr_policy(
         parameters,
         &evaluation_config.baseline_desired_retentions,
         seed,
+        existing_cards,
     )?;
     let baseline_points = points_from_metrics(&baseline_metrics);
     let reference = reference_point(&baseline_points)?;
     let baseline_hypervolume = hypervolume_2d(&baseline_points, reference);
-    let scheduler_metrics = evaluate_cost_adr_rollouts(
+    let mut scheduler_metrics = evaluate_cost_adr_rollouts(
         config,
         parameters,
         policy,
         &evaluation_config.cost_weights,
         seed,
+        existing_cards,
     )?;
+    annotate_cost_adr_rollouts(
+        &evaluation_config.baseline_desired_retentions,
+        &baseline_metrics,
+        &mut scheduler_metrics,
+    );
     let scheduler_metrics_only = scheduler_metrics
         .iter()
         .map(|point| point.metrics)
@@ -432,28 +893,217 @@ fn evaluate_cost_adr_rollouts(
     policy: &CostAdrPolicy,
     cost_weights: &[f32],
     seed: u64,
+    existing_cards: Option<&[Card]>,
 ) -> Result<Vec<CostAdrEvaluationPoint>> {
     policy.validate()?;
     cost_weights
         .par_iter()
         .enumerate()
         .map(|(index, &goal_cost_weight)| {
-            let result = simulate_with_cost_adr_policy(
+            let result = simulate_with_cost_adr_policy_for_evaluation(
                 config,
                 parameters,
                 policy,
                 goal_cost_weight,
                 Some(cost_adr_rollout_seed(seed, index)),
-                None,
+                clone_existing_cards(existing_cards),
             )?;
-            let metrics = metrics_from_simulation(&result);
+            let metrics = metrics_from_simulation(&result.result);
             Ok(CostAdrEvaluationPoint {
                 goal_cost_weight,
                 metrics,
                 average_desired_retention: result.average_desired_retention,
+                fixed_fsrs_equivalent_desired_retention: None,
+                same_target_time_saved_percent: None,
             })
         })
         .collect()
+}
+
+fn evaluate_cost_adr_rollout_for_weight(
+    config: &SimulatorConfig,
+    parameters: &Parameters,
+    policy: &CostAdrPolicy,
+    goal_cost_weight: f32,
+    seed: Option<u64>,
+    existing_cards: Option<&[Card]>,
+) -> Result<CostAdrEvaluationPoint> {
+    let result = simulate_with_cost_adr_policy_for_evaluation(
+        config,
+        parameters,
+        policy,
+        goal_cost_weight,
+        seed,
+        clone_existing_cards(existing_cards),
+    )?;
+    Ok(CostAdrEvaluationPoint {
+        goal_cost_weight,
+        metrics: metrics_from_simulation(&result.result),
+        average_desired_retention: result.average_desired_retention,
+        fixed_fsrs_equivalent_desired_retention: None,
+        same_target_time_saved_percent: None,
+    })
+}
+
+fn average_desired_retention_from_point(point: &CostAdrEvaluationPoint) -> Result<f32> {
+    let average_desired_retention = point
+        .average_desired_retention
+        .ok_or(FSRSError::InvalidInput)?;
+    if average_desired_retention.is_finite() {
+        Ok(average_desired_retention)
+    } else {
+        Err(FSRSError::InvalidInput)
+    }
+}
+
+fn closest_average_desired_retention_point(
+    left: CostAdrEvaluationPoint,
+    right: CostAdrEvaluationPoint,
+    target: f32,
+) -> Result<CostAdrEvaluationPoint> {
+    let left_distance = (average_desired_retention_from_point(&left)? - target).abs();
+    let right_distance = (average_desired_retention_from_point(&right)? - target).abs();
+    Ok(if left_distance <= right_distance {
+        left
+    } else {
+        right
+    })
+}
+
+fn midpoint_log_cost_weight(left: f32, right: f32) -> f32 {
+    ((left.ln_1p() + right.ln_1p()) * 0.5).exp_m1()
+}
+
+fn annotate_cost_adr_rollouts(
+    baseline_desired_retentions: &[f32],
+    baseline_metrics: &[CostAdrMetrics],
+    scheduler_metrics: &mut [CostAdrEvaluationPoint],
+) {
+    let baseline_points =
+        fixed_baseline_frontier_points(baseline_desired_retentions, baseline_metrics);
+
+    for point in scheduler_metrics {
+        let target = point.metrics.memorized_average;
+        point.fixed_fsrs_equivalent_desired_retention =
+            interpolated_desired_retention_for_memory_target(&baseline_points, target);
+        let baseline_time =
+            interpolated_time_for_desired_retention_memory_target(&baseline_points, target);
+        point.same_target_time_saved_percent = baseline_time.and_then(|time| {
+            if time > 0.0 {
+                Some(((time - point.metrics.time_average) / time) * 100.0)
+            } else {
+                None
+            }
+        });
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AverageDesiredRetentionWeightPoint {
+    average_desired_retention: f32,
+    cost_weight: f32,
+}
+
+fn cost_weight_for_average_desired_retention(
+    points: &[CostAdrEvaluationPoint],
+    target_average_desired_retention: f32,
+) -> Option<f32> {
+    if !target_average_desired_retention.is_finite() {
+        return None;
+    }
+    let mut points = points
+        .iter()
+        .filter_map(|point| {
+            let average_desired_retention = point.average_desired_retention?;
+            if average_desired_retention.is_finite()
+                && point.goal_cost_weight.is_finite()
+                && point.goal_cost_weight >= 0.0
+            {
+                Some(AverageDesiredRetentionWeightPoint {
+                    average_desired_retention,
+                    cost_weight: point.goal_cost_weight,
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if points.is_empty() {
+        return None;
+    }
+
+    points.sort_by(|left, right| {
+        left.average_desired_retention
+            .partial_cmp(&right.average_desired_retention)
+            .unwrap_or(Ordering::Equal)
+    });
+    collapse_average_desired_retention_weight_points(&mut points);
+
+    let first = points[0];
+    let last = points[points.len() - 1];
+    if target_average_desired_retention < first.average_desired_retention
+        && !is_close(
+            target_average_desired_retention,
+            first.average_desired_retention,
+        )
+    {
+        return None;
+    }
+    if is_close(
+        target_average_desired_retention,
+        first.average_desired_retention,
+    ) {
+        return Some(first.cost_weight);
+    }
+    if target_average_desired_retention > last.average_desired_retention
+        && !is_close(
+            target_average_desired_retention,
+            last.average_desired_retention,
+        )
+    {
+        return None;
+    }
+    if is_close(
+        target_average_desired_retention,
+        last.average_desired_retention,
+    ) {
+        return Some(last.cost_weight);
+    }
+
+    for pair in points.windows(2) {
+        let left = pair[0];
+        let right = pair[1];
+        if !(left.average_desired_retention <= target_average_desired_retention
+            && target_average_desired_retention <= right.average_desired_retention)
+        {
+            continue;
+        }
+        let ratio = (target_average_desired_retention - left.average_desired_retention)
+            / (right.average_desired_retention - left.average_desired_retention);
+        let left_weight = left.cost_weight.ln_1p();
+        let right_weight = right.cost_weight.ln_1p();
+        return Some((left_weight + ratio * (right_weight - left_weight)).exp_m1());
+    }
+    None
+}
+
+fn collapse_average_desired_retention_weight_points(
+    points: &mut Vec<AverageDesiredRetentionWeightPoint>,
+) {
+    let mut collapsed: Vec<AverageDesiredRetentionWeightPoint> = Vec::new();
+    for point in points.iter().copied() {
+        if let Some(last) = collapsed.last_mut()
+            && is_close(
+                last.average_desired_retention,
+                point.average_desired_retention,
+            )
+        {
+            last.cost_weight = last.cost_weight.min(point.cost_weight);
+            continue;
+        }
+        collapsed.push(point);
+    }
+    *points = collapsed;
 }
 
 fn evaluate_baseline_desired_retentions(
@@ -461,6 +1111,7 @@ fn evaluate_baseline_desired_retentions(
     parameters: &Parameters,
     desired_retentions: &[f32],
     seed: u64,
+    existing_cards: Option<&[Card]>,
 ) -> Result<Vec<CostAdrMetrics>> {
     desired_retentions
         .par_iter()
@@ -471,11 +1122,31 @@ fn evaluate_baseline_desired_retentions(
                 parameters,
                 desired_retention,
                 Some(cost_adr_rollout_seed(seed, index)),
-                None,
+                clone_existing_cards_with_desired_retention(existing_cards, desired_retention),
             )?;
             Ok(metrics_from_simulation(&result))
         })
         .collect()
+}
+
+fn clone_existing_cards(existing_cards: Option<&[Card]>) -> Option<Vec<Card>> {
+    existing_cards.map(|cards| cards.to_vec())
+}
+
+fn clone_existing_cards_with_desired_retention(
+    existing_cards: Option<&[Card]>,
+    desired_retention: f32,
+) -> Option<Vec<Card>> {
+    existing_cards.map(|cards| {
+        cards
+            .iter()
+            .cloned()
+            .map(|mut card| {
+                card.desired_retention = desired_retention;
+                card
+            })
+            .collect()
+    })
 }
 
 fn cost_adr_auc_metrics(
@@ -587,17 +1258,143 @@ fn cost_adr_auc_metrics(
     }
 }
 
+fn average_desired_retention_endpoint_penalty(
+    points: &[CostAdrEvaluationPoint],
+    config: &CostAdrTrainingConfig,
+) -> f32 {
+    if config.average_desired_retention_endpoint_penalty <= 0.0 {
+        return 0.0;
+    }
+
+    let mut penalty = 0.0;
+    if let Some(target) = config.average_desired_retention_min_weight_target
+        && let Some(point) = endpoint_average_desired_retention(points, f32::total_cmp)
+    {
+        let diff = point - target;
+        penalty += diff * diff;
+    }
+    if let Some(target) = config.average_desired_retention_max_weight_target
+        && let Some(point) =
+            endpoint_average_desired_retention(points, |left, right| right.total_cmp(left))
+    {
+        let diff = point - target;
+        penalty += diff * diff;
+    }
+
+    penalty * config.average_desired_retention_endpoint_penalty
+}
+
+fn endpoint_average_desired_retention(
+    points: &[CostAdrEvaluationPoint],
+    compare: impl Fn(&f32, &f32) -> Ordering,
+) -> Option<f32> {
+    points
+        .iter()
+        .filter_map(|point| {
+            point
+                .average_desired_retention
+                .filter(|average_desired_retention| average_desired_retention.is_finite())
+                .map(|average_desired_retention| {
+                    (point.goal_cost_weight, average_desired_retention)
+                })
+        })
+        .min_by(|left, right| compare(&left.0, &right.0))
+        .map(|(_, average_desired_retention)| average_desired_retention)
+}
+
+fn efficient_fixed_desired_retention_points(
+    baseline_desired_retentions: &[f32],
+    baseline_metrics: &[CostAdrMetrics],
+    scheduler_points: &[CostAdrEvaluationPoint],
+) -> Vec<CostAdrFixedTargetCalibrationPoint> {
+    let baseline_points =
+        fixed_baseline_frontier_points(baseline_desired_retentions, baseline_metrics);
+
+    let candidates = scheduler_points
+        .iter()
+        .filter_map(|point| {
+            if !(point.goal_cost_weight.is_finite()
+                && point.goal_cost_weight >= 0.0
+                && point.metrics.memorized_average.is_finite()
+                && point.metrics.time_average.is_finite())
+            {
+                return None;
+            }
+            let desired_retention =
+                point.fixed_fsrs_equivalent_desired_retention.or_else(|| {
+                    interpolated_desired_retention_for_memory_target(
+                        &baseline_points,
+                        point.metrics.memorized_average,
+                    )
+                })?;
+            if desired_retention.is_finite() && (0.0..=1.0).contains(&desired_retention) {
+                Some(CostAdrFixedTargetCalibrationPoint {
+                    desired_retention,
+                    goal_cost_weight: point.goal_cost_weight,
+                    memorized_average: point.metrics.memorized_average,
+                    time_average: point.metrics.time_average,
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut points = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            !candidates.iter().any(|other| {
+                let no_worse = other.desired_retention >= candidate.desired_retention
+                    && other.time_average <= candidate.time_average;
+                let strictly_better = other.desired_retention > candidate.desired_retention
+                    || other.time_average < candidate.time_average;
+                no_worse && strictly_better
+            })
+        })
+        .collect::<Vec<_>>();
+
+    points.sort_by(|left, right| {
+        left.desired_retention
+            .total_cmp(&right.desired_retention)
+            .then_with(|| left.time_average.total_cmp(&right.time_average))
+    });
+    collapse_fixed_target_calibration_points(&mut points);
+    points
+}
+
+fn collapse_fixed_target_calibration_points(points: &mut Vec<CostAdrFixedTargetCalibrationPoint>) {
+    let mut collapsed: Vec<CostAdrFixedTargetCalibrationPoint> = Vec::new();
+    for point in points.iter().copied() {
+        if let Some(last) = collapsed.last_mut()
+            && is_close(last.desired_retention, point.desired_retention)
+        {
+            if point.time_average < last.time_average
+                || (is_close(point.time_average, last.time_average)
+                    && point.goal_cost_weight > last.goal_cost_weight)
+            {
+                *last = point;
+            }
+            continue;
+        }
+        collapsed.push(point);
+    }
+    *points = collapsed;
+}
+
 fn train_cost_adr_single_user(
     config: &SimulatorConfig,
     parameters: &Parameters,
     training_config: &CostAdrTrainingConfig,
+    existing_cards: Option<&[Card]>,
 ) -> Result<CostAdrTrainingResult> {
     if let Err(err) = validate_training_config(training_config) {
         finish_cost_adr_training_progress(&training_config.progress);
         return Err(err);
     }
     reset_cost_adr_training_progress(training_config);
-    let result = train_cost_adr_single_user_inner(config, parameters, training_config);
+    let result =
+        train_cost_adr_single_user_inner(config, parameters, training_config, existing_cards);
     finish_cost_adr_training_progress(&training_config.progress);
     result
 }
@@ -606,6 +1403,7 @@ fn train_cost_adr_single_user_inner(
     config: &SimulatorConfig,
     parameters: &Parameters,
     training_config: &CostAdrTrainingConfig,
+    existing_cards: Option<&[Card]>,
 ) -> Result<CostAdrTrainingResult> {
     if cost_adr_training_should_abort(&training_config.progress) {
         return Err(FSRSError::Interrupted);
@@ -624,6 +1422,7 @@ fn train_cost_adr_single_user_inner(
         parameters,
         &training_config.baseline_desired_retentions,
         simulation_seed,
+        existing_cards,
     )?;
     let baseline_points = points_from_metrics(&baseline_metrics);
     let reference = reference_point(&baseline_points)?;
@@ -640,6 +1439,8 @@ fn train_cost_adr_single_user_inner(
     let mut best_cost_weight_metrics = Vec::new();
     let mut best_hypervolume = f32::NEG_INFINITY;
     let mut best_hypervolume_delta = f32::NEG_INFINITY;
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_score_history = Vec::with_capacity(training_config.generations);
     let mut history = Vec::with_capacity(training_config.generations);
 
     for generation in 0..training_config.generations {
@@ -661,24 +1462,40 @@ fn train_cost_adr_single_user_inner(
                 if cost_adr_training_should_abort(&progress) {
                     return Err(FSRSError::Interrupted);
                 }
-                let policy = CostAdrPolicy::new(coefficients.clone())?;
-                let points = evaluate_cost_adr_rollouts(
+                let policy =
+                    cost_adr_policy_from_training_config(coefficients.clone(), training_config)?;
+                let mut points = evaluate_cost_adr_rollouts(
                     config,
                     parameters,
                     &policy,
                     &training_config.cost_weights,
                     generation_seed,
+                    existing_cards,
                 )?;
+                annotate_cost_adr_rollouts(
+                    &training_config.baseline_desired_retentions,
+                    &baseline_metrics,
+                    &mut points,
+                );
                 let candidate_metrics =
                     points.iter().map(|point| point.metrics).collect::<Vec<_>>();
                 let candidate_points = points_from_metrics(&candidate_metrics);
                 let hypervolume = hypervolume_2d(&candidate_points, reference);
                 let hypervolume_delta = hypervolume - baseline_hypervolume;
+                let endpoint_penalty =
+                    average_desired_retention_endpoint_penalty(&points, training_config);
+                let score = cost_adr_training_score(
+                    &baseline_metrics,
+                    &candidate_metrics,
+                    hypervolume_delta,
+                    endpoint_penalty,
+                );
                 let evaluation = Ok(CandidateEvaluation {
                     coefficients,
                     rollout_points: points,
                     hypervolume,
                     hypervolume_delta,
+                    score,
                 });
                 let completed = completed_candidates.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                 update_cost_adr_training_progress(
@@ -693,26 +1510,32 @@ fn train_cost_adr_single_user_inner(
         let candidate_results = candidate_results?;
         let scores = candidate_results
             .iter()
-            .map(|candidate| candidate.hypervolume_delta)
+            .map(|candidate| candidate.score)
             .collect::<Vec<_>>();
         optimizer.tell(&candidate_results, &scores);
 
         let generation_best = candidate_results
             .iter()
             .max_by(|left, right| {
-                left.hypervolume_delta
-                    .partial_cmp(&right.hypervolume_delta)
+                left.score
+                    .partial_cmp(&right.score)
                     .unwrap_or(Ordering::Equal)
             })
             .ok_or(FSRSError::InvalidInput)?;
-        if generation_best.hypervolume_delta > best_hypervolume_delta {
+        if generation_best.score > best_score {
             best_coefficients = generation_best.coefficients.clone();
             best_cost_weight_metrics = generation_best.rollout_points.clone();
             best_hypervolume = generation_best.hypervolume;
             best_hypervolume_delta = generation_best.hypervolume_delta;
+            best_score = generation_best.score;
         }
+        best_score_history.push(best_score);
 
-        let mean_delta = scores.iter().sum::<f32>() / scores.len() as f32;
+        let mean_delta = candidate_results
+            .iter()
+            .map(|candidate| candidate.hypervolume_delta)
+            .sum::<f32>()
+            / candidate_results.len() as f32;
         history.push(CostAdrGenerationMetrics {
             generation,
             best_hypervolume_delta,
@@ -720,6 +1543,9 @@ fn train_cost_adr_single_user_inner(
             mean_hypervolume_delta: mean_delta,
             sigma: optimizer.sigma,
         });
+        if should_stop_cost_adr_training_early(training_config, &best_score_history) {
+            break;
+        }
     }
 
     let best_metrics = best_cost_weight_metrics
@@ -729,7 +1555,7 @@ fn train_cost_adr_single_user_inner(
     let best_auc_metrics = cost_adr_auc_metrics(&baseline_metrics, &best_metrics);
 
     Ok(CostAdrTrainingResult {
-        policy: CostAdrPolicy::new(best_coefficients)?,
+        policy: cost_adr_policy_from_training_config(best_coefficients, training_config)?,
         baseline_metrics,
         baseline_hypervolume,
         best_hypervolume,
@@ -739,6 +1565,40 @@ fn train_cost_adr_single_user_inner(
         history,
         training_seconds: started.elapsed().as_secs_f32(),
     })
+}
+
+fn cost_adr_training_score(
+    baseline_metrics: &[CostAdrMetrics],
+    candidate_metrics: &[CostAdrMetrics],
+    hypervolume_delta: f32,
+    endpoint_penalty: f32,
+) -> f32 {
+    let auc_metrics = cost_adr_auc_metrics(baseline_metrics, candidate_metrics);
+    let coverage = if auc_metrics.total_span > 0.0 {
+        (auc_metrics.covered_span / auc_metrics.total_span).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let same_target_score = auc_metrics
+        .relative_same_target_time_saved_auc_percent
+        .map(|percent| percent * coverage)
+        .filter(|score| score.is_finite());
+
+    same_target_score.unwrap_or(hypervolume_delta) - endpoint_penalty
+}
+
+fn cost_adr_policy_from_training_config(
+    coefficients: Vec<f32>,
+    config: &CostAdrTrainingConfig,
+) -> Result<CostAdrPolicy> {
+    CostAdrPolicy::new_with_settings(
+        coefficients,
+        0.0,
+        1024.0,
+        config.retention_min,
+        config.retention_max,
+        None,
+    )
 }
 
 fn reset_cost_adr_training_progress(config: &CostAdrTrainingConfig) {
@@ -763,6 +1623,28 @@ fn cost_adr_training_should_abort(progress: &Option<Arc<Mutex<CombinedProgressSt
     progress
         .as_ref()
         .is_some_and(|progress| progress.lock().unwrap().want_abort)
+}
+
+fn should_stop_cost_adr_training_early(
+    config: &CostAdrTrainingConfig,
+    best_score_history: &[f32],
+) -> bool {
+    let window = config.early_stop_patience_generations;
+    if window == 0
+        || best_score_history.len() < config.early_stop_min_generations
+        || best_score_history.len() <= window
+    {
+        return false;
+    }
+
+    let current = *best_score_history.last().unwrap();
+    let previous = best_score_history[best_score_history.len() - window - 1];
+    if !(current.is_finite() && previous.is_finite()) {
+        return false;
+    }
+
+    let relative_gain = (current - previous) / previous.abs().max(COST_ADR_EARLY_STOP_SCORE_SCALE);
+    relative_gain < config.early_stop_min_relative_gain
 }
 
 fn update_cost_adr_training_progress(
@@ -795,10 +1677,16 @@ fn cost_adr_training_progress_position(completed: usize, items_total: usize) -> 
 fn validate_training_config(config: &CostAdrTrainingConfig) -> Result<()> {
     if config.population_size < 2
         || config.generations == 0
+        || !config.early_stop_min_relative_gain.is_finite()
+        || config.early_stop_min_relative_gain < 0.0
         || config.sigma0 <= 0.0
         || !config.lower_bound.is_finite()
         || !config.upper_bound.is_finite()
         || config.lower_bound >= config.upper_bound
+        || !config.retention_min.is_finite()
+        || !config.retention_max.is_finite()
+        || !(0.0 < config.retention_min && config.retention_min < config.retention_max)
+        || config.retention_max >= 1.0
         || config.initial_coefficients.len() != COST_ADR_PARAMETER_COUNT
         || config
             .initial_coefficients
@@ -806,6 +1694,16 @@ fn validate_training_config(config: &CostAdrTrainingConfig) -> Result<()> {
             .any(|value| !value.is_finite())
         || config.cost_weights.is_empty()
         || config.baseline_desired_retentions.is_empty()
+        || !config
+            .average_desired_retention_endpoint_penalty
+            .is_finite()
+        || config.average_desired_retention_endpoint_penalty < 0.0
+        || config
+            .average_desired_retention_min_weight_target
+            .is_some_and(|target| !(target.is_finite() && 0.0 < target && target < 1.0))
+        || config
+            .average_desired_retention_max_weight_target
+            .is_some_and(|target| !(target.is_finite() && 0.0 < target && target < 1.0))
     {
         return Err(FSRSError::InvalidInput);
     }
@@ -898,6 +1796,84 @@ struct MemoryTimePoint {
     time_average: f32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DesiredRetentionMemoryTimePoint {
+    desired_retention: f32,
+    memorized_average: f32,
+    time_average: f32,
+}
+
+fn fixed_baseline_frontier_points(
+    baseline_desired_retentions: &[f32],
+    baseline_metrics: &[CostAdrMetrics],
+) -> Vec<DesiredRetentionMemoryTimePoint> {
+    let candidates = baseline_desired_retentions
+        .iter()
+        .copied()
+        .zip(baseline_metrics.iter().copied())
+        .map(
+            |(desired_retention, metrics)| DesiredRetentionMemoryTimePoint {
+                desired_retention,
+                memorized_average: metrics.memorized_average,
+                time_average: metrics.time_average,
+            },
+        )
+        .filter(|point| {
+            point.desired_retention.is_finite()
+                && (0.0..=1.0).contains(&point.desired_retention)
+                && point.memorized_average.is_finite()
+                && point.time_average.is_finite()
+        })
+        .collect::<Vec<_>>();
+
+    let mut frontier = Vec::new();
+    for candidate in &candidates {
+        let dominated = candidates.iter().any(|other| {
+            let no_worse = other.memorized_average >= candidate.memorized_average
+                && other.time_average <= candidate.time_average;
+            let strictly_better = other.memorized_average > candidate.memorized_average
+                || other.time_average < candidate.time_average;
+            no_worse && strictly_better
+        });
+        if !dominated {
+            frontier.push(*candidate);
+        }
+    }
+
+    frontier.sort_by(|left, right| {
+        left.memorized_average
+            .partial_cmp(&right.memorized_average)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                left.time_average
+                    .partial_cmp(&right.time_average)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| {
+                left.desired_retention
+                    .partial_cmp(&right.desired_retention)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+
+    let mut collapsed: Vec<DesiredRetentionMemoryTimePoint> = Vec::new();
+    for point in frontier {
+        if let Some(last) = collapsed.last_mut()
+            && is_close(last.memorized_average, point.memorized_average)
+        {
+            if point.time_average < last.time_average
+                || (is_close(point.time_average, last.time_average)
+                    && point.desired_retention < last.desired_retention)
+            {
+                *last = point;
+            }
+            continue;
+        }
+        collapsed.push(point);
+    }
+    collapsed
+}
+
 fn frontier_memory_time_points(metrics: &[CostAdrMetrics]) -> Vec<MemoryTimePoint> {
     let mut frontier = Vec::new();
     for candidate in metrics {
@@ -934,11 +1910,11 @@ fn frontier_memory_time_points(metrics: &[CostAdrMetrics]) -> Vec<MemoryTimePoin
 
     let mut collapsed: Vec<MemoryTimePoint> = Vec::new();
     for point in frontier {
-        if let Some(last) = collapsed.last_mut() {
-            if is_close(last.memorized_average, point.memorized_average) {
-                last.time_average = last.time_average.min(point.time_average);
-                continue;
-            }
+        if let Some(last) = collapsed.last_mut()
+            && is_close(last.memorized_average, point.memorized_average)
+        {
+            last.time_average = last.time_average.min(point.time_average);
+            continue;
         }
         collapsed.push(point);
     }
@@ -1000,6 +1976,67 @@ fn interpolated_time_for_memory_target(points: &[MemoryTimePoint], target: f32) 
         let ratio =
             (target - left.memorized_average) / (right.memorized_average - left.memorized_average);
         return Some(left.time_average + ratio * (right.time_average - left.time_average));
+    }
+    None
+}
+
+fn interpolated_desired_retention_for_memory_target(
+    points: &[DesiredRetentionMemoryTimePoint],
+    target: f32,
+) -> Option<f32> {
+    interpolated_desired_retention_memory_time_for_target(points, target)
+        .map(|(desired_retention, _time)| desired_retention)
+}
+
+fn interpolated_time_for_desired_retention_memory_target(
+    points: &[DesiredRetentionMemoryTimePoint],
+    target: f32,
+) -> Option<f32> {
+    interpolated_desired_retention_memory_time_for_target(points, target)
+        .map(|(_desired_retention, time)| time)
+}
+
+fn interpolated_desired_retention_memory_time_for_target(
+    points: &[DesiredRetentionMemoryTimePoint],
+    target: f32,
+) -> Option<(f32, f32)> {
+    if points.is_empty() {
+        return None;
+    }
+    let first = points[0];
+    let last = points[points.len() - 1];
+    if target < first.memorized_average && !is_close(target, first.memorized_average) {
+        return None;
+    }
+    if is_close(target, first.memorized_average) {
+        return Some((first.desired_retention, first.time_average));
+    }
+    if target > last.memorized_average && !is_close(target, last.memorized_average) {
+        return None;
+    }
+    if is_close(target, last.memorized_average) {
+        return Some((last.desired_retention, last.time_average));
+    }
+    for pair in points.windows(2) {
+        let left = pair[0];
+        let right = pair[1];
+        if !(left.memorized_average <= target && target <= right.memorized_average) {
+            continue;
+        }
+        if is_close(left.memorized_average, right.memorized_average) {
+            let point = if left.time_average <= right.time_average {
+                left
+            } else {
+                right
+            };
+            return Some((point.desired_retention, point.time_average));
+        }
+        let ratio =
+            (target - left.memorized_average) / (right.memorized_average - left.memorized_average);
+        return Some((
+            left.desired_retention + ratio * (right.desired_retention - left.desired_retention),
+            left.time_average + ratio * (right.time_average - left.time_average),
+        ));
     }
     None
 }
@@ -1118,6 +2155,7 @@ struct CandidateEvaluation {
     rollout_points: Vec<CostAdrEvaluationPoint>,
     hypervolume: f32,
     hypervolume_delta: f32,
+    score: f32,
 }
 
 impl SeparableCmaEs {
@@ -1168,9 +2206,7 @@ impl SeparableCmaEs {
             .map(|weight| weight / weight_sum)
             .collect::<Vec<_>>();
         let old_mean = self.mean.clone();
-        for value in &mut self.mean {
-            *value = 0.0;
-        }
+        self.mean.fill(0.0);
         for (&candidate_index, &weight) in order.iter().take(mu).zip(weights.iter()) {
             for (dimension, value) in candidates[candidate_index].coefficients.iter().enumerate() {
                 self.mean[dimension] += weight * value;
@@ -1231,7 +2267,8 @@ fn softplus(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DEFAULT_PARAMETERS, FSRS};
+    use crate::DEFAULT_PARAMETERS;
+    use crate::{FSRS, MemoryState};
 
     fn test_metrics(memorized_average: f32, time_average: f32) -> CostAdrMetrics {
         CostAdrMetrics {
@@ -1241,6 +2278,45 @@ mod tests {
             total_reviews: 0,
             total_lapses: 0,
             total_cost: 0.0,
+        }
+    }
+
+    fn test_existing_card() -> Card {
+        Card {
+            difficulty: 5.0,
+            stability: 10.0,
+            last_date: 0.0,
+            due: 1.0,
+            interval: 1.0,
+            desired_retention: 0.9,
+            ..Default::default()
+        }
+    }
+
+    fn test_evaluation_point(
+        cost_weight: f32,
+        average_desired_retention: f32,
+    ) -> CostAdrEvaluationPoint {
+        CostAdrEvaluationPoint {
+            goal_cost_weight: cost_weight,
+            metrics: test_metrics(1.0, 1.0),
+            average_desired_retention: Some(average_desired_retention),
+            fixed_fsrs_equivalent_desired_retention: None,
+            same_target_time_saved_percent: None,
+        }
+    }
+
+    fn test_evaluation_point_with_metrics(
+        cost_weight: f32,
+        memorized_average: f32,
+        time_average: f32,
+    ) -> CostAdrEvaluationPoint {
+        CostAdrEvaluationPoint {
+            goal_cost_weight: cost_weight,
+            metrics: test_metrics(memorized_average, time_average),
+            average_desired_retention: Some(0.8),
+            fixed_fsrs_equivalent_desired_retention: None,
+            same_target_time_saved_percent: None,
         }
     }
 
@@ -1255,11 +2331,325 @@ mod tests {
     }
 
     #[test]
+    fn test_policy_evaluator_matches_direct_retention() {
+        let policy = CostAdrPolicy::default_initial();
+        let evaluator = policy.evaluator_for_cost_weight(64.0);
+        for stability in [0.01, 1.0, 10.0, 1000.0] {
+            for difficulty in [1.0, 5.0, 10.0] {
+                assert_eq!(
+                    evaluator
+                        .evaluate_retention(stability, difficulty)
+                        .to_bits(),
+                    policy
+                        .evaluate_retention(stability, difficulty, 64.0)
+                        .to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_policy_clone_round_trip() -> Result<()> {
         let policy = CostAdrPolicy::default_initial();
         let decoded = policy.clone();
         decoded.validate()?;
+        assert_eq!(decoded.policy_version, COST_ADR_POLICY_VERSION);
         assert_eq!(decoded.coefficients, policy.coefficients);
+        Ok(())
+    }
+
+    #[test]
+    fn test_policy_rejects_unknown_version() {
+        let mut policy = CostAdrPolicy::default_initial();
+        policy.policy_version += 1;
+        assert_eq!(policy.validate(), Err(FSRSError::InvalidInput));
+    }
+
+    #[test]
+    fn test_policy_rejects_non_finite_bounds() {
+        let mut policy = CostAdrPolicy::default_initial();
+        policy.cost_weight_max = f32::NAN;
+        assert_eq!(policy.validate(), Err(FSRSError::InvalidInput));
+
+        let mut policy = CostAdrPolicy::default_initial();
+        policy.bounds.s_max = f32::INFINITY;
+        assert_eq!(policy.validate(), Err(FSRSError::InvalidInput));
+    }
+
+    #[test]
+    fn test_retention_grid_exports_finite_plot_points() -> Result<()> {
+        let policy = CostAdrPolicy::default_initial();
+        let points = policy.retention_grid(&[1.0, 10.0], &[3.0, 7.0], &[0.0, 64.0])?;
+        assert_eq!(points.len(), 8);
+        for point in points {
+            assert!(point.desired_retention.is_finite());
+            assert!(
+                (policy.retention_min..=policy.retention_max).contains(&point.desired_retention)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_average_desired_retention_calibration_uses_bisection() -> Result<()> {
+        let policy = CostAdrPolicy::default_initial();
+        let config = SimulatorConfig {
+            deck_size: 80,
+            learn_span: 10,
+            learn_limit: 20,
+            review_limit: 200,
+            ..Default::default()
+        };
+        let low = evaluate_cost_adr_rollout_for_weight(
+            &config,
+            &DEFAULT_PARAMETERS,
+            &policy,
+            policy.cost_weight_min,
+            Some(9),
+            None,
+        )?;
+        let high = evaluate_cost_adr_rollout_for_weight(
+            &config,
+            &DEFAULT_PARAMETERS,
+            &policy,
+            policy.cost_weight_max,
+            Some(9),
+            None,
+        )?;
+        let target = (average_desired_retention_from_point(&low)?
+            + average_desired_retention_from_point(&high)?)
+            * 0.5;
+
+        let point = policy.calibrate_cost_weight_for_average_desired_retention(
+            &config,
+            &DEFAULT_PARAMETERS,
+            target,
+            Some(9),
+        )?;
+
+        assert!(
+            point.goal_cost_weight > policy.cost_weight_min
+                && point.goal_cost_weight < policy.cost_weight_max
+        );
+        assert!((point.average_desired_retention.unwrap() - target).abs() <= 1e-3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_average_desired_retention_range_calibration_returns_sorted_weights() -> Result<()> {
+        let policy = CostAdrPolicy::default_initial();
+        let config = SimulatorConfig {
+            deck_size: 80,
+            learn_span: 10,
+            learn_limit: 20,
+            review_limit: 200,
+            ..Default::default()
+        };
+
+        let points = policy.calibrate_average_desired_retention_range(
+            &config,
+            &DEFAULT_PARAMETERS,
+            4,
+            Some(11),
+        )?;
+
+        assert_eq!(points.len(), 4);
+        for point in points.windows(2) {
+            assert!(point[0].goal_cost_weight <= point[1].goal_cost_weight);
+            assert!(
+                point[0].average_desired_retention.unwrap()
+                    >= point[1].average_desired_retention.unwrap()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_average_desired_retention_range_calibration_keeps_only_endpoints_when_narrow()
+    -> Result<()> {
+        let policy = CostAdrPolicy::constant_retention(0.9)?;
+        let config = SimulatorConfig {
+            deck_size: 80,
+            learn_span: 10,
+            learn_limit: 20,
+            review_limit: 200,
+            ..Default::default()
+        };
+
+        let points = policy.calibrate_average_desired_retention_range(
+            &config,
+            &DEFAULT_PARAMETERS,
+            16,
+            Some(11),
+        )?;
+
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].goal_cost_weight, policy.cost_weight_min);
+        assert_eq!(points[1].goal_cost_weight, policy.cost_weight_max);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cost_weight_for_average_desired_retention_interpolates_log_weight() {
+        let result = CostAdrEvaluationResult {
+            baseline_metrics: Vec::new(),
+            scheduler_metrics: vec![
+                test_evaluation_point(0.0, 0.9),
+                test_evaluation_point(99.0, 0.7),
+            ],
+            baseline_hypervolume: 0.0,
+            scheduler_hypervolume: 0.0,
+            hypervolume_delta: 0.0,
+            auc_metrics: CostAdrAucMetrics {
+                baseline_point_count: 0,
+                scheduler_point_count: 0,
+                baseline_frontier_count: 0,
+                scheduler_frontier_count: 0,
+                target_count: 0,
+                covered_target_count: 0,
+                total_span: 0.0,
+                covered_span: 0.0,
+                span_coverage_percent: 0.0,
+                same_target_time_saved_auc: None,
+                baseline_time_auc: None,
+                relative_same_target_time_saved_auc_percent: None,
+            },
+        };
+
+        let weight = result
+            .cost_weight_for_average_desired_retention(0.8)
+            .unwrap();
+
+        assert!((weight - 9.0).abs() < 1e-5);
+        assert_eq!(result.cost_weight_for_average_desired_retention(0.95), None);
+        assert_eq!(
+            result.cost_weight_for_average_desired_retention(f32::NAN),
+            None
+        );
+    }
+
+    #[test]
+    fn test_efficient_fixed_desired_retention_points_choose_cheapest_eligible_point() {
+        let baseline_desired_retentions = vec![0.8, 0.9];
+        let baseline_metrics = vec![test_metrics(100.0, 10.0), test_metrics(120.0, 20.0)];
+        let scheduler_points = vec![
+            test_evaluation_point_with_metrics(0.0, 120.0, 25.0),
+            test_evaluation_point_with_metrics(16.0, 120.0, 12.0),
+            test_evaluation_point_with_metrics(64.0, 100.0, 6.0),
+            test_evaluation_point_with_metrics(128.0, 90.0, 2.0),
+        ];
+
+        let points = efficient_fixed_desired_retention_points(
+            &baseline_desired_retentions,
+            &baseline_metrics,
+            &scheduler_points,
+        );
+
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].desired_retention, 0.8);
+        assert_eq!(points[0].goal_cost_weight, 64.0);
+        assert_eq!(points[1].desired_retention, 0.9);
+        assert_eq!(points[1].goal_cost_weight, 16.0);
+    }
+
+    #[test]
+    fn test_cost_adr_training_score_prefers_same_target_time_savings() {
+        let baseline = vec![test_metrics(100.0, 10.0), test_metrics(200.0, 20.0)];
+        let time_saving_candidate = vec![test_metrics(100.0, 9.0), test_metrics(200.0, 18.0)];
+        let slower_candidate = vec![test_metrics(100.0, 11.0), test_metrics(200.0, 22.0)];
+
+        let saving_score = cost_adr_training_score(&baseline, &time_saving_candidate, -100.0, 0.0);
+        let slower_score = cost_adr_training_score(&baseline, &slower_candidate, 100.0, 0.0);
+
+        assert!(saving_score > slower_score);
+    }
+
+    #[test]
+    fn test_fixed_equivalent_uses_baseline_frontier() {
+        let baseline_desired_retentions = vec![0.8, 0.88, 0.9];
+        let baseline_metrics = vec![
+            test_metrics(100.0, 10.0),
+            test_metrics(110.0, 50.0),
+            test_metrics(120.0, 20.0),
+        ];
+        let mut scheduler_points = vec![test_evaluation_point_with_metrics(64.0, 110.0, 14.0)];
+
+        annotate_cost_adr_rollouts(
+            &baseline_desired_retentions,
+            &baseline_metrics,
+            &mut scheduler_points,
+        );
+
+        let point = scheduler_points[0];
+        assert!((point.fixed_fsrs_equivalent_desired_retention.unwrap() - 0.85).abs() < 1e-6);
+        assert!((point.same_target_time_saved_percent.unwrap() - 6.666_667).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_average_desired_retention_endpoint_penalty_uses_weight_endpoints() {
+        let config = CostAdrTrainingConfig {
+            average_desired_retention_min_weight_target: Some(0.9),
+            average_desired_retention_max_weight_target: Some(0.5),
+            average_desired_retention_endpoint_penalty: 10.0,
+            ..Default::default()
+        };
+        let points = vec![
+            test_evaluation_point(0.0, 0.88),
+            test_evaluation_point(64.0, 0.7),
+            test_evaluation_point(1024.0, 0.62),
+        ];
+
+        let penalty = average_desired_retention_endpoint_penalty(&points, &config);
+
+        assert!((penalty - 0.148).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_cost_adr_early_stop_uses_relative_gain_window() {
+        let enabled = CostAdrTrainingConfig {
+            early_stop_patience_generations: 2,
+            early_stop_min_generations: 4,
+            early_stop_min_relative_gain: 0.1,
+            ..Default::default()
+        };
+        assert!(!should_stop_cost_adr_training_early(
+            &enabled,
+            &[100.0, 101.0, 101.0]
+        ));
+        assert!(should_stop_cost_adr_training_early(
+            &enabled,
+            &[100.0, 101.0, 101.0, 101.0]
+        ));
+        assert!(!should_stop_cost_adr_training_early(
+            &enabled,
+            &[100.0, 101.0, 112.0, 112.0]
+        ));
+
+        let disabled = CostAdrTrainingConfig {
+            early_stop_patience_generations: 0,
+            ..Default::default()
+        };
+        assert!(!should_stop_cost_adr_training_early(
+            &disabled,
+            &[100.0, 100.0, 100.0, 100.0]
+        ));
+    }
+
+    #[test]
+    fn test_fsrs7_policy_input_is_internal_stability_not_s90() -> Result<()> {
+        let fsrs = FSRS::new(&DEFAULT_PARAMETERS)?;
+        let policy = CostAdrPolicy::default_initial();
+        let state = MemoryState {
+            stability: 10.0,
+            difficulty: 5.0,
+            stability_fast: 10.0,
+        };
+        let s90 = fsrs.s90(state);
+
+        assert!((s90 - state.stability).abs() > 1e-3);
+        let internal_retention = policy.evaluate_retention(state.stability, state.difficulty, 64.0);
+        let s90_retention = policy.evaluate_retention(s90, state.difficulty, 64.0);
+        assert!((internal_retention - s90_retention).abs() > 1e-6);
         Ok(())
     }
 
@@ -1274,7 +2664,15 @@ mod tests {
             ..Default::default()
         };
         let fixed = simulate(&config, &DEFAULT_PARAMETERS, 0.9, Some(7), None)?;
-        let dynamic = simulate_with_cost_adr_policy(
+        let dynamic = crate::simulate_with_cost_adr_policy(
+            &config,
+            &DEFAULT_PARAMETERS,
+            &policy,
+            0.0,
+            Some(7),
+            None,
+        )?;
+        let dynamic_evaluation = simulate_with_cost_adr_policy_for_evaluation(
             &config,
             &DEFAULT_PARAMETERS,
             &policy,
@@ -1285,29 +2683,53 @@ mod tests {
         assert_eq!(fixed.review_cnt_per_day, dynamic.review_cnt_per_day);
         assert_eq!(fixed.learn_cnt_per_day, dynamic.learn_cnt_per_day);
         assert_eq!(fixed.cost_per_day, dynamic.cost_per_day);
-        assert!((fixed.average_desired_retention.unwrap() - 0.9).abs() < 1e-4);
-        assert!((dynamic.average_desired_retention.unwrap() - 0.9).abs() < 1e-4);
+        assert!((dynamic_evaluation.average_desired_retention.unwrap() - 0.9).abs() < 1e-4);
         Ok(())
     }
 
     #[test]
     fn test_cost_adr_next_states_matches_constant_retention() -> Result<()> {
-        let fsrs = FSRS::new(&DEFAULT_PARAMETERS)?;
         let policy = CostAdrPolicy::constant_retention(0.9)?;
-        let previous_state = Some(MemoryState {
-            stability: 7.0,
-            difficulty: 5.0,
-        });
-
-        let fixed = fsrs.next_states(previous_state, 0.9, 7)?;
-        let dynamic = policy.next_states(&fsrs, previous_state, 64.0, 7)?;
-
-        assert_eq!(fixed.again.memory, dynamic.again.memory);
-        assert_eq!(fixed.hard.memory, dynamic.hard.memory);
-        assert_eq!(fixed.good.memory, dynamic.good.memory);
-        assert_eq!(fixed.easy.memory, dynamic.easy.memory);
-        assert!((fixed.good.interval - dynamic.good.interval).abs() < 1e-4);
-        assert!((dynamic.good.desired_retention - 0.9).abs() < 1e-4);
+        for parameters in [
+            &crate::FSRS6_DEFAULT_PARAMETERS[..],
+            &DEFAULT_PARAMETERS[..],
+        ] {
+            let fsrs = FSRS::new(parameters)?;
+            for previous_state in [
+                None,
+                Some(MemoryState {
+                    stability: 7.0,
+                    difficulty: 5.0,
+                    stability_fast: 7.0,
+                }),
+                Some(MemoryState {
+                    stability: 7.0,
+                    difficulty: 3.0,
+                    stability_fast: 1.5,
+                }),
+            ] {
+                for elapsed in [0.25, 7.0] {
+                    let fixed = fsrs.next_states_with_elapsed_days(previous_state, 0.9, elapsed)?;
+                    let dynamic = policy.next_states(&fsrs, previous_state, 64.0, elapsed)?;
+                    for (fixed, dynamic) in [
+                        (fixed.again, dynamic.again),
+                        (fixed.hard, dynamic.hard),
+                        (fixed.good, dynamic.good),
+                        (fixed.easy, dynamic.easy),
+                    ] {
+                        assert_eq!(fixed.memory, dynamic.memory);
+                        assert!(
+                            (fixed.interval - dynamic.interval).abs() < 1e-3,
+                            "params={} state={previous_state:?} elapsed={elapsed}: fixed={} dynamic={}",
+                            parameters.len(),
+                            fixed.interval,
+                            dynamic.interval
+                        );
+                        assert!((dynamic.desired_retention - 0.9).abs() < 1e-4);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1325,9 +2747,10 @@ mod tests {
         let previous_state = Some(MemoryState {
             stability: 100.0,
             difficulty: 5.0,
+            stability_fast: 100.0,
         });
 
-        let states = policy.next_states(&fsrs, previous_state, 64.0, 7)?;
+        let states = policy.next_states(&fsrs, previous_state, 64.0, 7.0)?;
 
         assert!(states.good.interval <= 3.0);
         assert!(states.good.interval >= 1.0);
@@ -1356,7 +2779,50 @@ mod tests {
         assert_eq!(result.policy.coefficients.len(), COST_ADR_PARAMETER_COUNT);
         assert_eq!(result.best_cost_weight_metrics.len(), 2);
         assert_eq!(result.history.len(), 2);
+        for (index, metrics) in result.history.iter().enumerate() {
+            assert_eq!(metrics.generation, index);
+            assert!(metrics.best_hypervolume_delta.is_finite());
+            assert!(metrics.generation_best_hypervolume_delta.is_finite());
+            assert!(metrics.mean_hypervolume_delta.is_finite());
+            assert!(metrics.sigma.is_finite());
+        }
+        assert_eq!(
+            result.history.last().unwrap().best_hypervolume_delta,
+            result.best_hypervolume_delta
+        );
+        assert!(
+            (result.baseline_hypervolume + result.best_hypervolume_delta - result.best_hypervolume)
+                .abs()
+                <= result.best_hypervolume.abs() * f32::EPSILON
+        );
         assert!(result.training_seconds >= 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_train_cost_adr_uses_configured_retention_bounds() -> Result<()> {
+        let config = SimulatorConfig {
+            deck_size: 80,
+            learn_span: 10,
+            learn_limit: 20,
+            review_limit: 200,
+            ..Default::default()
+        };
+        let training_config = CostAdrTrainingConfig {
+            population_size: 2,
+            generations: 1,
+            sigma0: 0.5,
+            retention_min: 0.75,
+            retention_max: 0.95,
+            cost_weights: vec![0.0],
+            baseline_desired_retentions: vec![0.9],
+            ..Default::default()
+        };
+        let result =
+            CostAdrPolicy::train_single_user(&config, &DEFAULT_PARAMETERS, &training_config)?;
+
+        assert_eq!(result.policy.retention_min, 0.75);
+        assert_eq!(result.policy.retention_max, 0.95);
         Ok(())
     }
 
@@ -1459,6 +2925,36 @@ mod tests {
     }
 
     #[test]
+    fn test_evaluate_cost_adr_policy_returns_baseline_and_scheduler_metrics() -> Result<()> {
+        let config = SimulatorConfig {
+            deck_size: 120,
+            learn_span: 15,
+            learn_limit: 20,
+            review_limit: 200,
+            ..Default::default()
+        };
+        let policy = CostAdrPolicy::default_initial();
+        let evaluation_config = CostAdrEvaluationConfig {
+            cost_weights: vec![0.0, 16.0],
+            baseline_desired_retentions: vec![0.8, 0.9],
+            seed: Some(11),
+        };
+        let result = policy.evaluate(&config, &DEFAULT_PARAMETERS, &evaluation_config)?;
+        assert_eq!(result.baseline_metrics.len(), 2);
+        assert_eq!(result.scheduler_metrics.len(), 2);
+        assert!(result.baseline_hypervolume.is_finite());
+        assert!(result.scheduler_hypervolume.is_finite());
+        assert!(result.hypervolume_delta.is_finite());
+        for point in &result.scheduler_metrics {
+            let average_desired_retention = point.average_desired_retention.unwrap();
+            assert!((0.30..=0.995).contains(&average_desired_retention));
+        }
+        assert_eq!(result.auc_metrics.baseline_point_count, 2);
+        assert_eq!(result.auc_metrics.scheduler_point_count, 2);
+        Ok(())
+    }
+
+    #[test]
     fn test_cost_adr_default_seed_derivation_separates_train_and_evaluation() {
         let training_config = CostAdrTrainingConfig::default();
         let optimizer_seed = cost_adr_training_optimizer_seed(&training_config);
@@ -1476,6 +2972,15 @@ mod tests {
             COST_ADR_DEFAULT_SEED + COST_ADR_EVALUATION_SEED_OFFSET
         );
         assert_ne!(training_simulation_seed, evaluation_seed);
+    }
+
+    #[test]
+    fn test_cost_adr_seed_offsets_wrap_at_u64_max() {
+        assert_eq!(cost_adr_rollout_seed(u64::MAX, 1), 0);
+        assert_eq!(
+            cost_adr_generation_seed(u64::MAX, 1),
+            COST_ADR_GENERATION_SEED_STRIDE - 1
+        );
     }
 
     #[test]
@@ -1552,36 +3057,6 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_cost_adr_policy_returns_baseline_and_scheduler_metrics() -> Result<()> {
-        let config = SimulatorConfig {
-            deck_size: 120,
-            learn_span: 15,
-            learn_limit: 20,
-            review_limit: 200,
-            ..Default::default()
-        };
-        let policy = CostAdrPolicy::default_initial();
-        let evaluation_config = CostAdrEvaluationConfig {
-            cost_weights: vec![0.0, 16.0],
-            baseline_desired_retentions: vec![0.8, 0.9],
-            seed: Some(11),
-        };
-        let result = policy.evaluate(&config, &DEFAULT_PARAMETERS, &evaluation_config)?;
-        assert_eq!(result.baseline_metrics.len(), 2);
-        assert_eq!(result.scheduler_metrics.len(), 2);
-        assert!(result.baseline_hypervolume.is_finite());
-        assert!(result.scheduler_hypervolume.is_finite());
-        assert!(result.hypervolume_delta.is_finite());
-        for point in &result.scheduler_metrics {
-            let average_desired_retention = point.average_desired_retention.unwrap();
-            assert!((0.30..=0.995).contains(&average_desired_retention));
-        }
-        assert_eq!(result.auc_metrics.baseline_point_count, 2);
-        assert_eq!(result.auc_metrics.scheduler_point_count, 2);
-        Ok(())
-    }
-
-    #[test]
     fn test_cost_adr_none_seed_uses_default_seed() -> Result<()> {
         let config = SimulatorConfig {
             deck_size: 120,
@@ -1609,9 +3084,105 @@ mod tests {
     }
 
     #[test]
+    fn test_evaluate_cost_adr_policy_with_existing_cards_uses_in_flight_cards() -> Result<()> {
+        let config = SimulatorConfig {
+            deck_size: 1,
+            learn_span: 5,
+            learn_limit: 0,
+            review_limit: 200,
+            review_rating_prob: [0.0, 1.0, 0.0],
+            ..Default::default()
+        };
+        let policy = CostAdrPolicy::constant_retention(0.9)?;
+        let evaluation_config = CostAdrEvaluationConfig {
+            cost_weights: vec![0.0],
+            baseline_desired_retentions: vec![0.9],
+            seed: Some(11),
+        };
+        let synthetic = policy.evaluate(&config, &DEFAULT_PARAMETERS, &evaluation_config)?;
+        let existing_cards = vec![test_existing_card()];
+        let with_existing = policy.evaluate_with_existing_cards(
+            &config,
+            &DEFAULT_PARAMETERS,
+            &evaluation_config,
+            &existing_cards,
+        )?;
+
+        assert_eq!(synthetic.baseline_metrics[0].total_reviews, 0);
+        assert_eq!(synthetic.scheduler_metrics[0].metrics.total_reviews, 0);
+        assert!(with_existing.baseline_metrics[0].total_reviews > 0);
+        assert!(with_existing.scheduler_metrics[0].metrics.total_reviews > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fixed_baselines_with_existing_cards_apply_each_desired_retention() -> Result<()> {
+        let config = SimulatorConfig {
+            deck_size: 1,
+            learn_span: 120,
+            learn_limit: 0,
+            review_limit: 200,
+            review_rating_prob: [0.0, 1.0, 0.0],
+            ..Default::default()
+        };
+        let policy = CostAdrPolicy::constant_retention(0.9)?;
+        let evaluation_config = CostAdrEvaluationConfig {
+            cost_weights: vec![0.0],
+            baseline_desired_retentions: vec![0.8, 0.9],
+            seed: Some(11),
+        };
+        let existing_cards = vec![test_existing_card()];
+
+        let result = policy.evaluate_with_existing_cards(
+            &config,
+            &DEFAULT_PARAMETERS,
+            &evaluation_config,
+            &existing_cards,
+        )?;
+
+        assert!(
+            result.baseline_metrics[0].total_reviews < result.baseline_metrics[1].total_reviews
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_train_cost_adr_with_existing_cards_uses_in_flight_cards() -> Result<()> {
+        let config = SimulatorConfig {
+            deck_size: 1,
+            learn_span: 5,
+            learn_limit: 0,
+            review_limit: 200,
+            review_rating_prob: [0.0, 1.0, 0.0],
+            ..Default::default()
+        };
+        let training_config = CostAdrTrainingConfig {
+            population_size: 2,
+            generations: 1,
+            sigma0: 0.5,
+            cost_weights: vec![0.0],
+            baseline_desired_retentions: vec![0.9],
+            ..Default::default()
+        };
+        let existing_cards = vec![test_existing_card()];
+
+        let result = CostAdrPolicy::train_single_user_with_existing_cards(
+            &config,
+            &DEFAULT_PARAMETERS,
+            &training_config,
+            &existing_cards,
+        )?;
+
+        assert!(result.baseline_metrics[0].total_reviews > 0);
+        assert!(result.best_cost_weight_metrics[0].metrics.total_reviews > 0);
+        Ok(())
+    }
+
+    #[test]
     fn test_default_baseline_retention_grid_has_sixteen_fixed_points() {
+        assert_eq!(CostAdrTrainingConfig::default().generations, 10);
         assert_eq!(COST_ADR_DEFAULT_BASELINE_RETENTIONS.len(), 16);
-        assert_eq!(COST_ADR_DEFAULT_BASELINE_RETENTIONS[0], 0.50);
+        assert_eq!(COST_ADR_DEFAULT_BASELINE_RETENTIONS[0], 0.30);
         assert_eq!(COST_ADR_DEFAULT_BASELINE_RETENTIONS[15], 0.95);
     }
 

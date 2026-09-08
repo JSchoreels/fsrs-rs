@@ -17,3 +17,6 @@ artifacts/
 *.anki21
 *.anki21.zip
 /tests
+
+# Local ADR outputs generated from private collections.
+/docs/fsrs7-adr-plots/

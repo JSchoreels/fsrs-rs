@@ -1,22 +1,20 @@
-//! The dataset module provides data structures and data processing functions for working with FSRS datasets.
-
 use std::collections::{HashMap, HashSet};
 
-#[cfg(test)]
 use burn::data::dataloader::batcher::Batcher;
-#[cfg(test)]
-use burn::data::dataset::Dataset;
-#[cfg(test)]
-use burn::tensor::{Float, Int, Tensor, TensorData, backend::Backend};
+use burn::{
+    data::dataset::Dataset,
+    tensor::{Float, Int, Shape, Tensor, TensorData, backend::Backend},
+};
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-/// Stores a list of reviews for a card, in chronological order.
-///
-/// Each [`FSRSItem`] corresponds to a single review, but contains the previous reviews of the card as well, after the first one.
-/// When used during review, the last item should include the correct delta_t, but the provided rating is ignored as all four ratings are returned by `.next_states()`.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+/// Stores a list of reviews for a card, in chronological order. Each FSRSItem corresponds
+/// to a single review, but contains the previous reviews of the card as well, after the
+/// first one.
+/// When used during review, the last item should include the correct delta_t, but
+/// the provided rating is ignored as all four ratings are returned by .next_states()
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub struct FSRSItem {
     pub reviews: Vec<FSRSReview>,
 }
@@ -24,33 +22,33 @@ pub struct FSRSItem {
 #[derive(Debug, Clone)]
 pub(crate) struct WeightedFSRSItem {
     pub weight: f32,
-    pub card_id: i64,
     pub item: FSRSItem,
+    pub card_id: Option<i64>,
 }
 
-/// A single review for a card, including the user's rating and the number of days that passed.
-///
-/// This struct is a part of [`FSRSItem`].
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 pub struct FSRSReview {
-    /// The user's performance rating for this review.
-    ///
-    /// Rating scale:
-    /// - 1 = Again (forgot anything you want to remember)
-    /// - 2 = Hard (remembered with difficulty)
-    /// - 3 = Good (remembered correctly)
-    /// - 4 = Easy (remembered effortlessly)
-    ///
-    /// # Note
-    /// This field is **ignored** for the most recent item when calling
-    /// `.next_states()`. The method returns all four possible next states
-    /// regardless of the rating stored here.
+    /// 1-4
     pub rating: u32,
-    /// The number of days that passed
-    ///
+    /// The number of days that passed (can be fractional).
     /// # Warning
     /// `delta_t` for item first(initial) review must be 0
-    pub delta_t: u32,
+    pub delta_t: f32,
+}
+
+const LONG_TERM_DELTA_T_BUCKET_DAYS: f32 = 1.0;
+
+/// Bucket long-term elapsed days for preprocessing/grouping steps.
+///
+/// Training/inference still uses the original (possibly fractional) `delta_t`.
+/// This bucketing is only to keep initialization/outlier groups stable when
+/// interday fractional deltas are enabled.
+pub(crate) fn bucket_long_term_delta_t(delta_t: f32) -> f32 {
+    if !delta_t.is_finite() {
+        return 1.0;
+    }
+    let clamped = delta_t.max(1.0);
+    (clamped / LONG_TERM_DELTA_T_BUCKET_DAYS).floor() * LONG_TERM_DELTA_T_BUCKET_DAYS
 }
 
 impl FSRSItem {
@@ -63,28 +61,10 @@ impl FSRSItem {
         self.reviews.last().unwrap()
     }
 
-    /// Count long-term reviews.
-    ///
-    /// # Notes
-    /// The long-term reviews mean the number of reviews with `delta_t` > 0.
-    ///
-    /// # Examples
-    /// ```
-    /// use fsrs::{FSRSReview, FSRSItem};
-    /// let items = FSRSItem {
-    ///     reviews: vec![
-    ///         FSRSReview { rating: 0, delta_t: 0 },
-    ///         FSRSReview { rating: 1, delta_t: 1 },
-    ///         FSRSReview { rating: 2, delta_t: 2 },
-    ///         FSRSReview { rating: 3, delta_t: 0 },
-    ///     ],
-    /// };
-    /// assert_eq!(items.long_term_review_cnt(), 2);
-    /// ```
     pub fn long_term_review_cnt(&self) -> usize {
         self.reviews
             .iter()
-            .filter(|review| review.delta_t > 0)
+            .filter(|review| review.delta_t >= 1.0)
             .count()
     }
 
@@ -92,8 +72,8 @@ impl FSRSItem {
         *self
             .reviews
             .iter()
-            .find(|review| review.delta_t > 0)
-            .expect("Invalid FSRS item: at least one review with delta_t > 0 is required")
+            .find(|review| review.delta_t >= 1.0)
+            .expect("Invalid FSRS item: at least one review with delta_t >= 1.0 is required")
     }
 
     pub(crate) fn r_matrix_index(&self) -> (u32, u32, u32) {
@@ -103,7 +83,7 @@ impl FSRSItem {
         let length_bin = (1.99 * 1.89f64.powf(length.log(1.89).floor())).round() as u32;
         let lapse = self
             .history()
-            .filter(|review| review.rating == 1 && review.delta_t > 0)
+            .filter(|review| review.rating == 1 && review.delta_t >= 1.0)
             .count();
         if lapse == 0 {
             return (delta_t_bin, length_bin, 0);
@@ -113,13 +93,11 @@ impl FSRSItem {
     }
 }
 
-#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct FSRSBatcher<B: Backend> {
     _backend: core::marker::PhantomData<B>,
 }
 
-#[cfg(test)]
 impl<B: Backend> FSRSBatcher<B> {
     pub const fn new() -> Self {
         Self {
@@ -128,7 +106,6 @@ impl<B: Backend> FSRSBatcher<B> {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct FSRSBatch<B: Backend> {
     pub t_historys: Tensor<B, 2, Float>,
@@ -138,10 +115,8 @@ pub(crate) struct FSRSBatch<B: Backend> {
     pub weights: Tensor<B, 1, Float>,
 }
 
-#[cfg(test)]
 impl<B: Backend> Batcher<B, WeightedFSRSItem, FSRSBatch<B>> for FSRSBatcher<B> {
     fn batch(&self, weighted_items: Vec<WeightedFSRSItem>, device: &B::Device) -> FSRSBatch<B> {
-        let batch_size = weighted_items.len();
         let pad_size = weighted_items
             .iter()
             .map(|x| x.item.reviews.len())
@@ -149,36 +124,60 @@ impl<B: Backend> Batcher<B, WeightedFSRSItem, FSRSBatch<B>> for FSRSBatcher<B> {
             .expect("FSRSItem is empty")
             - 1;
 
-        let mut time_histories = vec![0.0; pad_size * batch_size];
-        let mut rating_histories = vec![0.0; pad_size * batch_size];
-        let mut delta_ts = Vec::with_capacity(batch_size);
-        let mut labels = Vec::with_capacity(batch_size);
-        let mut weights = Vec::with_capacity(batch_size);
+        let (time_histories, rating_histories) = weighted_items
+            .iter()
+            .map(|weighted_item| {
+                let (mut delta_t, mut rating): (Vec<_>, Vec<_>) = weighted_item
+                    .item
+                    .history()
+                    .map(|r| (r.delta_t, r.rating))
+                    .unzip();
+                delta_t.resize(pad_size, 0.0);
+                rating.resize(pad_size, 0);
+                let delta_t = Tensor::<B, 2>::from_floats(
+                    TensorData::new(
+                        delta_t,
+                        Shape {
+                            dims: vec![1, pad_size],
+                        },
+                    ),
+                    device,
+                );
+                let rating = Tensor::<B, 2>::from_data(
+                    TensorData::new(
+                        rating,
+                        Shape {
+                            dims: vec![1, pad_size],
+                        },
+                    ),
+                    device,
+                );
+                (delta_t, rating)
+            })
+            .unzip();
 
-        for (batch_index, weighted_item) in weighted_items.iter().enumerate() {
-            for (history_index, review) in weighted_item.item.history().enumerate() {
-                let index = history_index * batch_size + batch_index;
-                time_histories[index] = review.delta_t as f32;
-                rating_histories[index] = review.rating as f32;
-            }
+        let (delta_ts, labels, weights) = weighted_items
+            .iter()
+            .map(|weighted_item| {
+                let current = weighted_item.item.current();
+                let delta_t: Tensor<B, 1> = Tensor::from_floats([current.delta_t], device);
+                let label = match current.rating {
+                    1 => 0,
+                    _ => 1,
+                };
+                let label: Tensor<B, 1, Int> = Tensor::from_ints([label], device);
+                let weight: Tensor<B, 1> = Tensor::from_floats([weighted_item.weight], device);
+                (delta_t, label, weight)
+            })
+            .multiunzip();
 
-            let current = weighted_item.item.current();
-            delta_ts.push(current.delta_t as f32);
-            labels.push(if current.rating == 1 { 0 } else { 1 });
-            weights.push(weighted_item.weight);
-        }
-
-        let t_historys = Tensor::from_floats(
-            TensorData::new(time_histories, [pad_size, batch_size]),
-            device,
-        ); // [seq_len, batch_size]
-        let r_historys = Tensor::from_floats(
-            TensorData::new(rating_histories, [pad_size, batch_size]),
-            device,
-        ); // [seq_len, batch_size]
-        let delta_ts = Tensor::from_floats(TensorData::new(delta_ts, [batch_size]), device);
-        let labels = Tensor::from_ints(TensorData::new(labels, [batch_size]), device);
-        let weights = Tensor::from_floats(TensorData::new(weights, [batch_size]), device);
+        let t_historys = Tensor::cat(time_histories, 0).transpose().to_device(device); // [seq_len, batch_size]
+        let r_historys = Tensor::cat(rating_histories, 0)
+            .transpose()
+            .to_device(device); // [seq_len, batch_size]
+        let delta_ts = Tensor::cat(delta_ts, 0).to_device(device);
+        let labels = Tensor::cat(labels, 0).to_device(device);
+        let weights = Tensor::cat(weights, 0).to_device(device);
 
         // dbg!(&items[0].t_history);
         // dbg!(&t_historys);
@@ -193,12 +192,10 @@ impl<B: Backend> Batcher<B, WeightedFSRSItem, FSRSBatch<B>> for FSRSBatcher<B> {
     }
 }
 
-#[cfg(test)]
 pub(crate) struct FSRSDataset {
     pub(crate) items: Vec<WeightedFSRSItem>,
 }
 
-#[cfg(test)]
 impl Dataset<WeightedFSRSItem> for FSRSDataset {
     fn len(&self) -> usize {
         self.items.len()
@@ -210,7 +207,6 @@ impl Dataset<WeightedFSRSItem> for FSRSDataset {
     }
 }
 
-#[cfg(test)]
 impl From<Vec<WeightedFSRSItem>> for FSRSDataset {
     fn from(items: Vec<WeightedFSRSItem>) -> Self {
         Self {
@@ -219,19 +215,27 @@ impl From<Vec<WeightedFSRSItem>> for FSRSDataset {
     }
 }
 
-fn compute_outlier_analysis(items: &[FSRSItem]) -> ([HashSet<u32>; 5], Vec<usize>) {
+struct OutlierBucketDecisions {
+    removed_pairs: [HashSet<u32>; 5],
+    kept_initialization_indices: Vec<usize>,
+}
+
+fn compute_outlier_bucket_decisions<'a>(
+    dataset_for_initialization: impl Iterator<Item = &'a FSRSItem>,
+) -> OutlierBucketDecisions {
+    let to_key = |delta_t: f32| bucket_long_term_delta_t(delta_t).to_bits();
+    let from_key = |key: u32| f32::from_bits(key);
     let mut groups = HashMap::<u32, HashMap<u32, Vec<usize>>>::new();
 
-    // group by rating of first review and delta_t of second review
-    for (index, item) in items
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| item.long_term_review_cnt() == 1)
-    {
-        let (first_review, second_review) = (item.reviews.first().unwrap(), item.current());
-        let rating_group = groups.entry(first_review.rating).or_default();
-        rating_group
-            .entry(second_review.delta_t)
+    // Group by first rating and first long-term review delta_t.
+    // (For FSRS-7, current review can be same-day and should not define the group.)
+    for (index, item) in dataset_for_initialization.enumerate() {
+        let first_review = item.reviews.first().unwrap();
+        let first_long_term_review = item.first_long_term_review();
+        groups
+            .entry(first_review.rating)
+            .or_default()
+            .entry(to_key(first_long_term_review.delta_t))
             .or_default()
             .push(index);
     }
@@ -242,12 +246,13 @@ fn compute_outlier_analysis(items: &[FSRSItem]) -> ([HashSet<u32>; 5], Vec<usize
     for (rating, delta_t_groups) in groups.into_iter().sorted_by_key(|&(k, _)| k) {
         let mut sub_groups = delta_t_groups.into_iter().collect::<Vec<_>>();
 
-        // order by size of sub group ascending and delta_t descending
+        // Order by bucket size descending and delta_t descending, matching the
+        // previous item-grouped implementation without storing full item groups.
         sub_groups.sort_by(|(delta_t_a, indices_a), (delta_t_b, indices_b)| {
             indices_b
                 .len()
                 .cmp(&indices_a.len())
-                .then(delta_t_b.cmp(delta_t_a))
+                .then(from_key(*delta_t_b).total_cmp(&from_key(*delta_t_a)))
         });
 
         let total = sub_groups
@@ -262,10 +267,11 @@ fn compute_outlier_analysis(items: &[FSRSItem]) -> ([HashSet<u32>; 5], Vec<usize
                 // keep the sub_group if it includes at least six items
                 // and the delta_t is less than 100 days if rating is not 4
                 // or less than 365 days if rating is 4
-                if indices.len() >= 6 && *delta_t <= if rating != 4 { 100 } else { 365 } {
-                    kept_initialization_indices.extend_from_slice(indices);
-                } else {
+                if indices.len() < 6 || from_key(*delta_t) > if rating != 4 { 100.0 } else { 365.0 }
+                {
                     removed_pairs[rating as usize].insert(*delta_t);
+                } else {
+                    kept_initialization_indices.extend(indices);
                 }
             } else {
                 has_been_removed += indices.len();
@@ -273,155 +279,79 @@ fn compute_outlier_analysis(items: &[FSRSItem]) -> ([HashSet<u32>; 5], Vec<usize
             }
         }
     }
-    (removed_pairs, kept_initialization_indices)
+    OutlierBucketDecisions {
+        removed_pairs,
+        kept_initialization_indices,
+    }
 }
 
-fn train_item_survives_outlier(item: &FSRSItem, removed_pairs: &[HashSet<u32>; 5]) -> bool {
-    !removed_pairs[item.reviews[0].rating as usize].contains(&item.first_long_term_review().delta_t)
+pub(crate) fn item_survives_outlier(item: &FSRSItem, removed_pairs: &[HashSet<u32>; 5]) -> bool {
+    if item.long_term_review_cnt() == 0 {
+        true
+    } else {
+        let key = bucket_long_term_delta_t(item.first_long_term_review().delta_t).to_bits();
+        !removed_pairs[item.reviews[0].rating as usize].contains(&key)
+    }
 }
 
-/// Filters out outlier reviews from two [`Vec<FSRSItem>`].
-///
-/// This function removes anomalous review records that could negatively impact model training.
-/// It uses `dataset_for_initialization` as a reference to choose normal review patterns.
-///
-/// # Arguments
-/// * `dataset_for_initialization` - A [`Vec<FSRSItem>`] used as the reference standard.
-///   Each item **must** contain at least 2 reviews.
-///   The data should be high-quality and free from obvious anomalies.
-/// * `trainset` - A [`Vec<FSRSItem>`] which contains the training data to be filtered.
-///
-/// # Returns
-/// * `filtered_init` - A `Vec<FSRSItem>` filtered from `dataset_for_initialization`.
-/// * `filtered_trainset` - A `Vec<FSRSItem>` filtered from input `trainset`.
-///   You can use it for model training.
-///
-/// # Panics
-/// This function will panic if any item in `dataset_for_initialization` contains fewer than 2 reviews.
-///
-/// # Example
-/// ```
-/// use fsrs::{FSRSItem, filter_outlier};
-///
-/// let dataset_for_initialization = vec![/* ... */];
-/// let trainset = vec![/* ... */];
-/// let (filtered_init, filtered_trainset) = filter_outlier(dataset_for_initialization, trainset);
-/// ```
-///
-/// # Notes
-/// Both input `Vec`s will move to this function.
-/// The filtered versions are returned as outputs.
-/// If you need to keep the data, use `.clone()`.
+pub(crate) fn filter_outlier_indices(
+    dataset_for_initialization: &[FSRSItem],
+    trainset: &[FSRSItem],
+) -> (Vec<usize>, Vec<usize>) {
+    filter_outlier_train_indices(dataset_for_initialization, trainset.iter())
+}
+
+pub(crate) fn filter_outlier_train_indices<'a>(
+    dataset_for_initialization: &[FSRSItem],
+    trainset: impl IntoIterator<Item = &'a FSRSItem>,
+) -> (Vec<usize>, Vec<usize>) {
+    let decisions = compute_outlier_bucket_decisions(dataset_for_initialization.iter());
+    let train_indices = trainset
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            item_survives_outlier(item, &decisions.removed_pairs).then_some(index)
+        })
+        .collect();
+    (decisions.kept_initialization_indices, train_indices)
+}
+
 pub fn filter_outlier(
     dataset_for_initialization: Vec<FSRSItem>,
-    mut trainset: Vec<FSRSItem>,
+    trainset: Vec<FSRSItem>,
 ) -> (Vec<FSRSItem>, Vec<FSRSItem>) {
-    let mut groups = HashMap::<u32, HashMap<u32, Vec<FSRSItem>>>::new();
-
-    // group by rating of first review and delta_t of second review
-    for item in dataset_for_initialization.into_iter() {
-        let (first_review, second_review) = (item.reviews.first().unwrap(), item.current());
-        let rating_group = groups.entry(first_review.rating).or_default();
-        let delta_t_group = rating_group.entry(second_review.delta_t).or_default();
-        delta_t_group.push(item);
-    }
-
-    let mut filtered_items = vec![];
-    let mut removed_pairs: [HashSet<_>; 5] = Default::default();
-
-    for (rating, delta_t_groups) in groups.into_iter().sorted_by_key(|&(k, _)| k) {
-        let mut sub_groups = delta_t_groups.into_iter().collect::<Vec<_>>();
-
-        // order by size of sub group ascending and delta_t descending
-        sub_groups.sort_by(|(delta_t_a, subv_a), (delta_t_b, subv_b)| {
-            subv_b
-                .len()
-                .cmp(&subv_a.len())
-                .then(delta_t_b.cmp(delta_t_a))
-        });
-
-        let total = sub_groups.iter().map(|(_, vec)| vec.len()).sum::<usize>();
-        let mut has_been_removed = 0;
-
-        for (delta_t, sub_group) in sub_groups.iter().rev() {
-            // remove 5% items (20 at least) of each group
-            if has_been_removed + sub_group.len() >= 20.max(total / 20) {
-                // keep the sub_group if it includes at least six items
-                // and the delta_t is less than 100 days if rating is not 4
-                // or less than 365 days if rating is 4
-                if sub_group.len() >= 6 && *delta_t <= if rating != 4 { 100 } else { 365 } {
-                    filtered_items.extend_from_slice(sub_group);
-                } else {
-                    removed_pairs[rating as usize].insert(*delta_t);
-                }
-            } else {
-                has_been_removed += sub_group.len();
-                removed_pairs[rating as usize].insert(*delta_t);
-            }
-        }
-    }
-    // keep the items in trainset if they are not removed from filtered_items
-    trainset.retain(|item| train_item_survives_outlier(item, &removed_pairs));
+    let (initialization_indices, train_indices) =
+        filter_outlier_indices(&dataset_for_initialization, &trainset);
+    let mut initialization_items = dataset_for_initialization
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<Option<FSRSItem>>>();
+    let filtered_items = initialization_indices
+        .into_iter()
+        .map(|index| initialization_items[index].take().unwrap())
+        .collect();
+    let mut train_items = trainset
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<Option<FSRSItem>>>();
+    let trainset = train_indices
+        .into_iter()
+        .map(|index| train_items[index].take().unwrap())
+        .collect();
     (filtered_items, trainset)
 }
 
 pub(crate) fn prepare_training_data(items: Vec<FSRSItem>) -> (Vec<FSRSItem>, Vec<FSRSItem>) {
-    if std::env::var("FSRS_NO_OUTLIER").is_ok() {
-        return items
-            .into_iter()
-            .partition(|item| item.long_term_review_cnt() == 1);
-    }
-
-    let (removed_pairs, kept_initialization_indices) = compute_outlier_analysis(&items);
-    let dataset_for_initialization = kept_initialization_indices
+    let (mut dataset_for_initialization, mut trainset) = items
+        .clone()
         .into_iter()
-        .map(|index| items[index].clone())
-        .collect();
-    let mut trainset = Vec::with_capacity(items.len());
-    for item in items {
-        if train_item_survives_outlier(&item, &removed_pairs) {
-            trainset.push(item);
-        }
+        .partition(|item| item.long_term_review_cnt() == 1);
+    if std::env::var("FSRS_NO_OUTLIER").is_err() {
+        (dataset_for_initialization, trainset) = filter_outlier(dataset_for_initialization, items);
     }
     (dataset_for_initialization, trainset)
 }
 
-pub(crate) fn prepare_training_data_with_card_ids(
-    items: Vec<FSRSItem>,
-    card_ids: Vec<i64>,
-) -> (Vec<FSRSItem>, Vec<FSRSItem>, Vec<i64>) {
-    if std::env::var("FSRS_NO_OUTLIER").is_ok() {
-        let mut dataset_for_initialization = Vec::new();
-        let mut trainset = Vec::new();
-        let mut trainset_card_ids = Vec::new();
-        for (item, card_id) in items.into_iter().zip(card_ids) {
-            if item.long_term_review_cnt() == 1 {
-                dataset_for_initialization.push(item);
-            } else {
-                trainset.push(item);
-                trainset_card_ids.push(card_id);
-            }
-        }
-        return (dataset_for_initialization, trainset, trainset_card_ids);
-    }
-
-    let (removed_pairs, kept_initialization_indices) = compute_outlier_analysis(&items);
-    let dataset_for_initialization = kept_initialization_indices
-        .into_iter()
-        .map(|index| items[index].clone())
-        .collect();
-    let mut trainset = Vec::with_capacity(items.len());
-    let mut trainset_card_ids = Vec::with_capacity(card_ids.len());
-    for (item, card_id) in items.into_iter().zip(card_ids) {
-        if train_item_survives_outlier(&item, &removed_pairs) {
-            trainset.push(item);
-            trainset_card_ids.push(card_id);
-        }
-    }
-    (dataset_for_initialization, trainset, trainset_card_ids)
-}
-
-#[cfg(test)]
 pub(crate) fn sort_items_by_review_length(
     mut weighted_items: Vec<WeightedFSRSItem>,
 ) -> Vec<WeightedFSRSItem> {
@@ -434,8 +364,8 @@ pub(crate) fn constant_weighted_fsrs_items(items: Vec<FSRSItem>) -> Vec<Weighted
         .into_iter()
         .map(|item| WeightedFSRSItem {
             weight: 1.0,
-            card_id: -1,
             item,
+            card_id: None,
         })
         .collect()
 }
@@ -448,25 +378,8 @@ pub(crate) fn recency_weighted_fsrs_items(items: Vec<FSRSItem>) -> Vec<WeightedF
         .enumerate()
         .map(|(idx, item)| WeightedFSRSItem {
             weight: 0.25 + 0.75 * (idx as f32 / length).powi(3),
-            card_id: -1,
             item,
-        })
-        .collect()
-}
-
-pub(crate) fn recency_weighted_fsrs_items_with_card_ids(
-    items: Vec<FSRSItem>,
-    card_ids: Vec<i64>,
-) -> Vec<WeightedFSRSItem> {
-    let length = (items.len() as f32 - 1.0).max(1.0);
-    items
-        .into_iter()
-        .zip(card_ids)
-        .enumerate()
-        .map(|(idx, (item, card_id))| WeightedFSRSItem {
-            weight: 0.25 + 0.75 * (idx as f32 / length).powi(3),
-            card_id,
-            item,
+            card_id: None,
         })
         .collect()
 }
@@ -495,11 +408,11 @@ mod tests {
                 reviews: vec![
                     FSRSReview {
                         rating: 4,
-                        delta_t: 0
+                        delta_t: 0.0
                     },
                     FSRSReview {
                         rating: 3,
-                        delta_t: 3
+                        delta_t: 3.0
                     }
                 ],
             }
@@ -528,49 +441,73 @@ mod tests {
             FSRSItem {
                 reviews: [(4, 0), (3, 5)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
             FSRSItem {
                 reviews: [(4, 0), (3, 5), (3, 11)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
             FSRSItem {
                 reviews: [(4, 0), (3, 2)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
             FSRSItem {
                 reviews: [(4, 0), (3, 2), (3, 6)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
             FSRSItem {
                 reviews: [(4, 0), (3, 2), (3, 6), (3, 16)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
             FSRSItem {
                 reviews: [(4, 0), (3, 2), (3, 6), (3, 16), (3, 39)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
             FSRSItem {
                 reviews: [(1, 0), (1, 1)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
             FSRSItem {
                 reviews: [(1, 0), (1, 1), (3, 1)]
                     .into_iter()
-                    .map(|(rating, delta_t)| FSRSReview { rating, delta_t })
+                    .map(|(rating, delta_t)| FSRSReview {
+                        rating,
+                        delta_t: delta_t as f32,
+                    })
                     .collect(),
             },
         ];
@@ -578,8 +515,8 @@ mod tests {
             .into_iter()
             .map(|item| WeightedFSRSItem {
                 weight: 1.0,
-                card_id: -1,
                 item,
+                card_id: None,
             })
             .collect();
         let batch = batcher.batch(items, &DEVICE);
@@ -625,5 +562,56 @@ mod tests {
             filter_outlier(dataset_for_initialization, trainset);
         assert_eq!(dataset_for_initialization.len(), 3265);
         assert_eq!(trainset.len(), 10900);
+    }
+
+    #[test]
+    fn test_filter_outlier_keeps_same_day_only_items_without_panic() {
+        let dataset_for_initialization = vec![FSRSItem {
+            reviews: vec![
+                FSRSReview {
+                    rating: 3,
+                    delta_t: 0.0,
+                },
+                FSRSReview {
+                    rating: 3,
+                    delta_t: 2.0,
+                },
+            ],
+        }];
+        let same_day_only = FSRSItem {
+            reviews: vec![
+                FSRSReview {
+                    rating: 2,
+                    delta_t: 0.0,
+                },
+                FSRSReview {
+                    rating: 3,
+                    delta_t: 0.5,
+                },
+            ],
+        };
+        let trainset = vec![same_day_only.clone()];
+        let (_filtered, trainset) = filter_outlier(dataset_for_initialization, trainset);
+        assert_eq!(trainset, vec![same_day_only]);
+    }
+
+    #[test]
+    fn test_filter_outlier_buckets_fractional_long_term_deltas() {
+        let make_item = |delta_t: f32| FSRSItem {
+            reviews: vec![
+                FSRSReview {
+                    rating: 3,
+                    delta_t: 0.0,
+                },
+                FSRSReview { rating: 3, delta_t },
+            ],
+        };
+        let mut dataset_for_initialization = vec![];
+        dataset_for_initialization.extend((0..12).map(|_| make_item(1.2)));
+        dataset_for_initialization.extend((0..12).map(|_| make_item(1.8)));
+        let trainset = dataset_for_initialization.clone();
+        let (filtered, trainset) = filter_outlier(dataset_for_initialization, trainset);
+        assert_eq!(filtered.len(), 24);
+        assert_eq!(trainset.len(), 24);
     }
 }
