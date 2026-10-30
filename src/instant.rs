@@ -121,6 +121,12 @@ impl InstantFsrs7 {
         self.forward(history, delta_t).value
     }
 
+    /// [`Self::predict`] with other parameters, for example a snapshot of
+    /// [`Self::parameters`] taken when the card was scheduled.
+    pub fn predict_with(parameters: &[f32], history: &[InstantReview], delta_t: f32) -> f64 {
+        Self::new(parameters, InstantConfig::default()).predict(history, delta_t)
+    }
+
     /// Predict the review, then learn from its outcome. Returns the prediction made
     /// before the update.
     pub fn observe(&mut self, history: &[InstantReview], delta_t: f32, recalled: bool) -> f64 {
@@ -129,12 +135,40 @@ impl InstantFsrs7 {
             return r.value;
         }
         let loss = bce_loss(r, if recalled { 1.0 } else { 0.0 }, 1.0);
+        self.adam_step(&loss.grad);
+        r.value
+    }
+
+    /// Like [`Self::observe`], for the prediction `sigmoid(logit(R) + offset)`, where
+    /// `offset` is an extra logit term the caller learns (for example a per-card bias).
+    /// Returns that prediction, made before the update.
+    pub fn observe_with_offset(
+        &mut self,
+        history: &[InstantReview],
+        delta_t: f32,
+        recalled: bool,
+        offset: f64,
+    ) -> f64 {
+        let r = self.forward(history, delta_t);
+        let rv = r.value.clamp(1e-5, 1.0 - 1e-5);
+        let p = 1.0 / (1.0 + (-((rv / (1.0 - rv)).ln() + offset)).exp());
+        if self.config.lr == 0.0 || history.is_empty() {
+            return p;
+        }
+        // d(log loss)/d(logit) = p - y, and d(logit R)/dR = 1 / (R (1 - R)).
+        let scale = (p - if recalled { 1.0 } else { 0.0 }) / (rv * (1.0 - rv));
+        let grad: [f64; PARAM_LEN] = core::array::from_fn(|i| r.grad[i] * scale);
+        self.adam_step(&grad);
+        p
+    }
+
+    fn adam_step(&mut self, grad: &[f64; PARAM_LEN]) {
         let c = self.config;
         self.t += 1;
         let bias1 = 1.0 - c.beta1.powi(self.t);
         let bias2 = 1.0 - c.beta2.powi(self.t);
         for i in 0..PARAM_LEN {
-            let mut g = loss.grad[i];
+            let mut g = grad[i];
             if c.l2 > 0.0 {
                 let sigma = PARAMS_STDDEV[i];
                 g += 2.0 * c.l2 * (self.w[i] - self.anchor[i]) as f64 / (sigma * sigma);
@@ -148,6 +182,5 @@ impl InstantFsrs7 {
             self.w[i] = (self.w[i] as f64 - step) as f32;
         }
         clip_parameters_in_place(&mut self.w, 0, true);
-        r.value
     }
 }
