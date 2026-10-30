@@ -9,16 +9,16 @@
 // for training gradients. Both were validated against the former autodiff path
 // during the migration and retain a single-card prefix-batch regression test.
 
-const PARAM_LEN: usize = 34;
+pub(crate) const PARAM_LEN: usize = 34;
 const S_MIN: f64 = 0.0001;
 const S_MAX: f64 = 36500.0;
 const D_MIN: f64 = 1.0;
 const D_MAX: f64 = 10.0;
 
 #[derive(Clone, Copy, Debug)]
-struct Dual {
-    value: f64,
-    grad: [f64; PARAM_LEN],
+pub(crate) struct Dual {
+    pub(crate) value: f64,
+    pub(crate) grad: [f64; PARAM_LEN],
 }
 
 impl Dual {
@@ -153,10 +153,10 @@ impl Dual {
 }
 
 #[derive(Clone, Copy)]
-struct MemoryStateDual {
-    stability: Dual,
-    stability_fast: Dual,
-    difficulty: Dual,
+pub(crate) struct MemoryStateDual {
+    pub(crate) stability: Dual,
+    pub(crate) stability_fast: Dual,
+    pub(crate) difficulty: Dual,
 }
 
 #[derive(Clone, Copy)]
@@ -166,7 +166,7 @@ struct MemoryStateScalar {
     difficulty: f64,
 }
 
-fn dual_params(w: &[f32]) -> [Dual; PARAM_LEN] {
+pub(crate) fn dual_params(w: &[f32]) -> [Dual; PARAM_LEN] {
     core::array::from_fn(|index| Dual::variable(w[index] as f64, index))
 }
 
@@ -182,7 +182,13 @@ fn init_difficulty(w: &[Dual; PARAM_LEN], rating: usize) -> Dual {
 }
 
 /// Retrievability mixture, mirroring `model_v7::power_forgetting_curve`.
-fn forgetting_curve(w: &[Dual; PARAM_LEN], t: f64, s: Dual, s_fast: Dual, d: Dual) -> Dual {
+pub(crate) fn forgetting_curve(
+    w: &[Dual; PARAM_LEN],
+    t: f64,
+    s: Dual,
+    s_fast: Dual,
+    d: Dual,
+) -> Dual {
     let t = t.max(0.0);
     let s = s.clamp(S_MIN, S_MAX);
     let s_fast = s_fast.clamp(S_MIN, S_MAX);
@@ -311,7 +317,7 @@ fn next_difficulty(w: &[Dual; PARAM_LEN], d: Dual, rating: usize, r: Dual) -> Du
         .clamp(D_MIN, D_MAX)
 }
 
-fn step(
+pub(crate) fn step(
     w: &[Dual; PARAM_LEN],
     delta_t: f64,
     rating: usize,
@@ -360,7 +366,7 @@ fn step(
 // BCE bounds: the model's output is already in [1e-5, 1 - 1e-5] (the final rescale), so they only
 // guard against rounding. Same bounds in every kernel (wide_loss MIN_R/MAX_R), and in effect
 // srs-benchmark's nn.BCELoss, which has no clamp of its own.
-fn bce_loss(r: Dual, label: f64, weight: f64) -> Dual {
+pub(crate) fn bce_loss(r: Dual, label: f64, weight: f64) -> Dual {
     let r = r.clamp(1e-5, 1.0 - 1e-5);
     debug_assert!(label == 0.0 || label == 1.0);
     let probability = if label == 0.0 { r.const_sub(1.0) } else { r };

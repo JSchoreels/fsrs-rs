@@ -50,6 +50,7 @@ mod cost_adr;
 mod dataset;
 mod error;
 mod inference;
+mod instant;
 mod model;
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 mod neon_math;
@@ -74,6 +75,7 @@ pub use inference::{
     ItemProgress, ItemState, MemoryState, ModelEvaluation, NextStates, current_retrievability,
     evaluate_with_time_series_splits,
 };
+pub use instant::{InstantConfig, InstantFsrs7, InstantReview};
 pub use model::{FSRS, ModelVersion, check_and_fill_parameters};
 pub use simulation::simulate_with_cost_adr_policy;
 pub use simulation::{
