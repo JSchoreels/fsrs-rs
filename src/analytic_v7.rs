@@ -160,10 +160,10 @@ pub(crate) struct MemoryStateDual {
 }
 
 #[derive(Clone, Copy)]
-struct MemoryStateScalar {
-    stability: f64,
-    stability_fast: f64,
-    difficulty: f64,
+pub(crate) struct MemoryStateScalar {
+    pub(crate) stability: f64,
+    pub(crate) stability_fast: f64,
+    pub(crate) difficulty: f64,
 }
 
 pub(crate) fn dual_params(w: &[f32]) -> [Dual; PARAM_LEN] {
@@ -384,7 +384,7 @@ fn init_difficulty_scalar(w: &[f32], rating: usize) -> f64 {
     w[4] as f64 - (w[5] as f64 * (rating - 1) as f64).exp() + 1.0
 }
 
-fn forgetting_curve_scalar(w: &[f32], t: f64, s: f64, s_fast: f64, d: f64) -> f64 {
+pub(crate) fn forgetting_curve_scalar(w: &[f32], t: f64, s: f64, s_fast: f64, d: f64) -> f64 {
     let t = t.max(0.0);
     let s = s.clamp(S_MIN, S_MAX);
     let s_fast = s_fast.clamp(S_MIN, S_MAX);
@@ -461,7 +461,7 @@ fn next_difficulty_scalar(w: &[f32], d: f64, rating: usize, r: f64) -> f64 {
     (init_difficulty_scalar(w, 4) * 0.01 + new_d * 0.99).clamp(D_MIN, D_MAX)
 }
 
-fn step_scalar(
+pub(crate) fn step_scalar(
     w: &[f32],
     delta_t: f64,
     rating: usize,

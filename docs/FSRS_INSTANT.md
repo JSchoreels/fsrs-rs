@@ -57,10 +57,87 @@ rate 0.01, all fixed on the dev users before this run.
 | FSRS-7 (this run) | 0.3245 | 0.0494 | 0.7278 |
 | **FSRS-Instant** | **0.2967** (−8.6%, [−0.0341, −0.0225]) | **0.0248** (−49.8%, [−0.0286, −0.0212]) | **0.7851** (+7.9%, [+0.0477, +0.0679]) |
 
-For scale, the README's 9,999-user means are FSRS-7 0.3437, FSRS-7 recency 0.3414, GRU
+For scale, the README's 9,999-user means are FSRS-7 0.3401, FSRS-7 recency 0.3370, GRU
 0.3328, RWKV-Curve 0.3193 and RWKV-Instant 0.2773. A −10% change on FSRS-7 would put
-FSRS-Instant near RWKV-Curve. That is an extrapolation from 300 users: the full
-9,999-user run has not been done.
+FSRS-Instant near RWKV-Curve. That is an extrapolation from 300 users; see the next
+section for a run on RWKV's 4,999 test users.
+
+## Results: RWKV's test users 1-4999, one shared fit (170.8M test reviews)
+
+This run uses the same users as srs-benchmark's RWKV rows. RWKV is trained on users
+5000-10000 and tested on users 1-4999, with the same test reviews as FSRS-7's folds.
+
+- **Fit.** One FSRS-7 parameter set is fitted on 100 of RWKV's training users: a random
+  seed-0 sample from 5000-10000 (`runs/shared-train-100.txt`), 5.8M reviews pooled, using
+  the benchmark's own trainer. The fit took 25 minutes. No test user is ever re-fitted.
+- **Replay.** Each test user's whole review stream is replayed once, from their first
+  review, starting from the shared parameters and using the online settings fixed on the
+  dev users. Nothing was re-tuned. The test reviews and the metrics code are the
+  benchmark's.
+- **Three prediction modes**, from one pass:
+  - *instant*: the parameters and offsets just before the review, as above;
+  - *scheduling time*: the snapshot taken right after the card's previous review, when its
+    interval was set;
+  - *start of day*: the snapshot before the user's first review of that day (the revlog's
+    day), so same-day reviews of other cards are not used.
+- **Baseline.** The published rows (per-user FSRS-7 refits on 5 folds, FSRS-7 recency, GRU,
+  RWKV-Curve = `RWKV.jsonl`, RWKV-Instant = `RWKV-P.jsonl`) are shown on the same users.
+  CIs are paired user-bootstrap 95% intervals on the difference vs published FSRS-7.
+- **Data note.** 284 of the 4,998 users have a slightly different test-review count here
+  than in the published files (local dataset version). The pairing is per user, so this
+  adds a little noise to the comparisons with published rows.
+- "Parameters only, lr 3e-4" turns the offsets off and uses the slow step. It was picked
+  as a curve candidate on users 1-300 (which are inside this test set), not on dev users,
+  so read it as indicative.
+
+Commands: `runs/shared-5k.sh`, then `python fsrs_instant_shared_compare.py runs/shared-5k`
+(srs-benchmark branch `fsrs-instant`).
+
+| Per user (README) | LogLoss↓ | RMSE(bins)↓ | AUC↑ |
+| --- | --- | --- | --- |
+| FSRS-7 (published, per-user refit) | 0.3418 | 0.0628 | 0.7164 |
+| FSRS-7 recency (published) | 0.3388 (−0.9%, [−0.0034, −0.0028]) | 0.0588 (−6.4%) | 0.7218 (+0.7%) |
+| GRU (published) | 0.3343 (−2.2%, [−0.0081, −0.0070]) | 0.0544 (−13.4%) | 0.7321 (+2.2%) |
+| RWKV-Curve (published) | 0.3212 (−6.0%, [−0.0215, −0.0198]) | 0.0547 (−12.9%) | 0.7680 (+7.2%) |
+| RWKV-Instant (published) | 0.2791 (−18.3%, [−0.0647, −0.0608]) | 0.0252 (−59.9%) | 0.8320 (+16.1%) |
+| FSRS-7 shared fit, no updates | 0.3623 (+6.0%, [+0.0193, +0.0217]) | 0.0873 (+38.9%) | 0.7039 (−1.8%) |
+| **FSRS-Instant, instant** | **0.3093** (−9.5%, [−0.0340, −0.0312]) | **0.0363** (−42.3%, [−0.0274, −0.0258]) | **0.7780** (+8.6%, [+0.0595, +0.0637]) |
+| FSRS-Instant, scheduling time | 0.3549 (+3.8%, [+0.0121, +0.0141]) | 0.0621 (−1.1%, [−0.0012, −0.0002]) | 0.6998 (−2.3%, [−0.0183, −0.0150]) |
+| FSRS-Instant, start of day | 0.3353 (−1.9%, [−0.0074, −0.0056]) | 0.0480 (−23.6%, [−0.0155, −0.0142]) | 0.7390 (+3.2%, [+0.0209, +0.0243]) |
+| parameters only lr 3e-4, instant | 0.3264 (−4.5%, [−0.0162, −0.0147]) | 0.0507 (−19.2%) | 0.7495 (+4.6%) |
+| parameters only lr 3e-4, scheduling time | 0.3446 (+0.8%, [+0.0022, +0.0034]) | 0.0636 (+1.2%, [+0.0003, +0.0012]) | 0.7092 (−1.0%) |
+| parameters only lr 3e-4, start of day | 0.3315 (−3.0%, [−0.0110, −0.0097]) | 0.0531 (−15.5%) | 0.7378 (+3.0%) |
+
+| Review-weighted | LogLoss↓ | RMSE(bins)↓ | AUC↑ |
+| --- | --- | --- | --- |
+| FSRS-7 (published, per-user refit) | 0.3203 | 0.0452 | 0.7185 |
+| RWKV-Curve (published) | 0.3017 (−5.8%, [−0.0196, −0.0178]) | 0.0349 (−22.8%) | 0.7717 (+7.4%) |
+| RWKV-Instant (published) | 0.2735 (−14.6%, [−0.0491, −0.0448]) | 0.0149 (−67.0%) | 0.8228 (+14.5%) |
+| FSRS-7 shared fit, no updates | 0.3389 (+5.8%, [+0.0172, +0.0199]) | 0.0701 (+55.1%) | 0.6988 (−2.7%) |
+| **FSRS-Instant, instant** | **0.2960** (−7.6%, [−0.0259, −0.0229]) | **0.0231** (−48.9%, [−0.0230, −0.0212]) | **0.7763** (+8.1%, [+0.0537, +0.0623]) |
+| FSRS-Instant, scheduling time | 0.3308 (+3.3%, [+0.0091, +0.0120]) | 0.0414 (−8.4%, [−0.0045, −0.0031]) | 0.7068 (−1.6%, [−0.0145, −0.0089]) |
+| FSRS-Instant, start of day | 0.3172 (−1.0%, [−0.0045, −0.0019]) | 0.0320 (−29.1%, [−0.0140, −0.0122]) | 0.7429 (+3.4%, [+0.0209, +0.0283]) |
+| parameters only lr 3e-4, scheduling time | 0.3207 (+0.1%, [−0.0003, +0.0011]) | 0.0422 (−6.6%, [−0.0036, −0.0023]) | 0.7148 (−0.5%, [−0.0069, −0.0006]) |
+| parameters only lr 3e-4, start of day | 0.3091 (−3.5%, [−0.0122, −0.0103]) | 0.0336 (−25.7%, [−0.0123, −0.0109]) | 0.7480 (+4.1%, [+0.0260, +0.0332]) |
+
+What this shows:
+
+- **Instant.** Starting from a shared fit with no per-user batch fit at all, FSRS-Instant
+  reaches −9.5% LogLoss vs per-user FSRS-7. It recovers the shared fit's +6.0% handicap
+  and more. It sits between RWKV-Curve (−6.0%) and RWKV-Instant (−18.3%), and its
+  RMSE(bins) is close to RWKV-Instant's. This matches the users 1-300 result (−10.1% with
+  per-user fold fits).
+- **Scheduling time.** It is 3.8% worse than per-user FSRS-7 (3.3% review-weighted), the
+  same picture as on users 1-300. The slow parameters-only step is about neutral (+0.8%
+  per user, +0.1% review-weighted, CI includes 0). Neither is a scheduling gain.
+- **Start of day.** Only same-day reviews are excluded, and it is still −1.9% LogLoss and
+  −24% RMSE(bins). With the slow step it is −3.0%. So part of the gain comes from
+  day-to-day drift, not only from within-session form.
+- **Cost.** The Rust replay ran at 44 µs per review for all three modes together (8
+  processes on a loaded machine, GPU jobs running). Data loading took 97 µs per review.
+  With the two other configs, the replay of the 306M stream reviews came to about 17
+  CPU-hours, plus 0.5 hours for the shared fit. The benchmark's per-user refit protocol
+  costs about 200 CPU-hours.
 
 ## What helped
 

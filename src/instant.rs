@@ -11,7 +11,8 @@
 //! update costs one forward pass of that card (microseconds), with no batch re-fit.
 
 use crate::analytic_v7::{
-    Dual, MemoryStateDual, PARAM_LEN, bce_loss, dual_params, forgetting_curve, step,
+    Dual, MemoryStateDual, MemoryStateScalar, PARAM_LEN, bce_loss, dual_params,
+    forgetting_curve, forgetting_curve_scalar, step, step_scalar,
 };
 use crate::parameter_clipper::clip_parameters_in_place;
 
@@ -122,9 +123,29 @@ impl InstantFsrs7 {
     }
 
     /// [`Self::predict`] with other parameters, for example a snapshot of
-    /// [`Self::parameters`] taken when the card was scheduled.
+    /// [`Self::parameters`] taken when the card was scheduled. Plain f64 pass, no gradient.
     pub fn predict_with(parameters: &[f32], history: &[InstantReview], delta_t: f32) -> f64 {
-        Self::new(parameters, InstantConfig::default()).predict(history, delta_t)
+        let mut state = MemoryStateScalar {
+            stability: 0.0,
+            stability_fast: 0.0,
+            difficulty: 0.0,
+        };
+        for (nth, review) in history.iter().enumerate() {
+            state = step_scalar(
+                parameters,
+                review.delta_t as f64,
+                review.rating as usize,
+                state,
+                nth,
+            );
+        }
+        forgetting_curve_scalar(
+            parameters,
+            delta_t as f64,
+            state.stability,
+            state.stability_fast,
+            state.difficulty,
+        )
     }
 
     /// Predict the review, then learn from its outcome. Returns the prediction made
