@@ -1,4 +1,4 @@
-//! Replays one user's review stream through FSRS-Instant for srs-benchmark.
+//! Replays one user's review stream through FSRS7-Instant for srs-benchmark.
 //!
 //! `instant_replay <input.bin> <output.bin>`. All values are little-endian.
 //!

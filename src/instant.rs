@@ -1,4 +1,4 @@
-//! FSRS-Instant: FSRS-7 whose parameters are re-fitted online after every review.
+//! FSRS7-Instant: FSRS-7 whose parameters are re-fitted online after every review.
 //!
 //! Start from parameters fitted the usual way (`compute_parameters`), then after each
 //! review take one Adam step on that review's log loss. With a constant step size this
@@ -71,7 +71,7 @@ impl InstantFsrs7 {
         assert_eq!(
             parameters.len(),
             PARAM_LEN,
-            "FSRS-Instant needs 34 FSRS-7 parameters"
+            "FSRS7-Instant needs 34 FSRS-7 parameters"
         );
         let w: [f32; PARAM_LEN] = core::array::from_fn(|i| parameters[i]);
         Self {
