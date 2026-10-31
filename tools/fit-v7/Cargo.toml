@@ -1,0 +1,11 @@
+[package]
+name = "fit-v7"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+fsrs = { path = "../.." }
+
+[workspace]
+
